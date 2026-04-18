@@ -1,0 +1,13 @@
+[Unit]
+Description=VoiceLayer local daemon
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/voicelayer/voicelayerd.env
+ExecStart=%h/.local/bin/vl daemon run --socket-path %t/voicelayer/daemon.sock
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

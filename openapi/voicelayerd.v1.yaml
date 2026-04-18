@@ -1,0 +1,494 @@
+openapi: 3.1.0
+info:
+  title: VoiceLayer Local Control API
+  version: 0.1.0
+  description: |
+    Local control API exposed by the VoiceLayer daemon over a Unix domain socket.
+servers:
+  - url: http://localhost
+    description: Logical placeholder. The daemon is served over a Unix domain socket.
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      summary: Read daemon health state.
+      responses:
+        "200":
+          description: Daemon health report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /v1/providers:
+    get:
+      operationId: listProviders
+      summary: List supported providers and host adapters.
+      responses:
+        "200":
+          description: Provider descriptors.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProviderDescriptor"
+  /v1/events/stream:
+    get:
+      operationId: streamEvents
+      summary: Subscribe to daemon events.
+      responses:
+        "200":
+          description: Server-Sent Events stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/sessions/dictation:
+    post:
+      operationId: startLiveDictationSession
+      summary: Create a live dictation session and start recording audio.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartDictationRequest"
+      responses:
+        "200":
+          description: Dictation session created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureSession"
+  /v1/sessions/dictation/stop:
+    post:
+      operationId: stopLiveDictationSession
+      summary: Stop a live dictation session, transcribe the recorded audio, and return the result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StopDictationRequest"
+      responses:
+        "200":
+          description: Dictation capture result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DictationCaptureResult"
+  /v1/sessions/compose:
+    post:
+      operationId: createCompositionJob
+      summary: Register a composition request and return a preview artifact.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComposeRequest"
+      responses:
+        "200":
+          description: Composition job receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompositionReceipt"
+  /v1/rewrites:
+    post:
+      operationId: rewriteText
+      summary: Register a rewrite request and return a preview artifact.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewriteRequest"
+      responses:
+        "200":
+          description: Rewrite job receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompositionReceipt"
+  /v1/translations:
+    post:
+      operationId: translateText
+      summary: Register a translation request and return a preview artifact.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TranslateRequest"
+      responses:
+        "200":
+          description: Translation job receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompositionReceipt"
+  /v1/transcriptions:
+    post:
+      operationId: transcribeAudioFile
+      summary: Transcribe a local audio file through the configured ASR provider.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TranscribeRequest"
+      responses:
+        "200":
+          description: Transcription result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscriptionResult"
+  /v1/dictation/capture:
+    post:
+      operationId: captureDictation
+      summary: Record a short clip, transcribe it, and return the resulting dictation session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DictationCaptureRequest"
+      responses:
+        "200":
+          description: Dictation capture result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DictationCaptureResult"
+  /v1/inject:
+    post:
+      operationId: planInjection
+      summary: Build an injection plan for a target.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InjectRequest"
+      responses:
+        "200":
+          description: Injection plan response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InjectionPlan"
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, socket_path, version, worker]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        socket_path:
+          type: string
+        version:
+          type: string
+        worker:
+          $ref: "#/components/schemas/WorkerHealthSummary"
+    WorkerHealthSummary:
+      type: object
+      required: [status, command]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, unavailable]
+        command:
+          type: string
+        asr_configured:
+          type: boolean
+        asr_binary:
+          type:
+            - string
+            - "null"
+        asr_model_path:
+          type:
+            - string
+            - "null"
+        asr_error:
+          type:
+            - string
+            - "null"
+        llm_configured:
+          type: boolean
+        llm_model:
+          type:
+            - string
+            - "null"
+        llm_endpoint:
+          type:
+            - string
+            - "null"
+        llm_reachable:
+          type: boolean
+        llm_error:
+          type:
+            - string
+            - "null"
+        message:
+          type:
+            - string
+            - "null"
+    ProviderDescriptor:
+      type: object
+      required:
+        - id
+        - kind
+        - transport
+        - local
+        - default_enabled
+        - experimental
+        - license
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [asr, llm, tts, host_adapter]
+        transport:
+          type: string
+        local:
+          type: boolean
+        default_enabled:
+          type: boolean
+        experimental:
+          type: boolean
+        license:
+          type: string
+    LanguageProfile:
+      type: object
+      required: [strategy, input_languages]
+      properties:
+        strategy:
+          type: string
+          enum: [auto_detect, locked, follow_previous, bilingual]
+        input_languages:
+          type: array
+          items:
+            type: string
+        output_language:
+          type:
+            - string
+            - "null"
+    StartDictationRequest:
+      type: object
+      required: [trigger]
+      properties:
+        trigger:
+          type: string
+          enum: [push_to_talk, toggle, cli, tui, tray_button]
+        language_profile:
+          $ref: "#/components/schemas/LanguageProfile"
+        recorder_backend:
+          $ref: "#/components/schemas/RecorderBackend"
+        translate_to_english:
+          type: boolean
+        keep_audio:
+          type: boolean
+    StopDictationRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+    RecorderBackend:
+      type: string
+      enum: [auto, pipewire, alsa]
+    DictationCaptureRequest:
+      type: object
+      required: [trigger, duration_seconds]
+      properties:
+        trigger:
+          type: string
+          enum: [push_to_talk, toggle, cli, tui, tray_button]
+        language_profile:
+          $ref: "#/components/schemas/LanguageProfile"
+        duration_seconds:
+          type: integer
+          minimum: 1
+        recorder_backend:
+          $ref: "#/components/schemas/RecorderBackend"
+        translate_to_english:
+          type: boolean
+        keep_audio:
+          type: boolean
+    CaptureSession:
+      type: object
+      required:
+        - session_id
+        - mode
+        - state
+        - trigger
+        - language_profile
+        - created_at_millis
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        mode:
+          type: string
+          enum: [dictation, compose, rewrite, translate]
+        state:
+          type: string
+          enum: [idle, listening, transcribing, previewing, awaiting_confirmation, completed, failed]
+        trigger:
+          type: string
+          enum: [push_to_talk, toggle, cli, tui, tray_button]
+        language_profile:
+          $ref: "#/components/schemas/LanguageProfile"
+        created_at_millis:
+          type: integer
+          format: int64
+    ComposeRequest:
+      type: object
+      required: [spoken_prompt]
+      properties:
+        spoken_prompt:
+          type: string
+        archetype:
+          type: string
+          enum:
+            - email
+            - cover_letter
+            - daily_report
+            - issue
+            - pull_request_description
+            - prompt
+            - technical_summary
+            - custom
+        output_language:
+          type:
+            - string
+            - "null"
+    RewriteRequest:
+      type: object
+      required: [source_text, style]
+      properties:
+        source_text:
+          type: string
+        style:
+          type: string
+          enum: [more_formal, shorter, politer, more_technical, translate]
+        output_language:
+          type:
+            - string
+            - "null"
+    TranslateRequest:
+      type: object
+      required: [source_text, target_language]
+      properties:
+        source_text:
+          type: string
+        target_language:
+          type: string
+    TranscribeRequest:
+      type: object
+      required: [audio_file]
+      properties:
+        audio_file:
+          type: string
+        language:
+          type:
+            - string
+            - "null"
+        translate_to_english:
+          type: boolean
+    PreviewArtifact:
+      type: object
+      required: [artifact_id, status, title, notes]
+      properties:
+        artifact_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [ready, needs_provider, rejected]
+        title:
+          type: string
+        generated_text:
+          type:
+            - string
+            - "null"
+        notes:
+          type: array
+          items:
+            type: string
+    CompositionReceipt:
+      type: object
+      required: [job_id, preview]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        preview:
+          $ref: "#/components/schemas/PreviewArtifact"
+    InjectRequest:
+      type: object
+      required: [target, text]
+      properties:
+        target:
+          type: string
+          enum:
+            - gui_accessible
+            - gui_clipboard
+            - terminal_bracketed_paste
+            - terminal_kitty_remote
+        text:
+          type: string
+        auto_submit:
+          type: boolean
+          default: false
+    InjectionPlan:
+      type: object
+      required: [target, payload, auto_submit]
+      properties:
+        target:
+          type: string
+          enum:
+            - gui_accessible
+            - gui_clipboard
+            - terminal_bracketed_paste
+            - terminal_kitty_remote
+        payload:
+          type: string
+        auto_submit:
+          type: boolean
+    TranscriptionResult:
+      type: object
+      required: [text, notes]
+      properties:
+        text:
+          type: string
+        detected_language:
+          type:
+            - string
+            - "null"
+        notes:
+          type: array
+          items:
+            type: string
+    DictationCaptureResult:
+      type: object
+      required: [session, transcription]
+      properties:
+        session:
+          $ref: "#/components/schemas/CaptureSession"
+        transcription:
+          $ref: "#/components/schemas/TranscriptionResult"
+        audio_file:
+          type:
+            - string
+            - "null"
