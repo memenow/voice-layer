@@ -1,3 +1,43 @@
+//! Foreground push-to-talk event loop and the side-effect policies that govern it.
+//!
+//! # Stop-action ordering
+//!
+//! When a dictation session transitions to `Completed` (either via key-release or a toggle
+//! press), [`apply_dictation_result_to_ui`] performs side effects in a deterministic order:
+//!
+//! 1. Copy-on-stop: if the CLI flag `--copy-on-stop` is set or the effective
+//!    `default_stop_action` is `copy`, the transcript is placed on the system clipboard.
+//!    Before the first such copy in a session, the pre-existing clipboard contents are
+//!    snapshotted into `clipboard_backup_text`.
+//! 2. Save-on-stop: if the effective `default_stop_action` is `save`, the transcript is
+//!    written to disk via [`save_transcript_to_target_dir`].
+//! 3. Inject-on-stop: if the effective `default_stop_action` is `inject`, the transcript is
+//!    pushed into the configured foreground target (tmux / wezterm / kitty).
+//!
+//! `default_stop_action` is a single enum; setting it to `none` disables the save and inject
+//! branches entirely. The copy branch is independent — `--copy-on-stop` is additive and can
+//! combine with any non-`none` stop action (for example, `default_stop_action=save` together
+//! with `--copy-on-stop=true` will both save and copy).
+//!
+//! # Clipboard-backup lifecycle
+//!
+//! `clipboard_backup_text` is populated lazily the first time [`copy_result_to_clipboard`] or
+//! the manual `c` key is triggered during a session, so the user can recover the text that
+//! VoiceLayer replaced. `r` restores the snapshot on demand at any point.
+//!
+//! When `--restore-clipboard-on-exit` is set, the loop calls [`restore_clipboard_backup`]
+//! just before breaking out of the event loop (including the Esc path after a final stop),
+//! so the pre-session clipboard text is put back. With both `--copy-on-stop` and
+//! `--restore-clipboard-on-exit`, the restore happens only at exit — during the session the
+//! transcript stays on the clipboard so the user can paste it.
+//!
+//! # Save-filename collision policy
+//!
+//! [`save_transcript_to_target_dir`] writes to `voicelayer-transcript-<epoch_secs>.txt`.
+//! If the base name already exists (for example, two stops in the same second), the writer
+//! appends `-1`, `-2`, … until an unused name is found. The first free candidate wins; we do
+//! not overwrite existing transcripts.
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -651,9 +691,23 @@ fn save_transcript_to_target_dir(
         None => std::env::current_dir()?,
     };
     std::fs::create_dir_all(&base_dir)?;
-    let path = base_dir.join(format!("voicelayer-transcript-{timestamp}.txt"));
+    let path = unique_transcript_path(&base_dir, timestamp);
     std::fs::write(&path, text)?;
     Ok(path)
+}
+
+fn unique_transcript_path(base_dir: &Path, timestamp: u64) -> PathBuf {
+    let primary = base_dir.join(format!("voicelayer-transcript-{timestamp}.txt"));
+    if !primary.exists() {
+        return primary;
+    }
+    for suffix in 1u32.. {
+        let candidate = base_dir.join(format!("voicelayer-transcript-{timestamp}-{suffix}.txt"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u32 suffix space exhausted while saving transcript")
 }
 
 fn copy_result_to_clipboard(ui: &mut ForegroundPttUiState, text: &str) {
@@ -667,5 +721,44 @@ fn copy_result_to_clipboard(ui: &mut ForegroundPttUiState, text: &str) {
         Err(error) => {
             ui.last_error = Some(format!("Clipboard copy failed: {error}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_transcript_path;
+    use std::fs;
+
+    #[test]
+    fn unique_transcript_path_is_primary_when_unused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = unique_transcript_path(dir.path(), 1_700_000_000);
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("voicelayer-transcript-1700000000.txt")
+        );
+    }
+
+    #[test]
+    fn unique_transcript_path_appends_suffix_on_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let timestamp = 1_700_000_000u64;
+        fs::write(
+            dir.path()
+                .join(format!("voicelayer-transcript-{timestamp}.txt")),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join(format!("voicelayer-transcript-{timestamp}-1.txt")),
+            b"",
+        )
+        .unwrap();
+        let path = unique_transcript_path(dir.path(), timestamp);
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("voicelayer-transcript-1700000000-2.txt")
+        );
     }
 }

@@ -129,6 +129,21 @@ pub(crate) fn write_vl_config(config: &VlConfig) -> Result<PathBuf, Box<dyn std:
     Ok(path)
 }
 
+const SUPPORTED_CONFIG_KEYS: &[&str] = &[
+    "foreground_ptt.language",
+    "foreground_ptt.backend",
+    "foreground_ptt.translate_to_english",
+    "foreground_ptt.keep_audio",
+    "foreground_ptt.key",
+    "foreground_ptt.tmux_target_pane",
+    "foreground_ptt.wezterm_target_pane_id",
+    "foreground_ptt.kitty_match",
+    "foreground_ptt.copy_on_stop",
+    "foreground_ptt.default_stop_action",
+    "foreground_ptt.restore_clipboard_on_exit",
+    "foreground_ptt.save_dir",
+];
+
 pub(crate) fn set_config_value(
     config: &mut VlConfig,
     key: &str,
@@ -151,11 +166,7 @@ pub(crate) fn set_config_value(
             config.foreground_ptt.restore_clipboard_on_exit = parse_bool(value)?;
         }
         "foreground_ptt.save_dir" => {
-            config.foreground_ptt.save_dir = if value.eq_ignore_ascii_case("none") {
-                None
-            } else {
-                Some(PathBuf::from(value))
-            };
+            config.foreground_ptt.save_dir = parse_optional_path(value);
         }
         "foreground_ptt.backend" => {
             config.foreground_ptt.backend = match value {
@@ -176,14 +187,49 @@ pub(crate) fn set_config_value(
                 _ => return Err("expected one of: space, enter, tab, f8, f9, f10".into()),
             };
         }
+        "foreground_ptt.language" => {
+            config.foreground_ptt.language = parse_optional_string(value);
+        }
+        "foreground_ptt.translate_to_english" => {
+            config.foreground_ptt.translate_to_english = parse_bool(value)?;
+        }
+        "foreground_ptt.keep_audio" => {
+            config.foreground_ptt.keep_audio = parse_bool(value)?;
+        }
+        "foreground_ptt.tmux_target_pane" => {
+            config.foreground_ptt.tmux_target_pane = parse_optional_string(value);
+        }
+        "foreground_ptt.wezterm_target_pane_id" => {
+            config.foreground_ptt.wezterm_target_pane_id = parse_optional_string(value);
+        }
+        "foreground_ptt.kitty_match" => {
+            config.foreground_ptt.kitty_match = parse_optional_string(value);
+        }
         _ => {
             return Err(format!(
-                "unsupported config key `{key}`; supported keys: foreground_ptt.default_stop_action, foreground_ptt.copy_on_stop, foreground_ptt.restore_clipboard_on_exit, foreground_ptt.save_dir, foreground_ptt.backend, foreground_ptt.key"
+                "unsupported config key `{key}`; supported keys: {}",
+                SUPPORTED_CONFIG_KEYS.join(", ")
             )
             .into());
         }
     }
     Ok(())
+}
+
+fn parse_optional_string(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn parse_optional_path(value: &str) -> Option<PathBuf> {
+    if value.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
 }
 
 fn parse_bool(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
@@ -229,5 +275,49 @@ mod tests {
         let mut config = VlConfig::default();
         let error = set_config_value(&mut config, "foreground_ptt.unknown", "x").unwrap_err();
         assert!(error.to_string().contains("unsupported config key"));
+    }
+
+    #[test]
+    fn set_config_value_accepts_language_and_clears_with_none() {
+        let mut config = VlConfig::default();
+        set_config_value(&mut config, "foreground_ptt.language", "en").unwrap();
+        assert_eq!(config.foreground_ptt.language.as_deref(), Some("en"));
+        set_config_value(&mut config, "foreground_ptt.language", "none").unwrap();
+        assert!(config.foreground_ptt.language.is_none());
+    }
+
+    #[test]
+    fn set_config_value_accepts_translate_and_keep_audio_booleans() {
+        let mut config = VlConfig::default();
+        set_config_value(&mut config, "foreground_ptt.translate_to_english", "true").unwrap();
+        set_config_value(&mut config, "foreground_ptt.keep_audio", "yes").unwrap();
+        assert!(config.foreground_ptt.translate_to_english);
+        assert!(config.foreground_ptt.keep_audio);
+    }
+
+    #[test]
+    fn set_config_value_accepts_target_selectors() {
+        let mut config = VlConfig::default();
+        set_config_value(&mut config, "foreground_ptt.tmux_target_pane", "%3").unwrap();
+        set_config_value(&mut config, "foreground_ptt.wezterm_target_pane_id", "12").unwrap();
+        set_config_value(&mut config, "foreground_ptt.kitty_match", "title:editor").unwrap();
+        assert_eq!(
+            config.foreground_ptt.tmux_target_pane.as_deref(),
+            Some("%3")
+        );
+        assert_eq!(
+            config.foreground_ptt.wezterm_target_pane_id.as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            config.foreground_ptt.kitty_match.as_deref(),
+            Some("title:editor")
+        );
+        set_config_value(&mut config, "foreground_ptt.tmux_target_pane", "none").unwrap();
+        set_config_value(&mut config, "foreground_ptt.wezterm_target_pane_id", "None").unwrap();
+        set_config_value(&mut config, "foreground_ptt.kitty_match", "NONE").unwrap();
+        assert!(config.foreground_ptt.tmux_target_pane.is_none());
+        assert!(config.foreground_ptt.wezterm_target_pane_id.is_none());
+        assert!(config.foreground_ptt.kitty_match.is_none());
     }
 }

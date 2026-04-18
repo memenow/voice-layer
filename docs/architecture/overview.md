@@ -61,6 +61,40 @@ These names should remain stable across Rust, Python, and OpenAPI surfaces.
 - Rust/Python bridge: JSON-RPC 2.0 over stdio
 - Worker launch policy: on-demand Python worker invocation through the `uv`-managed project environment
 
+## Configuration Precedence
+
+The `vl` CLI reads foreground-PTT options from three sources. Sources higher in the list win when
+a value is set at multiple layers:
+
+1. **Command-line flag** — every `vl dictation foreground-ptt` option can be set explicitly on the
+   command line (for example `--language en`, `--key f9`, `--default-stop-action inject`).
+2. **TOML config file** — persisted with `vl config set <key> <value>`. The file lives at the path
+   reported by `vl config path`, typically
+   `~/.config/voicelayer/config.toml` on Linux. Entries under `[foreground_ptt]` populate the same
+   fields the CLI flags set.
+3. **Struct defaults** — the values baked into `ForegroundPttConfig::default` (space key,
+   `RecorderBackend::Auto`, stop action `none`, and so on) apply when neither the file nor the CLI
+   provides a value.
+
+Supported keys for `vl config set` today:
+
+```
+foreground_ptt.language                    (BCP-47 tag; "none" clears)
+foreground_ptt.backend                     auto | pipewire | alsa
+foreground_ptt.translate_to_english        bool
+foreground_ptt.keep_audio                  bool
+foreground_ptt.key                         space | enter | tab | f8 | f9 | f10
+foreground_ptt.tmux_target_pane            tmux pane id (%N); "none" clears
+foreground_ptt.wezterm_target_pane_id      wezterm pane id; "none" clears
+foreground_ptt.kitty_match                 kitten match expression; "none" clears
+foreground_ptt.copy_on_stop                bool
+foreground_ptt.default_stop_action         none | copy | inject | save
+foreground_ptt.restore_clipboard_on_exit   bool
+foreground_ptt.save_dir                    directory path; "none" clears
+```
+
+Boolean values accept `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`.
+
 ## Recorder Backends
 
 The daemon captures microphone audio to a temporary WAV file through a subprocess backend:
