@@ -17,19 +17,25 @@ PYTHON_ROOT = PROJECT_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
+from voicelayer_orchestrator.config import (  # noqa: E402
+    load_llama_server_launch_config,
+    load_llm_provider_config,
+    load_whisper_provider_config,
+)
+from voicelayer_orchestrator.providers import supported_providers  # noqa: E402
+from voicelayer_orchestrator.providers.llm_openai_compatible import (  # noqa: E402
+    resolve_chat_completions_url,
+    resolve_models_url,
+)
+from voicelayer_orchestrator.providers.whisper_cli import (  # noqa: E402
+    validate_whisper_provider,
+)
 from voicelayer_orchestrator.worker import (  # noqa: E402
     METHOD_NOT_FOUND_CODE,
     PARSE_ERROR_CODE,
     PROVIDER_UNAVAILABLE_CODE,
     handle_request,
-    load_llama_server_launch_config,
-    load_llm_provider_config,
-    load_whisper_provider_config,
-    resolve_chat_completions_url,
-    resolve_models_url,
     serve,
-    supported_providers,
-    validate_whisper_provider,
 )
 
 

@@ -1,0 +1,102 @@
+"""Environment-backed configuration for VoiceLayer provider backends."""
+
+from __future__ import annotations
+
+import os
+import shlex
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleConfig:
+    """Configuration for a locally hosted OpenAI-compatible chat endpoint."""
+
+    endpoint: str
+    model: str
+    api_key: str | None
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class LlamaServerLaunchConfig:
+    """Configuration for automatically launching `llama-server`."""
+
+    server_bin: str
+    model_path: str | None
+    hf_repo: str | None
+    extra_args: tuple[str, ...]
+    launch_timeout_seconds: float
+    poll_interval_seconds: float
+
+
+@dataclass(frozen=True)
+class WhisperCppConfig:
+    """Configuration for invoking `whisper-cli`."""
+
+    binary: str
+    model_path: str
+    timeout_seconds: float
+    no_gpu: bool
+    extra_args: tuple[str, ...]
+
+
+def load_llm_provider_config(
+    environ: Mapping[str, str] | None = None,
+) -> OpenAICompatibleConfig | None:
+    """Load an OpenAI-compatible provider configuration from the environment."""
+
+    source = environ or os.environ
+    endpoint = source.get("VOICELAYER_LLM_ENDPOINT")
+    model = source.get("VOICELAYER_LLM_MODEL")
+    if not endpoint or not model:
+        return None
+
+    timeout_seconds = float(source.get("VOICELAYER_LLM_TIMEOUT_SECONDS", "60"))
+    api_key = source.get("VOICELAYER_LLM_API_KEY") or None
+    return OpenAICompatibleConfig(
+        endpoint=endpoint.strip(),
+        model=model.strip(),
+        api_key=api_key,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def load_llama_server_launch_config(
+    environ: Mapping[str, str] | None = None,
+) -> LlamaServerLaunchConfig | None:
+    """Load optional auto-start configuration for `llama-server`."""
+
+    source = environ or os.environ
+    enabled = source.get("VOICELAYER_LLM_AUTO_START", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+
+    return LlamaServerLaunchConfig(
+        server_bin=source.get("VOICELAYER_LLAMA_SERVER_BIN", "llama-server"),
+        model_path=source.get("VOICELAYER_LLAMA_MODEL_PATH"),
+        hf_repo=source.get("VOICELAYER_LLAMA_HF_REPO"),
+        extra_args=tuple(shlex.split(source.get("VOICELAYER_LLAMA_SERVER_ARGS", ""))),
+        launch_timeout_seconds=float(source.get("VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS", "45")),
+        poll_interval_seconds=float(source.get("VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS", "0.5")),
+    )
+
+
+def load_whisper_provider_config(
+    environ: Mapping[str, str] | None = None,
+) -> WhisperCppConfig | None:
+    """Load `whisper-cli` configuration from the environment."""
+
+    source = environ or os.environ
+    model_path = source.get("VOICELAYER_WHISPER_MODEL_PATH")
+    if not model_path:
+        return None
+
+    return WhisperCppConfig(
+        binary=source.get("VOICELAYER_WHISPER_BIN", "whisper-cli"),
+        model_path=model_path.strip(),
+        timeout_seconds=float(source.get("VOICELAYER_WHISPER_TIMEOUT_SECONDS", "300")),
+        no_gpu=source.get("VOICELAYER_WHISPER_NO_GPU", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        extra_args=tuple(shlex.split(source.get("VOICELAYER_WHISPER_ARGS", ""))),
+    )
