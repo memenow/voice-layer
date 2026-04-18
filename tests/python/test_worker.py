@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import pathlib
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -22,13 +21,12 @@ from voicelayer_orchestrator.worker import (  # noqa: E402
     METHOD_NOT_FOUND_CODE,
     PARSE_ERROR_CODE,
     PROVIDER_UNAVAILABLE_CODE,
-    ensure_llm_endpoint,
     handle_request,
     load_llama_server_launch_config,
     load_llm_provider_config,
     load_whisper_provider_config,
-    resolve_models_url,
     resolve_chat_completions_url,
+    resolve_models_url,
     serve,
     supported_providers,
     validate_whisper_provider,
@@ -41,9 +39,7 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(
-                json.dumps({"data": [{"id": "gemma-3-1b-it"}]}).encode("utf-8")
-            )
+            self.wfile.write(json.dumps({"data": [{"id": "gemma-3-1b-it"}]}).encode("utf-8"))
             return
 
         self.send_response(404)
@@ -58,15 +54,7 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(
                 json.dumps(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": "Professional backend status update."
-                                }
-                            }
-                        ]
-                    }
+                    {"choices": [{"message": {"content": "Professional backend status update."}}]}
                 ).encode("utf-8")
             )
             return
@@ -85,9 +73,7 @@ class FakeOpenAIServerMixin:
     def setUp(self) -> None:
         super().setUp()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAIHandler)
-        self.server_thread = threading.Thread(
-            target=self.server.serve_forever, daemon=True
-        )
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
         self.endpoint = f"http://127.0.0.1:{self.server.server_port}"
 
@@ -128,10 +114,13 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
 
                     def do_GET(self):
                         if self.path == "/v1/models":
+                            payload = json.dumps(
+                                {{"data": [{{"id": "gemma-3-1b-it"}}]}}
+                            ).encode("utf-8")
                             self.send_response(200)
                             self.send_header("Content-Type", "application/json")
                             self.end_headers()
-                            self.wfile.write(json.dumps({{"data": [{{"id": "gemma-3-1b-it"}}]}}).encode("utf-8"))
+                            self.wfile.write(payload)
                             self._count()
                             return
                         self.send_response(404)
@@ -141,10 +130,21 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
                         if self.path == "/v1/chat/completions":
                             length = int(self.headers.get("Content-Length", "0"))
                             self.rfile.read(length)
+                            payload = json.dumps(
+                                {{
+                                    "choices": [
+                                        {{
+                                            "message": {{
+                                                "content": "Auto-started llama-server response."
+                                            }}
+                                        }}
+                                    ]
+                                }}
+                            ).encode("utf-8")
                             self.send_response(200)
                             self.send_header("Content-Type", "application/json")
                             self.end_headers()
-                            self.wfile.write(json.dumps({{"choices": [{{"message": {{"content": "Auto-started llama-server response."}}}}]}}).encode("utf-8"))
+                            self.wfile.write(payload)
                             self._count()
                             return
                         self.send_response(404)
@@ -227,9 +227,7 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
 
     def test_provider_config_requires_endpoint_and_model(self) -> None:
         self.assertIsNone(
-            load_llm_provider_config(
-                {"VOICELAYER_LLM_ENDPOINT": "http://localhost:8080"}
-            )
+            load_llm_provider_config({"VOICELAYER_LLM_ENDPOINT": "http://localhost:8080"})
         )
         self.assertIsNone(load_llm_provider_config({"VOICELAYER_LLM_MODEL": "gemma"}))
 
@@ -263,9 +261,7 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
 
     def test_whisper_provider_config_requires_model(self) -> None:
         self.assertIsNone(load_whisper_provider_config({}))
-        self.assertIsNone(
-            load_whisper_provider_config({"VOICELAYER_WHISPER_BIN": "whisper-cli"})
-        )
+        self.assertIsNone(load_whisper_provider_config({"VOICELAYER_WHISPER_BIN": "whisper-cli"}))
 
     def test_validate_whisper_provider_detects_missing_binary(self) -> None:
         config = load_whisper_provider_config(

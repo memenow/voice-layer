@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import os
-import socket
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,12 +15,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import atexit
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-import shlex
-import shutil
-from typing import Any, Mapping, TextIO
+from typing import Any, TextIO
 
 from voicelayer_orchestrator.protocol import JSONRPC_VERSION, make_error, make_result
 
@@ -120,12 +121,8 @@ def load_llama_server_launch_config(
         model_path=source.get("VOICELAYER_LLAMA_MODEL_PATH"),
         hf_repo=source.get("VOICELAYER_LLAMA_HF_REPO"),
         extra_args=tuple(shlex.split(source.get("VOICELAYER_LLAMA_SERVER_ARGS", ""))),
-        launch_timeout_seconds=float(
-            source.get("VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS", "45")
-        ),
-        poll_interval_seconds=float(
-            source.get("VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS", "0.5")
-        ),
+        launch_timeout_seconds=float(source.get("VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS", "45")),
+        poll_interval_seconds=float(source.get("VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS", "0.5")),
     )
 
 
@@ -284,11 +281,7 @@ def invoke_chat_completion(
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            **(
-                {"Authorization": f"Bearer {config.api_key}"}
-                if config.api_key is not None
-                else {}
-            ),
+            **({"Authorization": f"Bearer {config.api_key}"} if config.api_key is not None else {}),
         },
         method="POST",
     )
@@ -305,7 +298,7 @@ def invoke_chat_completion(
         raise ProviderInvocationError(
             f"Configured LLM endpoint is unreachable: {exc.reason}"
         ) from exc
-    except socket.timeout as exc:
+    except TimeoutError as exc:
         raise ProviderInvocationError("Configured LLM endpoint timed out.") from exc
 
     try:
@@ -317,9 +310,7 @@ def invoke_chat_completion(
 
     text = render_content_text(content)
     if not text:
-        raise ProviderInvocationError(
-            "Configured LLM endpoint returned an empty completion."
-        )
+        raise ProviderInvocationError("Configured LLM endpoint returned an empty completion.")
     return text
 
 
@@ -380,7 +371,8 @@ def build_llama_server_command(
         source_args = ["-hf", launch.hf_repo]
     else:
         raise ProviderInvocationError(
-            "Automatic llama-server startup requires `VOICELAYER_LLAMA_MODEL_PATH` or `VOICELAYER_LLAMA_HF_REPO`."
+            "Automatic llama-server startup requires "
+            "`VOICELAYER_LLAMA_MODEL_PATH` or `VOICELAYER_LLAMA_HF_REPO`."
         )
 
     return [
@@ -476,10 +468,8 @@ def autostart_llama_server(
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def probe_llm_endpoint(config: OpenAICompatibleConfig) -> tuple[bool, str | None]:
@@ -488,9 +478,7 @@ def probe_llm_endpoint(config: OpenAICompatibleConfig) -> tuple[bool, str | None
     request = urllib.request.Request(
         resolve_models_url(config.endpoint),
         headers=(
-            {"Authorization": f"Bearer {config.api_key}"}
-            if config.api_key is not None
-            else {}
+            {"Authorization": f"Bearer {config.api_key}"} if config.api_key is not None else {}
         ),
         method="GET",
     )
@@ -503,7 +491,7 @@ def probe_llm_endpoint(config: OpenAICompatibleConfig) -> tuple[bool, str | None
         return False, f"HTTP {exc.code}: {detail}"
     except urllib.error.URLError as exc:
         return False, f"unreachable: {exc.reason}"
-    except socket.timeout:
+    except TimeoutError:
         return False, "timeout"
 
     if isinstance(body, dict) and isinstance(body.get("data"), list):
@@ -600,7 +588,8 @@ def transcribe_with_whisper_cli(
         "detected_language": None if language == "auto" else language,
         "notes": [
             f"Transcribed by `{config.binary}` using model `{config.model_path}`.",
-            "Input audio must be supported by whisper.cpp CLI; the official example supports flac, mp3, ogg, and wav.",
+            "Input audio must be supported by whisper.cpp CLI; "
+            "the official example supports flac, mp3, ogg, and wav.",
         ],
     }
 
@@ -648,9 +637,10 @@ def build_rewrite_payload(
         "You are VoiceLayer Rewrite. Rewrite the provided text according to the requested style. "
         "Return only the rewritten text."
     )
+    language_hint = output_language or "keep source language unless the style requires translation"
     user_prompt = (
         f"Rewrite style: {style}\n"
-        f"Preferred output language: {output_language or 'keep source language unless the style requires translation'}\n"
+        f"Preferred output language: {language_hint}\n"
         f"Source text:\n{source_text}"
     )
     generated_text = invoke_chat_completion(system_prompt, user_prompt, config)
@@ -674,8 +664,8 @@ def build_translate_payload(
         )
 
     system_prompt = (
-        "You are VoiceLayer Translate. Translate the input faithfully while preserving technical terms. "
-        "Return only the translated text."
+        "You are VoiceLayer Translate. Translate the input faithfully while "
+        "preserving technical terms. Return only the translated text."
     )
     user_prompt = f"Target language: {target_language}\nSource text:\n{source_text}"
     generated_text = invoke_chat_completion(system_prompt, user_prompt, config)
@@ -711,9 +701,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 "protocol": JSONRPC_VERSION,
                 "asr_configured": asr_configured,
                 "asr_binary": None if whisper_config is None else whisper_config.binary,
-                "asr_model_path": None
-                if whisper_config is None
-                else whisper_config.model_path,
+                "asr_model_path": None if whisper_config is None else whisper_config.model_path,
                 "asr_error": asr_error,
                 "llm_configured": config is not None,
                 "llm_model": None if config is None else config.model,

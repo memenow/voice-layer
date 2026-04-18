@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 JSONRPC_VERSION = "2.0"
 
 
@@ -18,7 +17,9 @@ def make_result(identifier: Any, result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def make_error(identifier: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+def make_error(
+    identifier: Any, code: int, message: str, data: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Build a JSON-RPC error response."""
 
     payload: dict[str, Any] = {

@@ -863,6 +863,7 @@ fn parse_bool(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_foreground_ptt(
     language: Option<String>,
     backend: CliRecorderBackend,
@@ -1171,16 +1172,15 @@ fn apply_dictation_result_to_ui(
         copy_result_to_clipboard(ui, &result.transcription.text);
     }
 
-    if matches!(ui.default_stop_action, StopAction::Save) {
-        if let Some(text) = ui.last_transcript_full.clone() {
-            match save_transcript_to_target_dir(&text, ui.save_dir.as_deref()) {
-                Ok(path) => {
-                    ui.last_injection_status =
-                        Some(format!("Saved transcript to {}.", path.display()));
-                }
-                Err(error) => {
-                    ui.last_error = Some(format!("Failed to save transcript: {error}"));
-                }
+    if matches!(ui.default_stop_action, StopAction::Save)
+        && let Some(text) = ui.last_transcript_full.clone()
+    {
+        match save_transcript_to_target_dir(&text, ui.save_dir.as_deref()) {
+            Ok(path) => {
+                ui.last_injection_status = Some(format!("Saved transcript to {}.", path.display()));
+            }
+            Err(error) => {
+                ui.last_error = Some(format!("Failed to save transcript: {error}"));
             }
         }
     }
@@ -1748,10 +1748,10 @@ fn prompt_for_tmux_pane(
         return Ok(None);
     }
 
-    if let Ok(index) = input.parse::<usize>() {
-        if (1..=candidates.len()).contains(&index) {
-            return Ok(Some(candidates[index - 1].pane_id.clone()));
-        }
+    if let Ok(index) = input.parse::<usize>()
+        && (1..=candidates.len()).contains(&index)
+    {
+        return Ok(Some(candidates[index - 1].pane_id.clone()));
     }
 
     if let Some(pane) = candidates.iter().find(|pane| pane.pane_id == input) {
