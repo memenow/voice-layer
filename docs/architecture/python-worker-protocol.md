@@ -20,19 +20,27 @@ The Python worker boundary exists so provider-specific logic can move faster wit
 - `translate`
 - `transcribe`
 
-## Current Scaffold Behavior
+## Current Behavior
 
-The worker currently implements:
+The worker implements every required method with real providers:
 
-- health reporting
-- provider listing
-- explicit provider-unavailable errors for generation and transcription methods
+- `health` reports ASR and LLM readiness, probes the configured LLM endpoint, and surfaces
+  `asr_configured`, `asr_error`, `llm_configured`, `llm_reachable`, and `llm_error`.
+- `list_providers` returns the whisper.cpp ASR descriptor plus the configured LLM descriptor, or a
+  stub LLM descriptor when no endpoint is set.
+- `transcribe` invokes `whisper-cli` through `providers/whisper_cli.py` against a local audio file.
+- `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
+  endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
+  via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.
 
-The Rust daemon and CLI now invoke these methods through a live stdio bridge.
-`health` and `list_providers` are exercised end-to-end in Rust tests.
+The Rust daemon and CLI invoke every method through a live stdio bridge. `health` and
+`list_providers` are exercised end-to-end in Rust integration tests; transcription, chat
+completion, llama-server auto-start, and URL normalization are covered by Python unit tests in
+`tests/python/test_worker.py`.
 
-The worker does not fabricate generated text.
-That preserves production-safe behavior while the provider adapters are still being wired.
+When a provider is not configured, the worker returns `-32004` (provider unavailable) rather than
+fabricating output. When a configured provider fails at runtime, it returns `-32005`
+(provider request failed).
 
 ## Error Policy
 
@@ -40,13 +48,11 @@ That preserves production-safe behavior while the provider adapters are still be
 - Method not found: `-32601`
 - Parse error: `-32700`
 - Provider unavailable: `-32004`
+- Provider request failed: `-32005`
 
-## Next Implementation Step
+## Preview Payload Shape
 
-The first real provider integration should add a `compose` execution path without changing the protocol shape.
-That keeps the daemon, CLI, and future UI surfaces stable while model runtime work evolves.
-
-When `compose`, `rewrite`, or `translate` eventually succeed, the worker should return a preview payload shaped as:
+`compose`, `rewrite`, and `translate` return a preview payload shaped as:
 
 ```json
 {
@@ -55,3 +61,17 @@ When `compose`, `rewrite`, or `translate` eventually succeed, the worker should 
   "notes": ["string"]
 }
 ```
+
+## Module Layout
+
+Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
+
+- `llm_openai_compatible.py` — chat completion HTTP client, endpoint URL normalization, preview
+  payload builders.
+- `llama_autostart.py` — optional background launch and readiness polling for `llama-server`.
+- `whisper_cli.py` — validation and invocation of the `whisper-cli` subprocess.
+
+Shared utilities live in `providers/__init__.py` (`ProviderInvocationError`,
+`provider_runtime_dir`, `supported_providers`). Environment-backed dataclasses and loaders live
+in `config.py`. `worker.py` is protocol-only: JSON-RPC constants, `handle_request`, `serve`,
+and `main`.
