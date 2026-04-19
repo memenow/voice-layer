@@ -85,20 +85,41 @@ cold-start latency on the operator's own hardware and model. The decision gate i
   `python/voicelayer_orchestrator/providers/whisper_server.py`); segmenting without it is
   strictly slower than the existing one-shot transcription.
 
-The repository ships two helpers for running that measurement reproducibly:
+The repository ships three helpers for running that measurement reproducibly:
 
 ```bash
 # 1. Generate a deterministic 3-second silent fixture (96 KB, 16 kHz mono PCM).
 python3 scripts/generate_silent_fixture.py
 
-# 2. Measure cold-start. Requires VOICELAYER_WHISPER_MODEL_PATH and `whisper-cli` on PATH.
+# 2a. Measure cold-start against a host whisper-cli binary.
 export VOICELAYER_WHISPER_MODEL_PATH=/abs/path/to/ggml-base.en.bin
 RUNS=5 scripts/benchmark-whisper-cold-start.sh
+
+# 2b. OR measure against the official container without installing anything on the host.
+#     Pulls ghcr.io/ggml-org/whisper.cpp:main and caches the model under
+#     ~/.cache/voicelayer/models.
+RUNS=5 scripts/benchmark-whisper-cold-start-docker.sh
 ```
 
-The script prints each run's wall-clock seconds plus mean/min/max and a decision line. If a
+Both scripts print each run's wall-clock seconds plus mean/min/max and a decision line. If a
 different threshold is wanted for the call, override `THRESHOLD_SECONDS` on the command line.
 
 The fixture contains only silence, so its transcription is empty; that is intentional — cold-start
 here measures how long whisper-cli spends mapping the model and initializing the graph before
 producing any tokens.
+
+### Baseline measurement (CPU, ggml-base.en.bin)
+
+Recorded via `scripts/benchmark-whisper-cold-start-docker.sh` with `IMAGE=ghcr.io/ggml-org/whisper.cpp:main`,
+`ggml-base.en.bin`, 5 runs, on an Ubuntu 24 workstation with an RTX 5090 laptop GPU (GPU was not
+enabled for this measurement because the CPU image was used):
+
+- mean: 0.8446 s
+- min : 0.8083 s
+- max : 0.8962 s
+
+The mean is ~3.4× the 0.25 s gate, so the roadmap takes the `whisper-server` detour before
+Phase 3B. The figure includes `docker exec` overhead (~10–30 ms); host `whisper-cli` cold-start
+is at most that much faster and still far above the threshold. Operators with a different
+hardware/model combination should re-run the script and update this section when the value
+changes meaningfully.
