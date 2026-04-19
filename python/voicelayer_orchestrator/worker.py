@@ -9,6 +9,7 @@ from typing import Any, TextIO
 from voicelayer_orchestrator.config import (
     load_llm_provider_config,
     load_whisper_provider_config,
+    load_whisper_server_config,
 )
 from voicelayer_orchestrator.protocol import JSONRPC_VERSION, make_error, make_result
 from voicelayer_orchestrator.providers import ProviderInvocationError, supported_providers
@@ -21,6 +22,10 @@ from voicelayer_orchestrator.providers.llm_openai_compatible import (
 from voicelayer_orchestrator.providers.whisper_cli import (
     transcribe_with_whisper_cli,
     validate_whisper_provider,
+)
+from voicelayer_orchestrator.providers.whisper_server import (
+    ensure_whisper_server,
+    transcribe_with_whisper_server,
 )
 
 PROVIDER_UNAVAILABLE_CODE = -32004
@@ -69,8 +74,31 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         return make_result(identifier, {"providers": supported_providers()})
 
     if method == "transcribe":
-        whisper_config = load_whisper_provider_config()
-        if whisper_config is None:
+        server_config = load_whisper_server_config()
+        server_error: str | None = None
+        if server_config is not None:
+            reachable, probe_error = ensure_whisper_server(server_config)
+            if reachable:
+                try:
+                    result = transcribe_with_whisper_server(params or {}, server_config)
+                    return make_result(identifier, result)
+                except ProviderInvocationError as exc:
+                    server_error = str(exc)
+            else:
+                server_error = probe_error or "whisper-server unreachable"
+
+        cli_config = load_whisper_provider_config()
+        if cli_config is None:
+            if server_error is not None:
+                return make_error(
+                    identifier,
+                    PROVIDER_REQUEST_FAILED_CODE,
+                    (
+                        f"whisper-server failed ({server_error}) and no whisper-cli "
+                        "fallback is configured."
+                    ),
+                    {"method": method},
+                )
             return make_error(
                 identifier,
                 PROVIDER_UNAVAILABLE_CODE,
@@ -79,12 +107,15 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             )
 
         try:
-            result = transcribe_with_whisper_cli(params or {}, whisper_config)
+            result = transcribe_with_whisper_cli(params or {}, cli_config)
         except ProviderInvocationError as exc:
+            detail = str(exc)
+            if server_error is not None:
+                detail = f"{detail} (whisper-server also failed: {server_error})"
             return make_error(
                 identifier,
                 PROVIDER_REQUEST_FAILED_CODE,
-                str(exc),
+                detail,
                 {"method": method},
             )
 

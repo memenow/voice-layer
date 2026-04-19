@@ -28,7 +28,12 @@ The worker implements every required method with real providers:
   `asr_configured`, `asr_error`, `llm_configured`, `llm_reachable`, and `llm_error`.
 - `list_providers` returns the whisper.cpp ASR descriptor plus the configured LLM descriptor, or a
   stub LLM descriptor when no endpoint is set.
-- `transcribe` invokes `whisper-cli` through `providers/whisper_cli.py` against a local audio file.
+- `transcribe` prefers a persistent `whisper-server` endpoint when
+  `VOICELAYER_WHISPER_SERVER_*` is configured (see
+  `providers/whisper_server.py`), falling back to one-shot `whisper-cli`
+  via `providers/whisper_cli.py` when the server is unreachable or
+  returns an error. Both paths are independent; configuring only the
+  cli variables keeps the legacy behavior.
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.
@@ -70,6 +75,8 @@ Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
   payload builders.
 - `llama_autostart.py` — optional background launch and readiness polling for `llama-server`.
 - `whisper_cli.py` — validation and invocation of the `whisper-cli` subprocess.
+- `whisper_server.py` — HTTP client, readiness probe, optional autostart, and `/inference`
+  multipart encoder for the persistent `whisper-server` path.
 
 Shared utilities live in `providers/__init__.py` (`ProviderInvocationError`,
 `provider_runtime_dir`, `supported_providers`). Environment-backed dataclasses and loaders live

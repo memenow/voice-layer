@@ -38,7 +38,58 @@ VOICELAYER_WHISPER_NO_GPU=false
 VOICELAYER_WHISPER_ARGS=
 ```
 
-`VOICELAYER_WHISPER_MODEL_PATH` is required for the current implementation.
+`VOICELAYER_WHISPER_MODEL_PATH` is required for the `whisper-cli` path.
+
+### Persistent `whisper-server` (preferred for Phase 3 segmented workflows)
+
+Launching `whisper-cli` once per transcription pays the full model-init cost every call
+(measured at ~0.84s on CPU, see Phase 3 Pre-flight below). A long-lived `whisper-server` process
+keeps the model mmapped and drops per-request latency by roughly the cold-start cost. The worker
+auto-selects the server whenever the configured endpoint is reachable and falls back to
+`whisper-cli` otherwise.
+
+```bash
+VOICELAYER_WHISPER_SERVER_HOST=127.0.0.1
+VOICELAYER_WHISPER_SERVER_PORT=8188
+VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS=60
+VOICELAYER_WHISPER_SERVER_AUTO_START=false
+VOICELAYER_WHISPER_SERVER_BIN=/abs/path/to/whisper-server
+VOICELAYER_WHISPER_SERVER_ARGS=-t 4
+VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS=30
+VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS=0.5
+```
+
+Set any of those variables to opt into the server path; the worker returns to
+`whisper-cli` when none are set. When `VOICELAYER_WHISPER_SERVER_AUTO_START=true` the worker
+launches a background `whisper-server` process against `VOICELAYER_WHISPER_MODEL_PATH` and
+waits up to `LAUNCH_TIMEOUT_SECONDS` for `GET /` to respond. PID, command, and endpoint are
+written under `$XDG_RUNTIME_DIR/voicelayer/providers/` so doctor tooling can recover state.
+
+You can also run the server manually:
+
+```bash
+# Host binary (requires a local whisper.cpp build):
+whisper-server -m /path/to/ggml-base.en.bin --host 127.0.0.1 --port 8188 -t 4
+
+# Docker (no host build):
+docker run -d --name voicelayer-whisper-server \
+  -v /path/to/ggml-base.en.bin:/model.bin:ro \
+  -p 127.0.0.1:8188:8080 \
+  --entrypoint whisper-server \
+  ghcr.io/ggml-org/whisper.cpp:main \
+  -m /model.bin --host 0.0.0.0 --port 8080 -t 4
+```
+
+After either path, configure VoiceLayer to point at it:
+
+```bash
+export VOICELAYER_WHISPER_SERVER_HOST=127.0.0.1
+export VOICELAYER_WHISPER_SERVER_PORT=8188
+```
+
+Both paths use the same `POST /inference` multipart contract (fields `file`, `language`,
+`translate`, `response_format=json`). The worker sends `response_format=json` and parses
+`{"text": "...", "language": "..."}`.
 
 ## Example Source Workflow
 

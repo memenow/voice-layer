@@ -21,6 +21,7 @@ from voicelayer_orchestrator.config import (  # noqa: E402
     load_llama_server_launch_config,
     load_llm_provider_config,
     load_whisper_provider_config,
+    load_whisper_server_config,
 )
 from voicelayer_orchestrator.providers import supported_providers  # noqa: E402
 from voicelayer_orchestrator.providers.llm_openai_compatible import (  # noqa: E402
@@ -29,6 +30,10 @@ from voicelayer_orchestrator.providers.llm_openai_compatible import (  # noqa: E
 )
 from voicelayer_orchestrator.providers.whisper_cli import (  # noqa: E402
     validate_whisper_provider,
+)
+from voicelayer_orchestrator.providers.whisper_server import (  # noqa: E402
+    probe_whisper_server,
+    transcribe_with_whisper_server,
 )
 from voicelayer_orchestrator.worker import (  # noqa: E402
     METHOD_NOT_FOUND_CODE,
@@ -450,6 +455,199 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
         self.assertEqual(exit_code, 0)
         response = json.loads(stdout.getvalue())
         self.assertEqual(response["error"]["code"], PARSE_ERROR_CODE)
+
+
+class FakeWhisperServerHandler(BaseHTTPRequestHandler):
+    text_payload = " hello world\n"
+    language_payload: str | None = "en"
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body>whisper server</body></html>")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/inference":
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            body: dict[str, str] = {"text": self.text_payload}
+            if self.language_payload is not None:
+                body["language"] = self.language_payload
+            self.wfile.write(json.dumps(body).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+
+class WhisperServerProviderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeWhisperServerHandler)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.host = "127.0.0.1"
+        self.port = self.server.server_port
+        self.audio_file = (
+            pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-whisper-server-test-")) / "sample.wav"
+        )
+        self.audio_file.write_bytes(b"RIFFmockdataWAVEfmt ")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=2)
+        super().tearDown()
+
+    def _config(self) -> object:
+        return load_whisper_server_config(
+            {
+                "VOICELAYER_WHISPER_SERVER_HOST": self.host,
+                "VOICELAYER_WHISPER_SERVER_PORT": str(self.port),
+            }
+        )
+
+    def test_whisper_server_config_returns_none_when_nothing_configured(self) -> None:
+        self.assertIsNone(load_whisper_server_config({}))
+
+    def test_whisper_server_config_reads_host_port_and_autostart(self) -> None:
+        config = load_whisper_server_config(
+            {
+                "VOICELAYER_WHISPER_SERVER_HOST": "127.0.0.1",
+                "VOICELAYER_WHISPER_SERVER_PORT": "8188",
+                "VOICELAYER_WHISPER_SERVER_AUTO_START": "true",
+                "VOICELAYER_WHISPER_SERVER_BIN": "/tmp/whisper-server",
+                "VOICELAYER_WHISPER_MODEL_PATH": "/tmp/ggml.bin",
+                "VOICELAYER_WHISPER_SERVER_ARGS": "-t 2",
+            }
+        )
+        assert config is not None
+        self.assertEqual(config.host, "127.0.0.1")
+        self.assertEqual(config.port, 8188)
+        self.assertTrue(config.auto_start)
+        self.assertEqual(config.server_bin, "/tmp/whisper-server")
+        self.assertEqual(config.model_path, "/tmp/ggml.bin")
+        self.assertEqual(config.extra_args, ("-t", "2"))
+        self.assertEqual(config.base_url, "http://127.0.0.1:8188")
+
+    def test_whisper_server_config_defaults_host_and_port_when_only_autostart_set(self) -> None:
+        config = load_whisper_server_config(
+            {
+                "VOICELAYER_WHISPER_SERVER_AUTO_START": "1",
+                "VOICELAYER_WHISPER_SERVER_BIN": "/tmp/whisper-server",
+                "VOICELAYER_WHISPER_MODEL_PATH": "/tmp/ggml.bin",
+            }
+        )
+        assert config is not None
+        self.assertEqual(config.host, "127.0.0.1")
+        self.assertEqual(config.port, 8188)
+
+    def test_probe_whisper_server_returns_reachable_when_root_is_served(self) -> None:
+        reachable, error = probe_whisper_server(self._config())
+        self.assertTrue(reachable)
+        self.assertIsNone(error)
+
+    def test_probe_whisper_server_returns_unreachable_when_port_closed(self) -> None:
+        dead_config = load_whisper_server_config(
+            {
+                "VOICELAYER_WHISPER_SERVER_HOST": "127.0.0.1",
+                "VOICELAYER_WHISPER_SERVER_PORT": "1",
+            }
+        )
+        reachable, error = probe_whisper_server(dead_config, timeout_seconds=1.0)
+        self.assertFalse(reachable)
+        self.assertIsNotNone(error)
+
+    def test_transcribe_with_whisper_server_returns_text(self) -> None:
+        FakeWhisperServerHandler.text_payload = " hello world\n"
+        FakeWhisperServerHandler.language_payload = "en"
+        result = transcribe_with_whisper_server(
+            {"audio_file": str(self.audio_file), "language": "auto"},
+            self._config(),
+        )
+        self.assertEqual(result["text"], "hello world")
+        self.assertEqual(result["detected_language"], "en")
+        self.assertTrue(result["notes"])
+
+    def test_transcribe_with_whisper_server_blank_audio_returns_empty_text(self) -> None:
+        FakeWhisperServerHandler.text_payload = " [BLANK_AUDIO]\n"
+        FakeWhisperServerHandler.language_payload = None
+        result = transcribe_with_whisper_server(
+            {"audio_file": str(self.audio_file), "language": "auto"},
+            self._config(),
+        )
+        self.assertEqual(result["text"], "")
+
+    def test_handle_request_dispatches_transcribe_to_whisper_server(self) -> None:
+        FakeWhisperServerHandler.text_payload = " server path\n"
+        FakeWhisperServerHandler.language_payload = "en"
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_WHISPER_SERVER_HOST": self.host,
+                "VOICELAYER_WHISPER_SERVER_PORT": str(self.port),
+            },
+            clear=False,
+        ):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 20,
+                    "method": "transcribe",
+                    "params": {
+                        "audio_file": str(self.audio_file),
+                        "language": "auto",
+                    },
+                }
+            )
+        assert response is not None
+        self.assertEqual(response["result"]["text"], "server path")
+
+
+class WhisperTranscribeFallbackTest(FakeOpenAIServerMixin, unittest.TestCase):
+    """When whisper-server is unreachable, the dispatcher falls back to whisper-cli."""
+
+    def create_fake_whisper_cli_script(self) -> tuple[str, str, str]:
+        return WorkerProtocolTest.create_fake_whisper_cli_script(self)  # type: ignore[arg-type]
+
+    def test_transcribe_falls_back_to_whisper_cli_when_server_unreachable(self) -> None:
+        script_path, model_path, audio_path = self.create_fake_whisper_cli_script()
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_WHISPER_BIN": script_path,
+                "VOICELAYER_WHISPER_MODEL_PATH": model_path,
+                "VOICELAYER_WHISPER_SERVER_HOST": "127.0.0.1",
+                "VOICELAYER_WHISPER_SERVER_PORT": "1",
+            },
+            clear=False,
+        ):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 21,
+                    "method": "transcribe",
+                    "params": {
+                        "audio_file": audio_path,
+                        "language": "auto",
+                    },
+                }
+            )
+        assert response is not None
+        self.assertIn("result", response)
+        self.assertEqual(response["result"]["text"], "Recognized transcript.")
 
 
 if __name__ == "__main__":

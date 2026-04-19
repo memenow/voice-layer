@@ -41,6 +41,25 @@ class WhisperCppConfig:
     extra_args: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class WhisperServerConfig:
+    """Configuration for talking to a persistent `whisper-server` HTTP endpoint."""
+
+    host: str
+    port: int
+    timeout_seconds: float
+    auto_start: bool
+    server_bin: str | None
+    model_path: str | None
+    extra_args: tuple[str, ...]
+    launch_timeout_seconds: float
+    poll_interval_seconds: float
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
 def load_llm_provider_config(
     environ: Mapping[str, str] | None = None,
 ) -> OpenAICompatibleConfig | None:
@@ -99,4 +118,48 @@ def load_whisper_provider_config(
         no_gpu=source.get("VOICELAYER_WHISPER_NO_GPU", "").strip().lower()
         in {"1", "true", "yes", "on"},
         extra_args=tuple(shlex.split(source.get("VOICELAYER_WHISPER_ARGS", ""))),
+    )
+
+
+def load_whisper_server_config(
+    environ: Mapping[str, str] | None = None,
+) -> WhisperServerConfig | None:
+    """Load persistent `whisper-server` configuration from the environment.
+
+    Returns None when neither a host/port pair nor an autostart binary is
+    configured, so callers can fall back to the one-shot ``whisper-cli``
+    provider without handling an error.
+    """
+
+    source = environ or os.environ
+    host = source.get("VOICELAYER_WHISPER_SERVER_HOST", "").strip()
+    port_str = source.get("VOICELAYER_WHISPER_SERVER_PORT", "").strip()
+    server_bin = source.get("VOICELAYER_WHISPER_SERVER_BIN")
+    auto_start = source.get("VOICELAYER_WHISPER_SERVER_AUTO_START", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    if not host and not port_str and not server_bin and not auto_start:
+        return None
+
+    resolved_host = host or "127.0.0.1"
+    resolved_port = int(port_str) if port_str else 8188
+
+    return WhisperServerConfig(
+        host=resolved_host,
+        port=resolved_port,
+        timeout_seconds=float(source.get("VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS", "60")),
+        auto_start=auto_start,
+        server_bin=server_bin,
+        model_path=source.get("VOICELAYER_WHISPER_MODEL_PATH"),
+        extra_args=tuple(shlex.split(source.get("VOICELAYER_WHISPER_SERVER_ARGS", ""))),
+        launch_timeout_seconds=float(
+            source.get("VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS", "30")
+        ),
+        poll_interval_seconds=float(
+            source.get("VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS", "0.5")
+        ),
     )
