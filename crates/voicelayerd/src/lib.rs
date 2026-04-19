@@ -24,10 +24,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::info;
 use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
-    DictationCaptureResult, EventEnvelope, HealthResponse, InjectRequest, InjectionPlan,
-    PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest, SessionMode, SessionState,
-    StartDictationRequest, StopDictationRequest, TranscribeRequest, TranscriptionResult,
-    TranslateRequest, WorkerHealthSummary, default_host_adapter_catalog,
+    DictationCaptureResult, DictationFailureKind, EventEnvelope, HealthResponse, InjectRequest,
+    InjectionPlan, PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest, SessionMode,
+    SessionState, StartDictationRequest, StopDictationRequest, TranscribeRequest,
+    TranscriptionResult, TranslateRequest, WorkerHealthSummary, default_host_adapter_catalog,
 };
 
 pub mod hotkeys;
@@ -411,6 +411,7 @@ pub async fn capture_dictation_once(
 
     let mut session = transition_session_state(session, SessionState::Listening);
     let audio_file = temp_audio_path();
+    let mut failure_kind: Option<DictationFailureKind> = None;
     let transcription = match record_audio_file(
         &audio_file,
         request.duration_seconds,
@@ -433,6 +434,7 @@ pub async fn capture_dictation_once(
                 }
                 Err(error) => {
                     session = transition_session_state(session, SessionState::Failed);
+                    failure_kind = Some(DictationFailureKind::AsrFailed);
                     TranscriptionResult {
                         text: String::new(),
                         detected_language: None,
@@ -443,6 +445,7 @@ pub async fn capture_dictation_once(
         }
         Err(error) => {
             session = transition_session_state(session, SessionState::Failed);
+            failure_kind = Some(DictationFailureKind::RecordingFailed);
             TranscriptionResult {
                 text: String::new(),
                 detected_language: None,
@@ -456,6 +459,7 @@ pub async fn capture_dictation_once(
         session,
         transcription,
         audio_file,
+        failure_kind,
     }
 }
 
@@ -494,6 +498,7 @@ async fn stop_live_dictation_with_state(
                 ],
             },
             audio_file: None,
+            failure_kind: Some(DictationFailureKind::RecordingFailed),
         };
     };
 
@@ -523,10 +528,12 @@ async fn stop_live_dictation_with_state(
                     notes: vec![format!("Recording detail: {error}")],
                 },
                 audio_file: None,
+                failure_kind: Some(DictationFailureKind::RecordingFailed),
             };
         }
     };
 
+    let mut failure_kind: Option<DictationFailureKind> = None;
     let transcription = match state
         .config
         .worker_command
@@ -543,6 +550,7 @@ async fn stop_live_dictation_with_state(
         }
         Err(error) => {
             session = transition_session_state(session, SessionState::Failed);
+            failure_kind = Some(DictationFailureKind::AsrFailed);
             TranscriptionResult {
                 text: String::new(),
                 detected_language: None,
@@ -570,6 +578,7 @@ async fn stop_live_dictation_with_state(
         session,
         transcription,
         audio_file: maybe_cleanup_audio_file(&audio_file, active.keep_audio),
+        failure_kind,
     }
 }
 
@@ -601,6 +610,7 @@ async fn capture_dictation_with_state(
     ));
 
     let audio_file = temp_audio_path();
+    let mut failure_kind: Option<DictationFailureKind> = None;
     let transcription = match record_audio_file(
         &audio_file,
         request.duration_seconds,
@@ -637,6 +647,7 @@ async fn capture_dictation_with_state(
                 }
                 Err(error) => {
                     session = transition_session_state(session, SessionState::Failed);
+                    failure_kind = Some(DictationFailureKind::AsrFailed);
                     store_session(&state, session.clone()).await;
                     let _ = state.events.send(EventEnvelope::new(
                         "dictation.failed",
@@ -653,6 +664,7 @@ async fn capture_dictation_with_state(
         }
         Err(error) => {
             session = transition_session_state(session, SessionState::Failed);
+            failure_kind = Some(DictationFailureKind::RecordingFailed);
             store_session(&state, session.clone()).await;
             let _ = state.events.send(EventEnvelope::new(
                 "dictation.failed",
@@ -671,6 +683,7 @@ async fn capture_dictation_with_state(
         session,
         transcription,
         audio_file: maybe_cleanup_audio_file(&audio_file, request.keep_audio),
+        failure_kind,
     }
 }
 

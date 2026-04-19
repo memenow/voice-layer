@@ -150,11 +150,25 @@ pub struct DictationCaptureRequest {
     pub keep_audio: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DictationFailureKind {
+    /// The recorder subprocess failed to capture audio or stop cleanly.
+    RecordingFailed,
+    /// The ASR worker reached the audio but failed to produce a transcript.
+    AsrFailed,
+    /// The transcript was produced but injecting it into the foreground target failed.
+    /// Only the client (CLI, desktop shell) can classify this; the daemon never sets it.
+    InjectionFailed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DictationCaptureResult {
     pub session: CaptureSession,
     pub transcription: TranscriptionResult,
     pub audio_file: Option<String>,
+    #[serde(default)]
+    pub failure_kind: Option<DictationFailureKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -350,4 +364,33 @@ pub fn now_epoch_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DictationFailureKind;
+
+    #[test]
+    fn dictation_failure_kind_serializes_to_snake_case_variants() {
+        assert_eq!(
+            serde_json::to_string(&DictationFailureKind::RecordingFailed).unwrap(),
+            "\"recording_failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DictationFailureKind::AsrFailed).unwrap(),
+            "\"asr_failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DictationFailureKind::InjectionFailed).unwrap(),
+            "\"injection_failed\""
+        );
+    }
+
+    #[test]
+    fn dictation_failure_kind_round_trips_through_json() {
+        let original = DictationFailureKind::AsrFailed;
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: DictationFailureKind = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
 }

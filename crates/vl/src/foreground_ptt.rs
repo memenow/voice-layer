@@ -55,8 +55,8 @@ use crossterm::{
     },
 };
 use voicelayer_core::{
-    DictationCaptureResult, LanguageProfile, LanguageStrategy, SessionState, StartDictationRequest,
-    StopDictationRequest, TriggerKind,
+    DictationCaptureResult, DictationFailureKind, LanguageProfile, LanguageStrategy, SessionState,
+    StartDictationRequest, StopDictationRequest, TriggerKind,
 };
 
 use crate::config::{CliPttKey, CliRecorderBackend, StopAction};
@@ -403,8 +403,9 @@ fn apply_dictation_result_to_ui(
                         ))
                     }
                     Err(error) => {
-                        ui.last_error =
-                            Some(format!("tmux pane {target_pane} injection failed: {error}"))
+                        ui.last_error = Some(format!(
+                            "[injection-failed] tmux pane {target_pane}: {error}"
+                        ))
                     }
                 }
             }
@@ -421,8 +422,9 @@ fn apply_dictation_result_to_ui(
                         ))
                     }
                     Err(error) => {
-                        ui.last_error =
-                            Some(format!("WezTerm pane {pane_id} injection failed: {error}"))
+                        ui.last_error = Some(format!(
+                            "[injection-failed] WezTerm pane {pane_id}: {error}"
+                        ))
                     }
                 }
             }
@@ -441,7 +443,7 @@ fn apply_dictation_result_to_ui(
                     }
                     Err(error) => {
                         ui.last_error = Some(format!(
-                            "Kitty target {} injection failed: {error}",
+                            "[injection-failed] Kitty target {}: {error}",
                             r#match
                         ))
                     }
@@ -459,8 +461,33 @@ fn apply_dictation_result_to_ui(
             }
         }
     }
-    if result.session.state == SessionState::Failed && ui.last_error.is_none() {
+    if let Some(kind) = result.failure_kind {
+        let tag = failure_kind_tag(kind);
+        let detail = result
+            .transcription
+            .notes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "dictation failure reported without detail.".to_owned());
+        let prefixed = format!("{tag} {detail}");
+        if ui
+            .last_error
+            .as_deref()
+            .is_none_or(|existing| !existing.starts_with("[injection-failed]"))
+        {
+            ui.last_error = Some(prefixed.clone());
+        }
+        ui.push_event(prefixed);
+    } else if result.session.state == SessionState::Failed && ui.last_error.is_none() {
         ui.last_error = result.transcription.notes.first().cloned();
+    }
+}
+
+fn failure_kind_tag(kind: DictationFailureKind) -> &'static str {
+    match kind {
+        DictationFailureKind::RecordingFailed => "[recording-failed]",
+        DictationFailureKind::AsrFailed => "[asr-failed]",
+        DictationFailureKind::InjectionFailed => "[injection-failed]",
     }
 }
 

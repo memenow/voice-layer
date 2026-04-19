@@ -492,3 +492,22 @@ components:
           type:
             - string
             - "null"
+        failure_kind:
+          description: |
+            When the dictation session did not complete successfully, identifies which
+            stage failed so clients can route the error to the right subsystem. Absent
+            (or null) on successful completions.
+            - `recording_failed`: the recorder subprocess could not capture or cleanly
+              stop audio.
+            - `asr_failed`: audio was captured but the worker failed to transcribe it.
+            - `injection_failed`: the transcript was produced but injecting it into the
+              foreground target failed. Only set by the client (CLI, desktop shell);
+              the daemon never emits this variant.
+          type:
+            - string
+            - "null"
+          enum:
+            - recording_failed
+            - asr_failed
+            - injection_failed
+            - null
