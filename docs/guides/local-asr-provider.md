@@ -73,3 +73,32 @@ It does not yet cover:
 - background ASR daemonization
 
 Those belong to the next stage of the VoiceLayer runtime.
+
+## Phase 3 Pre-flight: Cold-start Measurement
+
+Phase 3 of the roadmap (near-real-time ASR) depends on a concrete measurement of `whisper-cli`
+cold-start latency on the operator's own hardware and model. The decision gate is:
+
+- mean cold-start under ~0.25 s → proceed directly with fixed-duration segment transcription
+  (Phase 3B).
+- mean cold-start ≥ ~0.25 s → introduce a persistent `whisper-server` provider first (new
+  `python/voicelayer_orchestrator/providers/whisper_server.py`); segmenting without it is
+  strictly slower than the existing one-shot transcription.
+
+The repository ships two helpers for running that measurement reproducibly:
+
+```bash
+# 1. Generate a deterministic 3-second silent fixture (96 KB, 16 kHz mono PCM).
+python3 scripts/generate_silent_fixture.py
+
+# 2. Measure cold-start. Requires VOICELAYER_WHISPER_MODEL_PATH and `whisper-cli` on PATH.
+export VOICELAYER_WHISPER_MODEL_PATH=/abs/path/to/ggml-base.en.bin
+RUNS=5 scripts/benchmark-whisper-cold-start.sh
+```
+
+The script prints each run's wall-clock seconds plus mean/min/max and a decision line. If a
+different threshold is wanted for the call, override `THRESHOLD_SECONDS` on the command line.
+
+The fixture contains only silence, so its transcription is empty; that is intentional — cold-start
+here measures how long whisper-cli spends mapping the model and initializing the graph before
+producing any tokens.
