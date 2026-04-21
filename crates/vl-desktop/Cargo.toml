@@ -1,0 +1,26 @@
+[package]
+name = "vl-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "global_shortcuts",
+] }
+bytes.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+iced = { version = "0.14", features = ["tokio"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+voicelayer-core = { path = "../voicelayer-core" }
+voicelayerd = { path = "../voicelayerd" }

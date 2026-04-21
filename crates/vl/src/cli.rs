@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -228,19 +230,121 @@ struct DoctorReport {
     asr_binary: Option<String>,
     asr_model_path: Option<String>,
     asr_error: Option<String>,
+    whisper_mode: &'static str,
     llm_configured: bool,
     llm_model: Option<String>,
     llm_endpoint: Option<String>,
     llm_reachable: bool,
     llm_error: Option<String>,
+    llama_autostart_active: bool,
     global_shortcuts_portal_available: bool,
     global_shortcuts_portal_version: Option<u32>,
     global_shortcuts_portal_error: Option<String>,
     recorder: RecorderDiagnostics,
+    systemd_unit_installed: bool,
+    systemd_unit_active: bool,
     wayland_display: Option<String>,
     x11_display: Option<String>,
     dbus_session_bus_address: Option<String>,
     xdg_runtime_dir: Option<String>,
+}
+
+fn detect_whisper_mode() -> &'static str {
+    let server_configured = [
+        "VOICELAYER_WHISPER_SERVER_HOST",
+        "VOICELAYER_WHISPER_SERVER_PORT",
+        "VOICELAYER_WHISPER_SERVER_BIN",
+    ]
+    .iter()
+    .any(|key| {
+        std::env::var_os(key)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+    }) || matches!(
+        std::env::var("VOICELAYER_WHISPER_SERVER_AUTO_START")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(ref value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    );
+
+    if server_configured {
+        return "server";
+    }
+
+    let cli_configured = std::env::var_os("VOICELAYER_WHISPER_MODEL_PATH")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false);
+    if cli_configured {
+        "cli"
+    } else {
+        "unconfigured"
+    }
+}
+
+fn provider_state_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("voicelayer").join("providers")
+}
+
+fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn llama_autostart_active() -> bool {
+    let Ok(entries) = fs::read_dir(provider_state_dir()) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Skip whisper-server state; it has its own `whisper-server-*.json`
+        // prefix. Everything else under providers/ is a llama-server
+        // autostart record keyed by `{host}-{port}.json`.
+        if !name.ends_with(".json") || name.starts_with("whisper-server-") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if is_pid_alive(pid as i32) {
+            return true;
+        }
+    }
+    false
+}
+
+fn systemd_user_unit_path() -> Option<PathBuf> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(config_dir.join("systemd/user/voicelayerd.service"))
+}
+
+fn systemd_unit_installed() -> bool {
+    systemd_user_unit_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+fn systemd_unit_active() -> bool {
+    ProcessCommand::new("systemctl")
+        .args(["--user", "is-active", "voicelayerd"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -442,15 +546,19 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 asr_binary,
                 asr_model_path,
                 asr_error,
+                whisper_mode: detect_whisper_mode(),
                 llm_configured,
                 llm_model,
                 llm_endpoint,
                 llm_reachable,
                 llm_error,
+                llama_autostart_active: llama_autostart_active(),
                 global_shortcuts_portal_available: portal.available,
                 global_shortcuts_portal_version: portal.version,
                 global_shortcuts_portal_error: portal.error,
                 recorder: recorder_diagnostics(RecorderBackend::Auto),
+                systemd_unit_installed: systemd_unit_installed(),
+                systemd_unit_active: systemd_unit_active(),
                 wayland_display: std::env::var("WAYLAND_DISPLAY").ok(),
                 x11_display: std::env::var("DISPLAY").ok(),
                 dbus_session_bus_address: std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),

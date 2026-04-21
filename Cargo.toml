@@ -3,6 +3,7 @@ members = [
   "crates/voicelayer-core",
   "crates/voicelayerd",
   "crates/vl",
+  "crates/vl-desktop",
 ]
 resolver = "2"
 
