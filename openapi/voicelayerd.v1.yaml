@@ -297,6 +297,39 @@ components:
           type: boolean
         keep_audio:
           type: boolean
+        segmentation:
+          $ref: "#/components/schemas/SegmentationMode"
+    SegmentationMode:
+      description: |
+        Controls how the recorder subprocess is rolled during a live dictation
+        session. When omitted the daemon uses `one_shot`, which keeps the
+        pre-Phase-3 behavior (a single recording across the whole session).
+        `fixed` rotates the recorder every `segment_secs` seconds so each
+        chunk can be transcribed while the next segment captures.
+      oneOf:
+        - type: object
+          required: [mode]
+          properties:
+            mode:
+              type: string
+              enum: [one_shot]
+        - type: object
+          required: [mode, segment_secs]
+          properties:
+            mode:
+              type: string
+              enum: [fixed]
+            segment_secs:
+              type: integer
+              minimum: 1
+              description: Duration of each captured segment in whole seconds.
+            overlap_secs:
+              type: integer
+              minimum: 0
+              default: 0
+              description: |
+                Reserved for later stitching; the Phase 3B MVP accepts the
+                value but does not yet overlap consecutive segments.
     StopDictationRequest:
       type: object
       required: [session_id]

@@ -16,7 +16,7 @@ pub enum SessionMode {
     Translate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Idle,
@@ -126,14 +126,38 @@ pub struct StartDictationRequest {
     pub translate_to_english: bool,
     #[serde(default)]
     pub keep_audio: bool,
+    #[serde(default)]
+    pub segmentation: SegmentationMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecorderBackend {
     Auto,
     Pipewire,
     Alsa,
+}
+
+/// Describes how audio capture should be segmented for transcription.
+///
+/// `OneShot` (the default) keeps the pre-Phase-3 behavior: a single recorder
+/// subprocess runs from start to stop and the entire audio file is
+/// transcribed once at the end.
+///
+/// `Fixed` rolls the recorder every `segment_secs` seconds and streams each
+/// finalized chunk to the worker while the next chunk captures, so stop-to-text
+/// latency stays bounded by the chunk length plus the configured whisper
+/// warm-state cost rather than the full session length.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SegmentationMode {
+    #[default]
+    OneShot,
+    Fixed {
+        segment_secs: u32,
+        #[serde(default)]
+        overlap_secs: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

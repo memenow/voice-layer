@@ -110,6 +110,34 @@ the recorder as a long-running child process and send SIGINT on stop; the audio 
 to the Python worker for transcription via `whisper-cli`. The daemon does not process PCM in
 process; all capture flows through the recorder subprocess to a WAV file.
 
+## Dictation Segmentation (Phase 3B)
+
+`StartDictationRequest` carries a `segmentation` field that controls how audio is captured for
+transcription:
+
+- `segmentation: {"mode": "one_shot"}` (default) — the pre-Phase-3 behavior: a single
+  recorder subprocess runs from `create` to `stop` and the full WAV is transcribed once.
+- `segmentation: {"mode": "fixed", "segment_secs": N, "overlap_secs": 0}` — the recorder is
+  rolled every `N` seconds; each finalized chunk is transcribed in the background via the
+  configured whisper provider while the next chunk records. On stop the daemon waits for all
+  in-flight transcription tasks and returns a single concatenated transcript.
+
+While a segmented session is live the daemon streams per-segment events on `GET /v1/events/stream`
+in addition to the existing session-level events:
+
+- `dictation.segmented_started` — emitted once when the segmented task begins.
+- `dictation.segment_recorded` — emitted each time a segment's recording finalizes successfully,
+  so clients can render "segment N captured" indicators.
+- `dictation.segment_transcribed` — emitted each time a background transcription task completes,
+  carrying the character count on success or the worker error on failure.
+- `dictation.completed` / `dictation.failed` — unchanged; sent once at session end with the
+  stitched transcript or the classified failure. `DictationFailureKind::RecordingFailed` and
+  `AsrFailed` are populated by the daemon; `InjectionFailed` is only ever set by the client.
+
+Segmentation never applies to `POST /v1/dictation/capture` (one-shot bounded duration) or
+`POST /v1/transcriptions` (file transcription); those continue to use `whisper-cli` directly
+against a single WAV.
+
 ## Deferred Work
 
 This scaffold deliberately defers:

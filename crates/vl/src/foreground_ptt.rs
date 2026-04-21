@@ -55,8 +55,8 @@ use crossterm::{
     },
 };
 use voicelayer_core::{
-    DictationCaptureResult, DictationFailureKind, LanguageProfile, LanguageStrategy, SessionState,
-    StartDictationRequest, StopDictationRequest, TriggerKind,
+    DictationCaptureResult, DictationFailureKind, LanguageProfile, LanguageStrategy,
+    SegmentationMode, SessionState, StartDictationRequest, StopDictationRequest, TriggerKind,
 };
 
 use crate::config::{CliPttKey, CliRecorderBackend, StopAction};
@@ -253,6 +253,7 @@ pub(crate) async fn run_foreground_ptt(
                         recorder_backend: Some(backend.into()),
                         translate_to_english,
                         keep_audio,
+                        segmentation: SegmentationMode::default(),
                     };
                     let session: voicelayer_core::CaptureSession =
                         uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request)

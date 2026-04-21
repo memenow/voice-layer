@@ -1,9 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     env,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -18,20 +19,25 @@ use axum::{
 use futures_util::stream::StreamExt;
 use tokio::{
     net::UnixListener,
-    sync::{Mutex, RwLock, broadcast},
+    sync::{Mutex, RwLock, broadcast, oneshot},
+    task::JoinSet,
+    time::{MissedTickBehavior, interval},
 };
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::info;
+use uuid::Uuid;
 use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
     DictationCaptureResult, DictationFailureKind, EventEnvelope, HealthResponse, InjectRequest,
-    InjectionPlan, PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest, SessionMode,
-    SessionState, StartDictationRequest, StopDictationRequest, TranscribeRequest,
-    TranscriptionResult, TranslateRequest, WorkerHealthSummary, default_host_adapter_catalog,
+    InjectionPlan, PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest,
+    SegmentationMode, SessionMode, SessionState, StartDictationRequest, StopDictationRequest,
+    TranscribeRequest, TranscriptionResult, TranslateRequest, WorkerHealthSummary,
+    default_host_adapter_catalog,
 };
 
 pub mod hotkeys;
 pub mod recording;
+pub mod segmented_recording;
 pub mod worker;
 
 pub use hotkeys::{GlobalShortcutsPortalStatus, probe_global_shortcuts_portal};
@@ -94,11 +100,37 @@ struct AppState {
 }
 
 #[derive(Debug)]
-struct ActiveDictation {
+#[allow(clippy::large_enum_variant)]
+enum ActiveDictation {
+    OneShot(OneShotActive),
+    Segmented(SegmentedActive),
+}
+
+#[derive(Debug)]
+struct OneShotActive {
     recording: ActiveRecording,
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+}
+
+#[derive(Debug)]
+struct SegmentedActive {
+    stop_tx: oneshot::Sender<()>,
+    result_rx: oneshot::Receiver<DictationCaptureResult>,
+}
+
+#[derive(Debug)]
+struct SegmentRecord {
+    id: usize,
+    audio_path: PathBuf,
+    transcript: Option<String>,
+    detected_language: Option<String>,
+}
+
+struct SegmentTranscribeOutcome {
+    segment_id: usize,
+    result: Result<TranscriptionResult, crate::worker::WorkerCallError>,
 }
 
 #[derive(serde::Serialize)]
@@ -247,33 +279,83 @@ async fn create_dictation_session(
     let detected_language = request.language_profile.as_ref().and_then(|profile| {
         (profile.input_languages.len() == 1).then(|| profile.input_languages[0].clone())
     });
-    let session = transition_session_state(
-        CaptureSession::new(
-            SessionMode::Dictation,
-            request.trigger,
-            request.language_profile.unwrap_or_default(),
-        ),
-        SessionState::Listening,
+    let recorder_backend = request.recorder_backend.unwrap_or(RecorderBackend::Auto);
+    let keep_audio = request.keep_audio;
+    let translate_to_english = request.translate_to_english;
+    let base_session = CaptureSession::new(
+        SessionMode::Dictation,
+        request.trigger,
+        request.language_profile.clone().unwrap_or_default(),
     );
 
-    let audio_file = temp_audio_path();
-    let session = match start_recording_process(
-        &audio_file,
-        request.recorder_backend.unwrap_or(RecorderBackend::Auto),
-    ) {
-        Ok(recording) => {
-            state.active_dictations.lock().await.insert(
-                session.session_id.to_string(),
-                ActiveDictation {
-                    recording,
-                    keep_audio: request.keep_audio,
-                    translate_to_english: request.translate_to_english,
-                    language: detected_language,
-                },
-            );
-            session
+    let session = match request.segmentation {
+        SegmentationMode::OneShot => {
+            let session = transition_session_state(base_session, SessionState::Listening);
+            let audio_file = temp_audio_path();
+            match start_recording_process(&audio_file, recorder_backend) {
+                Ok(recording) => {
+                    state.active_dictations.lock().await.insert(
+                        session.session_id.to_string(),
+                        ActiveDictation::OneShot(OneShotActive {
+                            recording,
+                            keep_audio,
+                            translate_to_english,
+                            language: detected_language,
+                        }),
+                    );
+                    session
+                }
+                Err(_error) => transition_session_state(session, SessionState::Failed),
+            }
         }
-        Err(_error) => transition_session_state(session, SessionState::Failed),
+        SegmentationMode::Fixed {
+            segment_secs,
+            overlap_secs,
+        } => {
+            if segment_secs == 0 {
+                transition_session_state(base_session, SessionState::Failed)
+            } else {
+                let session = transition_session_state(base_session, SessionState::Listening);
+                let session_id = session.session_id;
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let (result_tx, result_rx) = oneshot::channel();
+                state.active_dictations.lock().await.insert(
+                    session_id.to_string(),
+                    ActiveDictation::Segmented(SegmentedActive { stop_tx, result_rx }),
+                );
+
+                let worker_command = state.config.worker_command.clone();
+                let events = state.events.clone();
+                let sessions = Arc::clone(&state.sessions);
+                let language = detected_language.clone();
+                let session_for_task = session.clone();
+                tokio::spawn(async move {
+                    let outcome = run_segmented_dictation_session(
+                        session_for_task,
+                        recorder_backend,
+                        segment_secs,
+                        overlap_secs,
+                        keep_audio,
+                        translate_to_english,
+                        language,
+                        worker_command,
+                        events,
+                        sessions,
+                        stop_rx,
+                    )
+                    .await;
+                    let _ = result_tx.send(outcome);
+                });
+                let _ = state.events.send(EventEnvelope::new(
+                    "dictation.segmented_started",
+                    Some(session_id),
+                    format!(
+                        "Segmented dictation started with segment_secs={segment_secs}, overlap_secs={overlap_secs}."
+                    ),
+                ));
+                session
+            }
+        }
     };
 
     store_session(&state, session.clone()).await;
@@ -502,6 +584,17 @@ async fn stop_live_dictation_with_state(
         };
     };
 
+    match active {
+        ActiveDictation::OneShot(active) => stop_oneshot_dictation(state, session, active).await,
+        ActiveDictation::Segmented(active) => stop_segmented_dictation(session, active).await,
+    }
+}
+
+async fn stop_oneshot_dictation(
+    state: Arc<AppState>,
+    mut session: CaptureSession,
+    active: OneShotActive,
+) -> DictationCaptureResult {
     session = transition_session_state(session, SessionState::Transcribing);
     store_session(&state, session.clone()).await;
     let _ = state.events.send(EventEnvelope::new(
@@ -579,6 +672,31 @@ async fn stop_live_dictation_with_state(
         transcription,
         audio_file: maybe_cleanup_audio_file(&audio_file, active.keep_audio),
         failure_kind,
+    }
+}
+
+async fn stop_segmented_dictation(
+    mut session: CaptureSession,
+    active: SegmentedActive,
+) -> DictationCaptureResult {
+    let _ = active.stop_tx.send(());
+    match active.result_rx.await {
+        Ok(result) => result,
+        Err(_) => {
+            session = transition_session_state(session, SessionState::Failed);
+            DictationCaptureResult {
+                session,
+                transcription: TranscriptionResult {
+                    text: String::new(),
+                    detected_language: None,
+                    notes: vec![
+                        "Segmented dictation task ended without returning a result.".to_owned(),
+                    ],
+                },
+                audio_file: None,
+                failure_kind: Some(DictationFailureKind::RecordingFailed),
+            }
+        }
     }
 }
 
@@ -698,6 +816,308 @@ async fn store_session(state: &Arc<AppState>, session: CaptureSession) {
 fn transition_session_state(mut session: CaptureSession, state: SessionState) -> CaptureSession {
     session.state = state;
     session
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_segmented_dictation_session(
+    mut session: CaptureSession,
+    recorder_backend: RecorderBackend,
+    segment_secs: u32,
+    overlap_secs: u32,
+    keep_audio: bool,
+    translate_to_english: bool,
+    language: Option<String>,
+    worker_command: worker::WorkerCommand,
+    events: broadcast::Sender<EventEnvelope>,
+    sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> DictationCaptureResult {
+    let session_id = session.session_id;
+    let segment_dir = temp_audio_path().with_extension("").join("segments");
+
+    let mut recorder = match segmented_recording::SegmentedRecording::start(
+        &segment_dir,
+        recorder_backend,
+        segment_secs,
+        overlap_secs,
+    ) {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            session = transition_session_state(session, SessionState::Failed);
+            update_session_map(&sessions, session.clone()).await;
+            let _ = events.send(EventEnvelope::new(
+                "dictation.failed",
+                Some(session_id),
+                format!("Segmented recorder failed to start: {error}"),
+            ));
+            return DictationCaptureResult {
+                session,
+                transcription: TranscriptionResult {
+                    text: String::new(),
+                    detected_language: None,
+                    notes: vec![format!("Recording detail: {error}")],
+                },
+                audio_file: None,
+                failure_kind: Some(DictationFailureKind::RecordingFailed),
+            };
+        }
+    };
+
+    let mut segments: Vec<SegmentRecord> = Vec::new();
+    let mut transcribe_tasks: JoinSet<SegmentTranscribeOutcome> = JoinSet::new();
+    let mut ticker = interval(Duration::from_secs(u64::from(segment_secs)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick fires immediately; skip it so the first rotation happens
+    // after `segment_secs` seconds of actual recording.
+    ticker.tick().await;
+
+    let mut recording_failure: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                break;
+            }
+            _ = ticker.tick() => {
+                match recorder.finalize_current().await {
+                    Ok(Some((id, path))) => {
+                        emit_segment_recorded(&events, session_id, id, &path);
+                        segments.push(SegmentRecord {
+                            id,
+                            audio_path: path.clone(),
+                            transcript: None,
+                            detected_language: None,
+                        });
+                        spawn_segment_transcribe(
+                            &mut transcribe_tasks,
+                            worker_command.clone(),
+                            events.clone(),
+                            session_id,
+                            id,
+                            path,
+                            language.clone(),
+                            translate_to_english,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        recording_failure = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let finalized_paths = match recorder.stop().await {
+        Ok(paths) => paths,
+        Err(error) => {
+            if recording_failure.is_none() {
+                recording_failure = Some(error.to_string());
+            }
+            Vec::new()
+        }
+    };
+
+    let known_ids: HashSet<usize> = segments.iter().map(|segment| segment.id).collect();
+    for (id, path) in finalized_paths {
+        if known_ids.contains(&id) {
+            continue;
+        }
+        emit_segment_recorded(&events, session_id, id, &path);
+        segments.push(SegmentRecord {
+            id,
+            audio_path: path.clone(),
+            transcript: None,
+            detected_language: None,
+        });
+        spawn_segment_transcribe(
+            &mut transcribe_tasks,
+            worker_command.clone(),
+            events.clone(),
+            session_id,
+            id,
+            path,
+            language.clone(),
+            translate_to_english,
+        );
+    }
+
+    session = transition_session_state(session, SessionState::Transcribing);
+    update_session_map(&sessions, session.clone()).await;
+
+    let mut transcription_failure: Option<String> = None;
+    while let Some(outcome) = transcribe_tasks.join_next().await {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => continue,
+        };
+        let segment = segments
+            .iter_mut()
+            .find(|segment| segment.id == outcome.segment_id);
+        match outcome.result {
+            Ok(result) => {
+                if let Some(segment) = segment {
+                    segment.transcript = Some(result.text.clone());
+                    segment.detected_language = result.detected_language.clone();
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                if transcription_failure.is_none() {
+                    transcription_failure = Some(detail);
+                }
+                if let Some(segment) = segment {
+                    segment.transcript = Some(String::new());
+                }
+            }
+        }
+    }
+
+    segments.sort_by_key(|segment| segment.id);
+    let combined_text = segments
+        .iter()
+        .filter_map(|segment| segment.transcript.as_deref())
+        .map(str::trim)
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let detected_language = segments
+        .iter()
+        .find_map(|segment| segment.detected_language.clone());
+
+    let audio_file_summary = if keep_audio {
+        segments
+            .first()
+            .map(|segment| segment.audio_path.display().to_string())
+    } else {
+        for segment in &segments {
+            let _ = std::fs::remove_file(&segment.audio_path);
+        }
+        let _ = std::fs::remove_dir(&segment_dir);
+        None
+    };
+
+    let (final_state, failure_kind, failure_detail) =
+        if let Some(detail) = recording_failure.clone() {
+            (
+                SessionState::Failed,
+                Some(DictationFailureKind::RecordingFailed),
+                Some(detail),
+            )
+        } else if let Some(detail) = transcription_failure.clone() {
+            (
+                SessionState::Failed,
+                Some(DictationFailureKind::AsrFailed),
+                Some(detail),
+            )
+        } else {
+            (SessionState::Completed, None, None)
+        };
+    session = transition_session_state(session, final_state);
+    update_session_map(&sessions, session.clone()).await;
+
+    let event_type = if final_state == SessionState::Completed {
+        "dictation.completed"
+    } else {
+        "dictation.failed"
+    };
+    let event_message = if final_state == SessionState::Completed {
+        format!(
+            "Segmented dictation session completed with {} segments.",
+            segments.len()
+        )
+    } else {
+        format!(
+            "Segmented dictation session failed: {}",
+            failure_detail.as_deref().unwrap_or("unspecified failure")
+        )
+    };
+    let _ = events.send(EventEnvelope::new(
+        event_type,
+        Some(session_id),
+        event_message,
+    ));
+
+    let mut notes = vec![format!("{} segments stitched", segments.len())];
+    if let Some(detail) = failure_detail {
+        notes.push(detail);
+    }
+
+    DictationCaptureResult {
+        session,
+        transcription: TranscriptionResult {
+            text: combined_text,
+            detected_language,
+            notes,
+        },
+        audio_file: audio_file_summary,
+        failure_kind,
+    }
+}
+
+fn emit_segment_recorded(
+    events: &broadcast::Sender<EventEnvelope>,
+    session_id: Uuid,
+    segment_id: usize,
+    path: &Path,
+) {
+    let _ = events.send(EventEnvelope::new(
+        "dictation.segment_recorded",
+        Some(session_id),
+        format!("Segment {segment_id} recorded at {}.", path.display()),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_segment_transcribe(
+    transcribe_tasks: &mut JoinSet<SegmentTranscribeOutcome>,
+    worker_command: worker::WorkerCommand,
+    events: broadcast::Sender<EventEnvelope>,
+    session_id: Uuid,
+    segment_id: usize,
+    audio_path: PathBuf,
+    language: Option<String>,
+    translate_to_english: bool,
+) {
+    transcribe_tasks.spawn(async move {
+        let request = TranscribeRequest {
+            audio_file: audio_path.display().to_string(),
+            language,
+            translate_to_english,
+        };
+        let result = worker_command.transcribe(&request).await;
+        let message = match &result {
+            Ok(result) => {
+                if result.text.trim().is_empty() {
+                    format!("Segment {segment_id} transcribed with empty text.")
+                } else {
+                    format!(
+                        "Segment {segment_id} transcribed ({} chars).",
+                        result.text.len()
+                    )
+                }
+            }
+            Err(error) => format!("Segment {segment_id} transcription failed: {error}"),
+        };
+        let _ = events.send(EventEnvelope::new(
+            "dictation.segment_transcribed",
+            Some(session_id),
+            message,
+        ));
+        SegmentTranscribeOutcome { segment_id, result }
+    });
+}
+
+async fn update_session_map(
+    sessions: &Arc<RwLock<HashMap<String, CaptureSession>>>,
+    session: CaptureSession,
+) {
+    sessions
+        .write()
+        .await
+        .insert(session.session_id.to_string(), session);
 }
 
 fn ready_receipt(preview: WorkerPreviewPayload) -> CompositionReceipt {

@@ -5,8 +5,8 @@ use serde::Serialize;
 use voicelayer_core::{
     ComposeRequest, CompositionArchetype, DictationCaptureRequest, InjectRequest, InjectTarget,
     InjectionPlan, LanguageProfile, LanguageStrategy, RecorderBackend, RewriteRequest,
-    RewriteStyle, SessionMode, StartDictationRequest, StopDictationRequest, TranscribeRequest,
-    TranslateRequest, TriggerKind,
+    RewriteStyle, SegmentationMode, SessionMode, StartDictationRequest, StopDictationRequest,
+    TranscribeRequest, TranslateRequest, TriggerKind,
 };
 use voicelayerd::{
     DaemonConfig, RecorderDiagnostics, WorkerHealthResult, capture_dictation_once,
@@ -352,6 +352,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     recorder_backend: Some(backend.into()),
                     translate_to_english,
                     keep_audio,
+                    segmentation: SegmentationMode::default(),
                 };
                 let session: voicelayer_core::CaptureSession =
                     uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request).await?;
