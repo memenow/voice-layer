@@ -10,15 +10,21 @@ from voicelayer_orchestrator.config import (
     load_llm_provider_config,
     load_whisper_provider_config,
     load_whisper_server_config,
+    load_whisper_vad_config,
 )
 from voicelayer_orchestrator.protocol import JSONRPC_VERSION, make_error, make_result
-from voicelayer_orchestrator.providers import ProviderInvocationError, supported_providers
+from voicelayer_orchestrator.providers import (
+    ProviderInvocationError,
+    provider_runtime_dir,
+    supported_providers,
+)
 from voicelayer_orchestrator.providers.llama_autostart import ensure_llm_endpoint
 from voicelayer_orchestrator.providers.llm_openai_compatible import (
     build_compose_payload,
     build_rewrite_payload,
     build_translate_payload,
 )
+from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
 from voicelayer_orchestrator.providers.whisper_cli import (
     transcribe_with_whisper_cli,
     validate_whisper_provider,
@@ -33,6 +39,53 @@ PROVIDER_REQUEST_FAILED_CODE = -32005
 INVALID_REQUEST_CODE = -32600
 METHOD_NOT_FOUND_CODE = -32601
 PARSE_ERROR_CODE = -32700
+
+
+def _apply_vad_prepass_if_configured(
+    params: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], dict[str, Any] | None]:
+    """Run the optional silero-vad pre-pass.
+
+    Returns ``(effective_params, extra_notes, short_circuit_result)``. When
+    ``short_circuit_result`` is not ``None`` the caller should return it
+    directly without invoking whisper (VAD detected no speech). When it is
+    ``None`` the caller proceeds with ``effective_params`` and appends
+    ``extra_notes`` to whisper's response.
+    """
+
+    vad_config = load_whisper_vad_config()
+    if vad_config is None:
+        return params, [], None
+
+    audio_file = str(params.get("audio_file", "")).strip()
+    if not audio_file:
+        return params, [], None
+
+    try:
+        runtime_dir = provider_runtime_dir() / "vad"
+        trimmed_path, regions = apply_vad_prepass(audio_file, vad_config, runtime_dir)
+    except ProviderInvocationError as exc:
+        return params, [f"VAD pre-pass failed, transcribing raw audio: {exc}"], None
+
+    if not regions:
+        return (
+            params,
+            [],
+            {
+                "text": "",
+                "detected_language": None,
+                "notes": ["VAD detected no speech; whisper inference was skipped."],
+            },
+        )
+
+    new_params = dict(params)
+    new_params["audio_file"] = trimmed_path
+    total_sec = sum(end - start for start, end in regions)
+    note = (
+        f"VAD pre-pass kept {len(regions)} speech region(s) "
+        f"({total_sec:.2f}s total) from the original capture."
+    )
+    return new_params, [note], None
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
@@ -74,13 +127,21 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         return make_result(identifier, {"providers": supported_providers()})
 
     if method == "transcribe":
+        effective_params, extra_notes, short_circuit = _apply_vad_prepass_if_configured(
+            dict(params or {})
+        )
+        if short_circuit is not None:
+            return make_result(identifier, short_circuit)
+
         server_config = load_whisper_server_config()
         server_error: str | None = None
         if server_config is not None:
             reachable, probe_error = ensure_whisper_server(server_config)
             if reachable:
                 try:
-                    result = transcribe_with_whisper_server(params or {}, server_config)
+                    result = transcribe_with_whisper_server(effective_params, server_config)
+                    if extra_notes:
+                        result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
                     return make_result(identifier, result)
                 except ProviderInvocationError as exc:
                     server_error = str(exc)
@@ -107,7 +168,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             )
 
         try:
-            result = transcribe_with_whisper_cli(params or {}, cli_config)
+            result = transcribe_with_whisper_cli(effective_params, cli_config)
         except ProviderInvocationError as exc:
             detail = str(exc)
             if server_error is not None:
@@ -119,6 +180,8 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 {"method": method},
             )
 
+        if extra_notes:
+            result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
         return make_result(identifier, result)
 
     if method in {"compose", "rewrite", "translate"}:

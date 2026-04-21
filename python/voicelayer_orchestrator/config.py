@@ -42,6 +42,26 @@ class WhisperCppConfig:
 
 
 @dataclass(frozen=True)
+class WhisperVadConfig:
+    """Configuration for the silero-vad pre-pass applied to transcribe inputs.
+
+    The VAD layer runs inside the Python worker before a WAV is handed to
+    whisper. When it finds speech regions it concatenates them into a
+    trimmed WAV and feeds that to the transcriber; the daemon and JSON-RPC
+    contract never see the split, so callers behave identically whether
+    VAD is enabled or not.
+    """
+
+    model_path: str
+    threshold: float
+    min_speech_ms: int
+    min_silence_ms: int
+    speech_pad_ms: int
+    max_segment_secs: float
+    sample_rate: int
+
+
+@dataclass(frozen=True)
 class WhisperServerConfig:
     """Configuration for talking to a persistent `whisper-server` HTTP endpoint."""
 
@@ -118,6 +138,36 @@ def load_whisper_provider_config(
         no_gpu=source.get("VOICELAYER_WHISPER_NO_GPU", "").strip().lower()
         in {"1", "true", "yes", "on"},
         extra_args=tuple(shlex.split(source.get("VOICELAYER_WHISPER_ARGS", ""))),
+    )
+
+
+def load_whisper_vad_config(
+    environ: Mapping[str, str] | None = None,
+) -> WhisperVadConfig | None:
+    """Load silero-vad pre-pass configuration from the environment.
+
+    Returns ``None`` when VAD is not explicitly enabled or the model path is
+    missing. Callers treat a ``None`` config as "no VAD" and fall back to the
+    raw WAV transcribe path.
+    """
+
+    source = environ or os.environ
+    enabled = source.get("VOICELAYER_WHISPER_VAD_ENABLED", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+
+    model_path = source.get("VOICELAYER_WHISPER_VAD_MODEL_PATH", "").strip()
+    if not model_path:
+        return None
+
+    return WhisperVadConfig(
+        model_path=model_path,
+        threshold=float(source.get("VOICELAYER_WHISPER_VAD_THRESHOLD", "0.5")),
+        min_speech_ms=int(source.get("VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS", "250")),
+        min_silence_ms=int(source.get("VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS", "100")),
+        speech_pad_ms=int(source.get("VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS", "30")),
+        max_segment_secs=float(source.get("VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS", "30")),
+        sample_rate=int(source.get("VOICELAYER_WHISPER_VAD_SAMPLE_RATE", "16000")),
     )
 
 

@@ -113,17 +113,53 @@ The current CLI recording path is intentionally minimal:
 This recording path writes a temporary WAV file and then forwards that file to `whisper-cli`.
 The same path is now exposed through the daemon-side `dictation capture` flow, so future global hotkey and tray integrations can reuse it without re-implementing recording logic.
 
+### Optional silero-vad Pre-pass (Phase 3D)
+
+The Python worker can run a silero-vad pre-pass before handing audio to whisper. When enabled it
+detects speech regions in the captured WAV, concatenates them into a trimmed 16-bit mono WAV, and
+feeds that file to the configured transcription provider. The JSON-RPC `transcribe` contract is
+unchanged — VAD is invisible to the daemon.
+
+VAD pulls in `onnxruntime` and `numpy`, which are shipped as the optional `vad` extra to keep the
+default worker stdlib-only. Install the extra once and download a silero-vad ONNX model:
+
+```bash
+uv sync --extra vad
+curl -L -o /abs/path/to/silero_vad.onnx \
+  https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+```
+
+Environment variables:
+
+```bash
+VOICELAYER_WHISPER_VAD_ENABLED=true
+VOICELAYER_WHISPER_VAD_MODEL_PATH=/abs/path/to/silero_vad.onnx
+VOICELAYER_WHISPER_VAD_THRESHOLD=0.5
+VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS=250
+VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS=100
+VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS=30
+VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS=30
+VOICELAYER_WHISPER_VAD_SAMPLE_RATE=16000
+```
+
+The worker only enables the pre-pass when both `VOICELAYER_WHISPER_VAD_ENABLED` is truthy and
+`VOICELAYER_WHISPER_VAD_MODEL_PATH` points at an existing ONNX file. If import of `onnxruntime`
+or `numpy` fails at runtime, the worker annotates the transcribe response with the error and
+falls back to transcribing the raw WAV — no request is lost. Silero-vad v4 (`h` + `c` state) and
+v5 (`state` tensor) ONNX exports are both supported; the sample rate must be 16000 Hz or 8000 Hz.
+
 ## Current Scope
 
-The current ASR integration is intentionally limited to file transcription and short-recording transcription.
-It does not yet cover:
+The current ASR integration covers file transcription, short-recording transcription, Phase 3B
+fixed-duration segmented live dictation (recorder rolled every *N* seconds with background
+transcription), and the optional silero-vad pre-pass above. It does not yet cover:
 
 - always-on live microphone capture
-- VAD-driven chunking
-- partial transcripts
+- dynamic VAD-driven segmentation boundaries at the recorder layer
+- partial transcripts streamed mid-utterance
 - background ASR daemonization
 
-Those belong to the next stage of the VoiceLayer runtime.
+Those belong to later stages of the VoiceLayer runtime.
 
 ## Phase 3 Pre-flight: Cold-start Measurement
 

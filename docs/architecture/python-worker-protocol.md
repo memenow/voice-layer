@@ -33,7 +33,12 @@ The worker implements every required method with real providers:
   `providers/whisper_server.py`), falling back to one-shot `whisper-cli`
   via `providers/whisper_cli.py` when the server is unreachable or
   returns an error. Both paths are independent; configuring only the
-  cli variables keeps the legacy behavior.
+  cli variables keeps the legacy behavior. When the optional silero-vad
+  pre-pass is enabled (`VOICELAYER_WHISPER_VAD_ENABLED=true`, see
+  `providers/vad_segmenter.py`), the worker runs VAD on the input WAV
+  before dispatching to whisper, trims non-speech, and short-circuits
+  with an empty-transcript response when no speech is detected.
+  VAD failure falls back to the raw WAV without losing the request.
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.
@@ -77,6 +82,9 @@ Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
 - `whisper_cli.py` — validation and invocation of the `whisper-cli` subprocess.
 - `whisper_server.py` — HTTP client, readiness probe, optional autostart, and `/inference`
   multipart encoder for the persistent `whisper-server` path.
+- `vad_segmenter.py` — optional silero-vad pre-pass (v4 or v5 ONNX) that trims non-speech out of
+  the input WAV before transcription. Lazy-imports `numpy` and `onnxruntime` so the `vad` extra
+  stays optional.
 
 Shared utilities live in `providers/__init__.py` (`ProviderInvocationError`,
 `provider_runtime_dir`, `supported_providers`). Environment-backed dataclasses and loaders live
