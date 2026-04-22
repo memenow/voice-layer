@@ -31,7 +31,9 @@ from voicelayer_orchestrator.providers.whisper_cli import (
 )
 from voicelayer_orchestrator.providers.whisper_server import (
     ensure_whisper_server,
+    probe_whisper_server,
     transcribe_with_whisper_server,
+    validate_autostart_prerequisites,
 )
 
 PROVIDER_UNAVAILABLE_CODE = -32004
@@ -104,7 +106,41 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         config = load_llm_provider_config()
         llm_reachable, llm_error = ensure_llm_endpoint(config)
         whisper_config = load_whisper_provider_config()
+        whisper_server_config = load_whisper_server_config()
         asr_configured, asr_error = validate_whisper_provider(whisper_config)
+
+        # Report which whisper path the `transcribe` handler would
+        # actually take. Mirrors the preference in the dispatch body:
+        # server-first (with autostart or probe), CLI fallback.
+        if whisper_server_config is not None:
+            whisper_mode = "server"
+        elif whisper_config is not None:
+            whisper_mode = "cli"
+        else:
+            whisper_mode = "unconfigured"
+
+        # A server-only configuration is legitimate — don't require the
+        # CLI binary + model to also be set. Surface the server as the
+        # source of truth for `asr_configured` when CLI isn't configured.
+        if whisper_mode == "server" and not asr_configured:
+            reachable, probe_error = probe_whisper_server(whisper_server_config)
+            if reachable:
+                asr_configured = True
+                asr_error = None
+            elif whisper_server_config.auto_start:
+                # Autostart is requested but transcribe would immediately
+                # fail if the launcher prereqs (server binary, model) are
+                # missing — keep ASR marked unhealthy in that case so
+                # `/health` and `vl doctor` don't report a false positive.
+                prereq_ok, prereq_error = validate_autostart_prerequisites(whisper_server_config)
+                if prereq_ok:
+                    asr_configured = True
+                    asr_error = None
+                else:
+                    asr_error = prereq_error
+            else:
+                asr_error = probe_error or "whisper-server is not reachable"
+
         return make_result(
             identifier,
             {
@@ -115,6 +151,10 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 "asr_binary": None if whisper_config is None else whisper_config.binary,
                 "asr_model_path": None if whisper_config is None else whisper_config.model_path,
                 "asr_error": asr_error,
+                "whisper_mode": whisper_mode,
+                "whisper_server_url": (
+                    whisper_server_config.base_url if whisper_server_config is not None else None
+                ),
                 "llm_configured": config is not None,
                 "llm_model": None if config is None else config.model,
                 "llm_endpoint": None if config is None else config.endpoint,

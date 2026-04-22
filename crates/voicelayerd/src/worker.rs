@@ -193,6 +193,10 @@ pub struct WorkerHealthResult {
     pub asr_binary: Option<String>,
     pub asr_model_path: Option<String>,
     pub asr_error: Option<String>,
+    #[serde(default)]
+    pub whisper_mode: Option<String>,
+    #[serde(default)]
+    pub whisper_server_url: Option<String>,
     pub llm_configured: bool,
     pub llm_model: Option<String>,
     pub llm_endpoint: Option<String>,

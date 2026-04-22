@@ -343,6 +343,18 @@ pub struct WorkerHealthSummary {
     pub asr_model_path: Option<String>,
     pub asr_binary: Option<String>,
     pub asr_error: Option<String>,
+    /// Which whisper path the Python worker would dispatch to on the next
+    /// `transcribe` call: `"server"` (persistent whisper-server over HTTP),
+    /// `"cli"` (one-shot whisper-cli subprocess), or `"unconfigured"`.
+    /// `None` when an older daemon / worker is serving and did not emit
+    /// this field.
+    #[serde(default)]
+    pub whisper_mode: Option<String>,
+    /// Base URL of the configured whisper-server endpoint (e.g.
+    /// `http://127.0.0.1:8188`). `None` when whisper-server is not
+    /// configured or when the worker predates this field.
+    #[serde(default)]
+    pub whisper_server_url: Option<String>,
     pub llm_configured: bool,
     pub llm_model: Option<String>,
     pub llm_endpoint: Option<String>,
