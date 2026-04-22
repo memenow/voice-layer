@@ -21,7 +21,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v5
 
-      - name: Install system dependencies for vl-desktop (iced + ashpd)
+      - name: Install system dependencies for vl-desktop and the recorder probe
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -38,7 +38,8 @@ jobs:
             libx11-dev \
             libxi-dev \
             libxcursor-dev \
-            libxrandr-dev
+            libxrandr-dev \
+            alsa-utils
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

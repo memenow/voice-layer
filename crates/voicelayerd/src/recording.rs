@@ -301,7 +301,26 @@ mod tests {
 
     #[test]
     fn diagnostics_report_current_machine_state() {
+        // Validates internal consistency rather than the presence of a
+        // recorder: CI runners do not always install pipewire/alsa, so
+        // asserting availability would hard-fail there. The invariant
+        // worth pinning is that the reported `selected_backend` must
+        // match the underlying `*_available` flags.
         let diagnostics = recorder_diagnostics(RecorderBackend::Auto);
-        assert!(diagnostics.pw_record_available || diagnostics.arecord_available);
+        match diagnostics.selected_backend.as_deref() {
+            Some("pipewire") => assert!(
+                diagnostics.pw_record_available,
+                "Auto selected pipewire but pw-record is not reported as available",
+            ),
+            Some("alsa") => assert!(
+                diagnostics.arecord_available,
+                "Auto selected alsa but arecord is not reported as available",
+            ),
+            Some(other) => panic!("Unexpected selected_backend label: {other}"),
+            None => assert!(
+                !diagnostics.pw_record_available && !diagnostics.arecord_available,
+                "selected_backend is None while a recorder is reported as available",
+            ),
+        }
     }
 }
