@@ -737,3 +737,118 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::{detect_whisper_mode, env_is_set, env_is_truthy, pid_matches_command};
+
+    /// Serializes process-env mutation across every test in this module.
+    /// Cargo runs unit tests concurrently by default, and Rust 2024 flagged
+    /// `std::env::set_var`/`remove_var` as `unsafe` precisely because a
+    /// concurrent reader in another thread is UB. Any future test here
+    /// that touches a `VOICELAYER_*` variable must take this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_var(key: &str) {
+        // SAFETY: ENV_LOCK is held for the duration of the mutation.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn set_var(key: &str, value: &str) {
+        // SAFETY: ENV_LOCK is held for the duration of the mutation.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[test]
+    fn env_is_set_rejects_unset_and_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_var("VL_TEST_ENV_SET");
+        assert!(!env_is_set("VL_TEST_ENV_SET"));
+        set_var("VL_TEST_ENV_SET", "");
+        assert!(!env_is_set("VL_TEST_ENV_SET"));
+        set_var("VL_TEST_ENV_SET", "/abs/path");
+        assert!(env_is_set("VL_TEST_ENV_SET"));
+        reset_var("VL_TEST_ENV_SET");
+    }
+
+    #[test]
+    fn env_is_truthy_accepts_canonical_forms() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for value in ["1", "true", "TRUE", " Yes ", "on", "YES"] {
+            set_var("VL_TEST_ENV_TRUTHY", value);
+            assert!(
+                env_is_truthy("VL_TEST_ENV_TRUTHY"),
+                "{value:?} should be truthy",
+            );
+        }
+        for value in ["0", "false", "no", "off", "", "anything-else"] {
+            set_var("VL_TEST_ENV_TRUTHY", value);
+            assert!(
+                !env_is_truthy("VL_TEST_ENV_TRUTHY"),
+                "{value:?} should be falsy",
+            );
+        }
+        reset_var("VL_TEST_ENV_TRUTHY");
+    }
+
+    #[test]
+    fn detect_whisper_mode_prefers_server_over_cli() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for key in [
+            "VOICELAYER_WHISPER_SERVER_HOST",
+            "VOICELAYER_WHISPER_SERVER_PORT",
+            "VOICELAYER_WHISPER_SERVER_BIN",
+            "VOICELAYER_WHISPER_SERVER_AUTO_START",
+            "VOICELAYER_WHISPER_MODEL_PATH",
+        ] {
+            reset_var(key);
+        }
+
+        assert_eq!(detect_whisper_mode(), "unconfigured");
+
+        set_var("VOICELAYER_WHISPER_MODEL_PATH", "/m.bin");
+        assert_eq!(detect_whisper_mode(), "cli");
+
+        set_var("VOICELAYER_WHISPER_SERVER_HOST", "127.0.0.1");
+        assert_eq!(detect_whisper_mode(), "server");
+
+        reset_var("VOICELAYER_WHISPER_SERVER_HOST");
+        set_var("VOICELAYER_WHISPER_SERVER_AUTO_START", "true");
+        assert_eq!(detect_whisper_mode(), "server");
+
+        for key in [
+            "VOICELAYER_WHISPER_SERVER_HOST",
+            "VOICELAYER_WHISPER_SERVER_PORT",
+            "VOICELAYER_WHISPER_SERVER_BIN",
+            "VOICELAYER_WHISPER_SERVER_AUTO_START",
+            "VOICELAYER_WHISPER_MODEL_PATH",
+        ] {
+            reset_var(key);
+        }
+    }
+
+    #[test]
+    fn pid_matches_command_recognizes_self_argv() {
+        // argv[0] of the running test binary should always match /proc/self
+        // regardless of absolute-path-vs-basename form.
+        let my_pid = std::process::id() as i32;
+        let my_exe = std::env::current_exe().expect("current_exe should resolve");
+        let exe_name = my_exe.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(pid_matches_command(my_pid, exe_name));
+        assert!(pid_matches_command(my_pid, my_exe.to_str().unwrap()));
+    }
+
+    #[test]
+    fn pid_matches_command_rejects_dead_and_zero_pids() {
+        assert!(!pid_matches_command(0, "anything"));
+        assert!(!pid_matches_command(-1, "anything"));
+        // PID 1 (init/systemd) should not match a name we never ran.
+        assert!(!pid_matches_command(1, "definitely-not-a-real-binary"));
+    }
+}
