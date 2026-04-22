@@ -670,24 +670,50 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             backend,
             keep_audio,
         } => {
-            let config =
-                DaemonConfig::with_project_root(default_socket_path(), default_project_root());
-            let result = capture_dictation_once(
-                &config,
-                DictationCaptureRequest {
-                    trigger: TriggerKind::Cli,
-                    language_profile: language.map(|language| LanguageProfile {
-                        strategy: LanguageStrategy::Locked,
-                        input_languages: vec![language],
-                        output_language: None,
-                    }),
-                    duration_seconds,
-                    recorder_backend: Some(backend.into()),
-                    translate_to_english,
-                    keep_audio,
-                },
-            )
-            .await;
+            let request = DictationCaptureRequest {
+                trigger: TriggerKind::Cli,
+                language_profile: language.map(|language| LanguageProfile {
+                    strategy: LanguageStrategy::Locked,
+                    input_languages: vec![language],
+                    output_language: None,
+                }),
+                duration_seconds,
+                recorder_backend: Some(backend.into()),
+                translate_to_english,
+                keep_audio,
+            };
+            // Prefer the running daemon so recording + transcription
+            // inherit its environment (systemd EnvironmentFile) and the
+            // capture shows up on /v1/events/stream alongside anything
+            // else an operator is watching. Falling back to the
+            // in-process `capture_dictation_once` when no daemon is
+            // listening keeps this command usable for scripting before
+            // the unit is enabled. Missing socket → silent fallback;
+            // existing socket that rejects the request → stderr warning,
+            // same split as TranscribeFile.
+            let socket_path = cli_socket_path();
+            let daemon_outcome: Option<
+                Result<voicelayer_core::DictationCaptureResult, Box<dyn std::error::Error>>,
+            > = if socket_path.exists() {
+                Some(uds_post_json(&socket_path, "/v1/dictation/capture", &request).await)
+            } else {
+                None
+            };
+            let result = match daemon_outcome {
+                Some(Ok(result)) => result,
+                other => {
+                    if let Some(Err(error)) = other {
+                        eprintln!(
+                            "warning: daemon at {} rejected /v1/dictation/capture ({error}); \
+                             falling back to in-process capture",
+                            socket_path.display()
+                        );
+                    }
+                    let config =
+                        DaemonConfig::with_project_root(socket_path, default_project_root());
+                    capture_dictation_once(&config, request).await
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::TranscribeFile {

@@ -12,7 +12,10 @@ PYTHON_ROOT = PROJECT_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from voicelayer_orchestrator.providers import reclaim_stale_lock  # noqa: E402
+from voicelayer_orchestrator.providers import (  # noqa: E402
+    collapse_nonspeech_transcript,
+    reclaim_stale_lock,
+)
 
 
 class ReclaimStaleLockTest(unittest.TestCase):
@@ -71,6 +74,82 @@ class ReclaimStaleLockTest(unittest.TestCase):
         self.lock_path.write_text("not-a-pid", encoding="utf-8")
         self.assertFalse(reclaim_stale_lock(self.lock_path, "llama-server"))
         self.assertTrue(self.lock_path.exists())
+
+
+class CollapseNonSpeechTranscriptTest(unittest.TestCase):
+    """Covers :func:`collapse_nonspeech_transcript` shared by both whisper adapters."""
+
+    def test_collapses_bracket_blank_audio(self) -> None:
+        self.assertEqual(collapse_nonspeech_transcript("[BLANK_AUDIO]"), "")
+
+    def test_collapses_bracket_music(self) -> None:
+        self.assertEqual(collapse_nonspeech_transcript("[MUSIC]"), "")
+
+    def test_collapses_parenthetical_foreign_language(self) -> None:
+        self.assertEqual(
+            collapse_nonspeech_transcript("(speaking in foreign language)"),
+            "",
+        )
+        self.assertEqual(
+            collapse_nonspeech_transcript("(speaks in foreign language)"),
+            "",
+        )
+
+    def test_collapses_parenthetical_inaudible(self) -> None:
+        self.assertEqual(collapse_nonspeech_transcript("(inaudible)"), "")
+
+    def test_is_case_insensitive_and_ignores_inner_whitespace(self) -> None:
+        self.assertEqual(collapse_nonspeech_transcript("[ music ]"), "")
+        self.assertEqual(collapse_nonspeech_transcript("[  Music  Playing  ]"), "")
+        self.assertEqual(collapse_nonspeech_transcript("  (INAUDIBLE)  "), "")
+
+    def test_collapses_multiline_repeated_annotations(self) -> None:
+        # whisper on a music-only recording often emits the same token
+        # repeatedly — collapse the whole block.
+        self.assertEqual(
+            collapse_nonspeech_transcript("[MUSIC]\n[MUSIC]\n[MUSIC]\n"),
+            "",
+        )
+        self.assertEqual(
+            collapse_nonspeech_transcript("[BLANK_AUDIO]\n(inaudible)\n(music playing)"),
+            "",
+        )
+
+    def test_preserves_mixed_content(self) -> None:
+        # A transcript that contains real speech alongside a decorative
+        # line must be returned verbatim — silently dropping the real
+        # speech would be worse than leaving the annotation in place.
+        mixed = "[MUSIC]\nI love this song."
+        self.assertEqual(collapse_nonspeech_transcript(mixed), mixed)
+
+    def test_preserves_real_speech_that_mentions_music(self) -> None:
+        # Spoken "music" without brackets is real content — must not be
+        # touched by the filter.
+        spoken = "We talked about music and art."
+        self.assertEqual(collapse_nonspeech_transcript(spoken), spoken)
+
+    def test_collapses_novel_bracket_and_paren_annotations(self) -> None:
+        # The filter is structural: anything standing alone in `[...]`
+        # or `(...)` is treated as a whisper decorative annotation,
+        # because whisper reserves brackets and parens for meta content
+        # rather than transcribed speech. This catches ad-hoc
+        # annotations (`(dramatic music)`, `(phone rings)`,
+        # `[DOG_BARKING]`) that an allowlist would miss.
+        for annotation in (
+            "(dramatic music)",
+            "(soft music)",
+            "(phone rings)",
+            "(door creaks)",
+            "[DOG_BARKING]",
+            "[ENGINE]",
+        ):
+            with self.subTest(annotation=annotation):
+                self.assertEqual(collapse_nonspeech_transcript(annotation), "")
+
+    def test_returns_empty_for_pure_whitespace_input(self) -> None:
+        self.assertEqual(collapse_nonspeech_transcript(""), "")
+        self.assertEqual(collapse_nonspeech_transcript("   "), "")
+        self.assertEqual(collapse_nonspeech_transcript("\n\n"), "")
 
 
 if __name__ == "__main__":

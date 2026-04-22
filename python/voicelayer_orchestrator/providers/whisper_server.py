@@ -34,6 +34,7 @@ from typing import Any
 from voicelayer_orchestrator.config import WhisperServerConfig
 from voicelayer_orchestrator.providers import (
     ProviderInvocationError,
+    collapse_nonspeech_transcript,
     provider_runtime_dir,
     reclaim_stale_lock,
 )
@@ -309,10 +310,11 @@ def transcribe_with_whisper_server(
         ) from exc
 
     text_raw = payload.get("text", "") if isinstance(payload, dict) else ""
-    text = str(text_raw).strip()
-    if not text or text == "[BLANK_AUDIO]":
-        # Keep empty text rather than raising: callers decide whether silence is an error.
-        text = ""
+    # Collapse whisper decorative annotations — see the filter doc in
+    # `providers/__init__.py` for the full rule. Keeping empty text
+    # rather than raising lets callers decide whether silence is an
+    # error, matching the whisper-cli path.
+    text = collapse_nonspeech_transcript(str(text_raw).strip())
 
     detected_language: str | None
     if language == "auto":

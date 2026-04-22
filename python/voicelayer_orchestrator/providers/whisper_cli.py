@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from voicelayer_orchestrator.config import WhisperCppConfig
-from voicelayer_orchestrator.providers import ProviderInvocationError, provider_runtime_dir
+from voicelayer_orchestrator.providers import (
+    ProviderInvocationError,
+    collapse_nonspeech_transcript,
+    provider_runtime_dir,
+)
 
 
 def validate_whisper_provider(
@@ -93,12 +97,13 @@ def transcribe_with_whisper_cli(
             f"whisper.cpp did not produce the expected transcript file: {transcript_file}"
         )
 
-    text = transcript_file.read_text(encoding="utf-8").strip()
-    if text == "[BLANK_AUDIO]":
-        # whisper.cpp emits this token for silence-only input. Keep the text
-        # empty rather than raising so callers can decide whether silence is
-        # an error — this matches the whisper-server path.
-        text = ""
+    raw_text = transcript_file.read_text(encoding="utf-8").strip()
+    # Collapse whisper decorative annotations (`[BLANK_AUDIO]`, `[MUSIC]`,
+    # `(speaking in foreign language)`, ...) to empty text. Callers decide
+    # whether an empty transcript is an error; the default stop actions
+    # (copy/save/inject) silently no-op on empty text, which is the right
+    # daily UX for a "I held PTT but didn't speak" session.
+    text = collapse_nonspeech_transcript(raw_text)
     notes = [
         f"Transcribed by `{config.binary}` using model `{config.model_path}`.",
         "Input audio must be supported by whisper.cpp CLI; "
