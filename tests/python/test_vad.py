@@ -185,6 +185,20 @@ class FramesToRegionsTest(unittest.TestCase):
         regions = _frames_to_regions(probs, config, self.FRAME_SEC)
         self.assertEqual(regions, [(0, 10), (30, 40)])
 
+    def test_low_threshold_still_exits_speech_through_silence(self) -> None:
+        # With a very low enter threshold (0.1) the fixed 0.15 margin
+        # would pin leave_threshold to 0; the scaling cap keeps it
+        # effective, so a 0.02 dip still closes the region.
+        probs = [0.5] * 10 + [0.02] * 10 + [0.5] * 10
+        config = _vad_config(
+            threshold=0.1,
+            min_silence_ms=10,
+            min_speech_ms=100,
+            speech_pad_ms=0,
+        )
+        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
+        self.assertEqual(regions, [(0, 10), (20, 30)])
+
 
 class VadWorkerIntegrationTest(unittest.TestCase):
     """VAD integration into the transcribe dispatch, using monkey-patched apply_vad_prepass."""

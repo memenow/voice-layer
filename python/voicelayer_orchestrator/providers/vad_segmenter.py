@@ -181,7 +181,13 @@ def _frames_to_regions(
     """
 
     enter_threshold = config.threshold
-    leave_threshold = max(0.0, config.threshold - _HYSTERESIS_MARGIN)
+    # When `config.threshold` is small (e.g. 0.1) the fixed
+    # `_HYSTERESIS_MARGIN` (0.15) would pin `leave_threshold` to 0 and an
+    # active region could never exit. Cap the effective margin to half
+    # the enter threshold so hysteresis scales with aggressive configs
+    # while still suppressing chatter at the default 0.5.
+    effective_margin = min(_HYSTERESIS_MARGIN, enter_threshold / 2.0)
+    leave_threshold = max(0.0, enter_threshold - effective_margin)
     raw: list[tuple[int, int]] = []
     start: int | None = None
     for i, prob in enumerate(probs):
