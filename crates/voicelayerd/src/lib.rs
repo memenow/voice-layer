@@ -976,21 +976,25 @@ async fn run_segmented_dictation_session(
     }
 
     segments.sort_by_key(|segment| segment.id);
-    let combined_text = segments
+    // Preserve whisper's native leading whitespace on Latin transcripts
+    // (it already separates words) and concatenate CJK transcripts
+    // without adding artificial spaces. A final `trim` strips any
+    // outer whitespace whisper may have emitted at the edges.
+    let combined_text: String = segments
         .iter()
         .filter_map(|segment| segment.transcript.as_deref())
-        .map(str::trim)
         .filter(|chunk| !chunk.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
+    let combined_text = combined_text.trim().to_owned();
     let detected_language = segments
         .iter()
         .find_map(|segment| segment.detected_language.clone());
 
+    // When `keep_audio` is set the operator usually wants the whole
+    // segment set, not just the first file. Return the directory path so
+    // `ls "$path"` lists every segment in order; clean it up otherwise.
     let audio_file_summary = if keep_audio {
-        segments
-            .first()
-            .map(|segment| segment.audio_path.display().to_string())
+        Some(segment_dir.display().to_string())
     } else {
         for segment in &segments {
             let _ = std::fs::remove_file(&segment.audio_path);
