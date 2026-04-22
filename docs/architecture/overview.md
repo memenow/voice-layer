@@ -120,7 +120,11 @@ transcription:
 - `segmentation: {"mode": "fixed", "segment_secs": N, "overlap_secs": 0}` — the recorder is
   rolled every `N` seconds; each finalized chunk is transcribed in the background via the
   configured whisper provider while the next chunk records. On stop the daemon waits for all
-  in-flight transcription tasks and returns a single concatenated transcript.
+  in-flight transcription tasks and returns a single concatenated transcript. When
+  `keep_audio` is true, `DictationCaptureResult.audio_file` points at the *segment directory*
+  under `$XDG_RUNTIME_DIR/voicelayer/dictation/<session_id>/` (one WAV per segment, sorted by
+  numeric id) rather than a single recording; listing the directory reconstructs the capture
+  in order. `keep_audio=false` deletes each segment and removes the directory.
 
 While a segmented session is live the daemon streams per-segment events on `GET /v1/events/stream`
 in addition to the existing session-level events:
