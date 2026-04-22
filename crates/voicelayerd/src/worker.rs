@@ -260,10 +260,20 @@ pub enum WorkerCallError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{
         DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCommand,
         worker_call_timeout,
     };
+
+    /// Serializes any test that mutates process-wide env vars. Cargo runs
+    /// unit tests concurrently by default, and Rust 2024 flagged
+    /// `std::env::set_var` as `unsafe` precisely because a concurrent
+    /// reader in another thread is UB. Any future test that touches
+    /// `VOICELAYER_WORKER_TIMEOUT_SECONDS` (or any other process env)
+    /// must take this lock for the duration of the mutation.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn probe_methods_use_short_timeout() {
@@ -279,10 +289,13 @@ mod tests {
 
     #[test]
     fn inference_methods_use_env_overridden_budget() {
-        // SAFETY: tests run serially in this crate and none of them rely on
-        // VOICELAYER_WORKER_TIMEOUT_SECONDS being unset; we restore it at the
-        // end so follow-up assertions see the default.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS").ok();
+        // SAFETY: ENV_LOCK serializes every mutation of this variable with
+        // every other env-touching test in this module, so no other thread
+        // can observe the mutation while we hold the lock.
         unsafe {
             std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
         }
