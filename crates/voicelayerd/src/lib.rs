@@ -193,6 +193,8 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             asr_binary: health.asr_binary,
             asr_model_path: health.asr_model_path,
             asr_error: health.asr_error,
+            whisper_mode: health.whisper_mode,
+            whisper_server_url: health.whisper_server_url,
             llm_configured: health.llm_configured,
             llm_model: health.llm_model,
             llm_endpoint: health.llm_endpoint,
@@ -218,6 +220,8 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             asr_binary: None,
             asr_model_path: None,
             asr_error: None,
+            whisper_mode: None,
+            whisper_server_url: None,
             message: Some(error.to_string()),
         },
     };

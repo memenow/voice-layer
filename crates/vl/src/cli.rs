@@ -239,7 +239,8 @@ struct DoctorReport {
     asr_binary: Option<String>,
     asr_model_path: Option<String>,
     asr_error: Option<String>,
-    whisper_mode: &'static str,
+    whisper_mode: String,
+    whisper_server_url: Option<String>,
     llm_configured: bool,
     llm_model: Option<String>,
     llm_endpoint: Option<String>,
@@ -538,6 +539,8 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 asr_binary,
                 asr_model_path,
                 asr_error,
+                health_whisper_mode,
+                health_whisper_server_url,
                 llm_configured,
                 llm_model,
                 llm_endpoint,
@@ -561,6 +564,8 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         worker.asr_binary,
                         worker.asr_model_path,
                         worker.asr_error,
+                        worker.whisper_mode,
+                        worker.whisper_server_url,
                         worker.llm_configured,
                         worker.llm_model,
                         worker.llm_endpoint,
@@ -575,6 +580,8 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         asr_binary,
                         asr_model_path,
                         asr_error,
+                        whisper_mode,
+                        whisper_server_url,
                         llm_configured,
                         llm_model,
                         llm_endpoint,
@@ -590,6 +597,8 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         asr_binary,
                         asr_model_path,
                         asr_error,
+                        whisper_mode,
+                        whisper_server_url,
                         llm_configured,
                         llm_model,
                         llm_endpoint,
@@ -605,6 +614,8 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         None,
                         None,
                         None,
+                        None,
+                        None,
                         false,
                         None,
                         None,
@@ -613,6 +624,14 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 },
             };
+
+            // Prefer the daemon's (or local worker's) reported whisper_mode
+            // over sniffing the CLI's own environment — the daemon sees the
+            // systemd EnvironmentFile and knows which path `transcribe` will
+            // actually dispatch to. Fall back to local env detection only
+            // when the worker returned no mode (older daemon / worker).
+            let whisper_mode =
+                health_whisper_mode.unwrap_or_else(|| detect_whisper_mode().to_owned());
 
             let report = DoctorReport {
                 socket_path: socket_path.display().to_string(),
@@ -626,7 +645,8 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 asr_binary,
                 asr_model_path,
                 asr_error,
-                whisper_mode: detect_whisper_mode(),
+                whisper_mode,
+                whisper_server_url: health_whisper_server_url,
                 llm_configured,
                 llm_model,
                 llm_endpoint,

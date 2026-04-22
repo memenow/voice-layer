@@ -214,6 +214,89 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
         assert response is not None
         self.assertEqual(response["result"]["status"], "ok")
 
+    def test_health_reports_whisper_mode_unconfigured_when_no_env(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {},
+            clear=True,
+        ):
+            response = handle_request({"jsonrpc": "2.0", "id": 100, "method": "health"})
+        assert response is not None
+        result = response["result"]
+        self.assertEqual(result["whisper_mode"], "unconfigured")
+        self.assertIsNone(result["whisper_server_url"])
+
+    def test_health_reports_whisper_mode_cli_when_only_cli_env_set(self) -> None:
+        # Use /bin/sh as a stand-in binary — validate_whisper_provider just
+        # needs the binary to exist on disk, and we do not run it here.
+        with (
+            tempfile.NamedTemporaryFile(suffix=".bin") as model_file,
+            patch.dict(
+                "os.environ",
+                {
+                    "VOICELAYER_WHISPER_BIN": "/bin/sh",
+                    "VOICELAYER_WHISPER_MODEL_PATH": model_file.name,
+                    "VOICELAYER_WHISPER_SERVER_HOST": "",
+                    "VOICELAYER_WHISPER_SERVER_PORT": "",
+                    "VOICELAYER_WHISPER_SERVER_BIN": "",
+                    "VOICELAYER_WHISPER_SERVER_AUTO_START": "",
+                },
+                clear=False,
+            ),
+        ):
+            response = handle_request({"jsonrpc": "2.0", "id": 101, "method": "health"})
+        assert response is not None
+        result = response["result"]
+        self.assertEqual(result["whisper_mode"], "cli")
+        self.assertIsNone(result["whisper_server_url"])
+
+    def test_health_reports_whisper_mode_server_when_server_env_set(self) -> None:
+        # Port 65535 with no listener: probe will fail, but because
+        # autostart is not requested and no CLI fallback is configured,
+        # the handler still reports the server as the preferred mode
+        # and records the probe error in asr_error.
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_WHISPER_SERVER_HOST": "127.0.0.1",
+                "VOICELAYER_WHISPER_SERVER_PORT": "65535",
+                "VOICELAYER_WHISPER_SERVER_AUTO_START": "",
+                "VOICELAYER_WHISPER_BIN": "",
+                "VOICELAYER_WHISPER_MODEL_PATH": "",
+            },
+            clear=False,
+        ):
+            response = handle_request({"jsonrpc": "2.0", "id": 102, "method": "health"})
+        assert response is not None
+        result = response["result"]
+        self.assertEqual(result["whisper_mode"], "server")
+        self.assertEqual(result["whisper_server_url"], "http://127.0.0.1:65535")
+        # Probe to the unreachable port should have populated asr_error.
+        self.assertFalse(result["asr_configured"])
+        self.assertIsNotNone(result["asr_error"])
+
+    def test_health_reports_server_as_configured_when_autostart_requested(self) -> None:
+        # A server-only configuration with autostart=true should report
+        # asr_configured=true even before the server is live — the next
+        # transcribe call will launch it.
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_WHISPER_SERVER_HOST": "127.0.0.1",
+                "VOICELAYER_WHISPER_SERVER_PORT": "65535",
+                "VOICELAYER_WHISPER_SERVER_AUTO_START": "1",
+                "VOICELAYER_WHISPER_BIN": "",
+                "VOICELAYER_WHISPER_MODEL_PATH": "",
+            },
+            clear=False,
+        ):
+            response = handle_request({"jsonrpc": "2.0", "id": 103, "method": "health"})
+        assert response is not None
+        result = response["result"]
+        self.assertEqual(result["whisper_mode"], "server")
+        self.assertTrue(result["asr_configured"])
+        self.assertIsNone(result["asr_error"])
+
     def test_list_providers_returns_expected_defaults(self) -> None:
         response = handle_request({"jsonrpc": "2.0", "id": 2, "method": "list_providers"})
         assert response is not None
