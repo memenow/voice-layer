@@ -89,7 +89,9 @@ impl SegmentedRecording {
             return Ok(None);
         };
         let id = self.current_id;
-        let path = stop_recording_process(active).await?;
+        let path = stop_recording_process(active).await.inspect_err(|err| {
+            tracing::error!(segment = id, %err, "failed to finalize segment");
+        })?;
         self.finalized.push((id, path.clone()));
         self.begin_next_segment()?;
         Ok(Some((id, path)))

@@ -713,12 +713,33 @@ fn save_transcript_to_target_dir(
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let base_dir = match save_dir {
         Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir()?,
+        None => default_save_dir(),
     };
     std::fs::create_dir_all(&base_dir)?;
     let path = unique_transcript_path(&base_dir, timestamp);
     std::fs::write(&path, text)?;
     Ok(path)
+}
+
+fn default_save_dir() -> PathBuf {
+    // Respect $XDG_STATE_HOME, then fall back to the spec default
+    // ($HOME/.local/state). Writing to the caller's cwd pollutes git
+    // checkouts, and transcripts are long-lived state (not cache or
+    // config), so `state` is the right bucket.
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        let path = PathBuf::from(state);
+        if path.is_absolute() {
+            return path.join("voicelayer").join("transcripts");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("voicelayer")
+            .join("transcripts");
+    }
+    std::env::temp_dir().join("voicelayer").join("transcripts")
 }
 
 fn unique_transcript_path(base_dir: &Path, timestamp: u64) -> PathBuf {
@@ -751,8 +772,57 @@ fn copy_result_to_clipboard(ui: &mut ForegroundPttUiState, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::unique_transcript_path;
+    use super::{default_save_dir, unique_transcript_path};
+    use std::ffi::OsString;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // The default_save_dir tests mutate XDG_STATE_HOME / HOME, so they
+    // must serialize. Rust's test harness parallelizes by default, and a
+    // sibling test clobbering the same variable would cause flakes.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // RAII guard that snapshots an env var on construction and restores
+    // it on Drop — including on panic — so a failing assertion does not
+    // leak a mutated variable into sibling tests that share the same
+    // test binary.
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: callers take ENV_LOCK before constructing any
+            // EnvGuard, so no other thread inside this test binary is
+            // reading or writing the process environment concurrently.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: same invariant as `set` — serialized via ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard's lifetime is scoped inside an
+            // ENV_LOCK-holding test, so the process is effectively
+            // single-threaded for environment mutation.
+            unsafe {
+                match self.prior.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn unique_transcript_path_is_primary_when_unused() {
@@ -785,5 +855,35 @@ mod tests {
             path.file_name().and_then(|s| s.to_str()),
             Some("voicelayer-transcript-1700000000-2.txt")
         );
+    }
+
+    #[test]
+    fn default_save_dir_honors_xdg_state_home() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _xdg = EnvGuard::set("XDG_STATE_HOME", "/tmp/vl-xdg-state-probe");
+        assert_eq!(
+            default_save_dir(),
+            PathBuf::from("/tmp/vl-xdg-state-probe/voicelayer/transcripts"),
+        );
+    }
+
+    #[test]
+    fn default_save_dir_falls_back_to_home_state_spec() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _xdg = EnvGuard::remove("XDG_STATE_HOME");
+        let _home = EnvGuard::set("HOME", "/tmp/vl-home-probe");
+        assert_eq!(
+            default_save_dir(),
+            PathBuf::from("/tmp/vl-home-probe/.local/state/voicelayer/transcripts"),
+        );
+    }
+
+    #[test]
+    fn default_save_dir_falls_back_to_temp_dir_when_home_unset() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _xdg = EnvGuard::remove("XDG_STATE_HOME");
+        let _home = EnvGuard::remove("HOME");
+        let expected = std::env::temp_dir().join("voicelayer").join("transcripts");
+        assert_eq!(default_save_dir(), expected);
     }
 }

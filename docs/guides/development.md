@@ -63,7 +63,7 @@ For file-based ASR, configure `VOICELAYER_WHISPER_BIN` and `VOICELAYER_WHISPER_M
 - `vl dictation foreground-ptt` now renders an alternate-screen status panel with session visibility, transcript preview, recent events, last injection result, and last error, instead of printing full JSON after every stop.
 - The alternate-screen panel now preserves the full last transcript for scrolling review and supports `j/k`, arrow keys, and `PageUp/PageDown` for navigation. Press `c` to copy the last completed transcript to the clipboard on demand.
 - Press `r` to restore the saved clipboard text backup after any clipboard overwrite performed by the panel.
-- The panel also supports lightweight result actions: `i` re-applies the last injection, `s` saves the last transcript to a timestamped file in the current directory, and `d` discards the last transcript from the panel state.
+- The panel also supports lightweight result actions: `i` re-applies the last injection, `s` saves the last transcript to a timestamped file under `$XDG_STATE_HOME/voicelayer/transcripts/` (default `~/.local/state/voicelayer/transcripts/`, override with `--save-dir`), and `d` discards the last transcript from the panel state.
 - `vl dictation foreground-ptt --copy-on-stop` adds an explicit clipboard fallback using the system clipboard after each completed dictation.
 - `vl dictation foreground-ptt --default-stop-action <none|copy|inject|save>` configures what the tool should try immediately after a stop.
 - `--restore-clipboard-on-exit` restores the saved text clipboard snapshot when the tool exits.

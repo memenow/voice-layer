@@ -5,10 +5,10 @@ use std::process::Command as ProcessCommand;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use voicelayer_core::{
-    ComposeRequest, CompositionArchetype, DictationCaptureRequest, InjectRequest, InjectTarget,
-    InjectionPlan, LanguageProfile, LanguageStrategy, RecorderBackend, RewriteRequest,
-    RewriteStyle, SegmentationMode, SessionMode, StartDictationRequest, StopDictationRequest,
-    TranscribeRequest, TranslateRequest, TriggerKind,
+    ComposeRequest, CompositionArchetype, DictationCaptureRequest, HealthResponse, InjectRequest,
+    InjectTarget, InjectionPlan, LanguageProfile, LanguageStrategy, RecorderBackend,
+    RewriteRequest, RewriteStyle, SegmentationMode, SessionMode, StartDictationRequest,
+    StopDictationRequest, TranscribeRequest, TranslateRequest, TriggerKind,
 };
 use voicelayerd::{
     DaemonConfig, RecorderDiagnostics, WorkerHealthResult, capture_dictation_once,
@@ -22,7 +22,7 @@ use crate::config::{
 };
 use crate::foreground_ptt::run_foreground_ptt;
 use crate::preview::{ready_receipt, worker_error_receipt};
-use crate::uds::{cli_socket_path, uds_post_json};
+use crate::uds::{cli_socket_path, uds_get_json, uds_post_json};
 
 #[derive(Debug, Parser)]
 #[command(name = "vl")]
@@ -219,11 +219,20 @@ impl From<CliRewriteStyle> for RewriteStyle {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonHealthSource {
+    Daemon,
+    LocalWorker,
+}
+
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     socket_path: String,
     project_root: String,
     worker_command: String,
+    daemon_reachable: bool,
+    daemon_health_source: DaemonHealthSource,
     worker_status: String,
     worker_error: Option<String>,
     asr_configured: bool,
@@ -512,7 +521,17 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project_root = default_project_root();
             let config = DaemonConfig::with_project_root(socket_path.clone(), project_root.clone());
             let portal = probe_global_shortcuts_portal().await;
+
+            // Prefer the live daemon's `/v1/health` so doctor sees the same
+            // env the daemon was started with (e.g. a systemd
+            // EnvironmentFile). Fall back to spawning a one-off worker only
+            // when the daemon socket is unreachable — doctor should still
+            // work for pre-enable dry runs.
+            let daemon_health: Option<HealthResponse> =
+                uds_get_json(&socket_path, "/v1/health").await.ok();
             let (
+                daemon_reachable,
+                daemon_health_source,
                 worker_status,
                 worker_error,
                 asr_configured,
@@ -524,51 +543,83 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 llm_endpoint,
                 llm_reachable,
                 llm_error,
-            ) = match config.worker_command.health().await {
-                Ok(WorkerHealthResult {
-                    status,
-                    asr_configured,
-                    asr_binary,
-                    asr_model_path,
-                    asr_error,
-                    llm_configured,
-                    llm_model,
-                    llm_endpoint,
-                    llm_reachable,
-                    llm_error,
-                    ..
-                }) => (
-                    status,
-                    None,
-                    asr_configured,
-                    asr_binary,
-                    asr_model_path,
-                    asr_error,
-                    llm_configured,
-                    llm_model,
-                    llm_endpoint,
-                    llm_reachable,
-                    llm_error,
-                ),
-                Err(error) => (
-                    "unavailable".to_owned(),
-                    Some(error.to_string()),
-                    false,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    false,
-                    None,
-                ),
+            ) = match daemon_health {
+                Some(response) => {
+                    let worker = response.worker;
+                    (
+                        true,
+                        DaemonHealthSource::Daemon,
+                        worker.status,
+                        // The daemon writes the underlying `worker_command.health()`
+                        // failure into `worker.message` when it marks the worker
+                        // "unavailable". Forward it so `vl doctor` surfaces the
+                        // actionable reason (Python import error, missing uv,
+                        // crashed subprocess, ...) instead of reporting an
+                        // unavailable worker with no explanation.
+                        worker.message,
+                        worker.asr_configured,
+                        worker.asr_binary,
+                        worker.asr_model_path,
+                        worker.asr_error,
+                        worker.llm_configured,
+                        worker.llm_model,
+                        worker.llm_endpoint,
+                        worker.llm_reachable,
+                        worker.llm_error,
+                    )
+                }
+                None => match config.worker_command.health().await {
+                    Ok(WorkerHealthResult {
+                        status,
+                        asr_configured,
+                        asr_binary,
+                        asr_model_path,
+                        asr_error,
+                        llm_configured,
+                        llm_model,
+                        llm_endpoint,
+                        llm_reachable,
+                        llm_error,
+                        ..
+                    }) => (
+                        false,
+                        DaemonHealthSource::LocalWorker,
+                        status,
+                        None,
+                        asr_configured,
+                        asr_binary,
+                        asr_model_path,
+                        asr_error,
+                        llm_configured,
+                        llm_model,
+                        llm_endpoint,
+                        llm_reachable,
+                        llm_error,
+                    ),
+                    Err(error) => (
+                        false,
+                        DaemonHealthSource::LocalWorker,
+                        "unavailable".to_owned(),
+                        Some(error.to_string()),
+                        false,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ),
+                },
             };
 
             let report = DoctorReport {
                 socket_path: socket_path.display().to_string(),
                 project_root: project_root.display().to_string(),
                 worker_command: config.worker_command.display(),
+                daemon_reachable,
+                daemon_health_source,
                 worker_status,
                 worker_error,
                 asr_configured,
@@ -644,16 +695,45 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             language,
             translate_to_english,
         } => {
-            let config =
-                DaemonConfig::with_project_root(default_socket_path(), default_project_root());
-            let result = config
-                .worker_command
-                .transcribe(&TranscribeRequest {
-                    audio_file,
-                    language,
-                    translate_to_english,
-                })
-                .await?;
+            let request = TranscribeRequest {
+                audio_file,
+                language,
+                translate_to_english,
+            };
+            // Prefer the running daemon so the request inherits its (e.g.
+            // systemd-provided) environment. Fall back to spawning a
+            // one-off local worker when no daemon is listening — useful
+            // for pre-enable scripting, but the caller's shell must then
+            // export VOICELAYER_WHISPER_* itself.
+            //
+            // We pre-check socket existence so a "no daemon running" boot
+            // is a silent fallback, while "socket exists but rejected the
+            // request" surfaces a warning. Without the split, a broken
+            // daemon silently routes to the local worker and the
+            // underlying error is hidden from the operator.
+            let socket_path = cli_socket_path();
+            let daemon_outcome: Option<
+                Result<voicelayer_core::TranscriptionResult, Box<dyn std::error::Error>>,
+            > = if socket_path.exists() {
+                Some(uds_post_json(&socket_path, "/v1/transcriptions", &request).await)
+            } else {
+                None
+            };
+            let result: voicelayer_core::TranscriptionResult = match daemon_outcome {
+                Some(Ok(result)) => result,
+                other => {
+                    if let Some(Err(error)) = other {
+                        eprintln!(
+                            "warning: daemon at {} rejected /v1/transcriptions ({error}); \
+                             falling back to a local worker",
+                            socket_path.display()
+                        );
+                    }
+                    let config =
+                        DaemonConfig::with_project_root(socket_path, default_project_root());
+                    config.worker_command.transcribe(&request).await?
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Preview { command } => match command {

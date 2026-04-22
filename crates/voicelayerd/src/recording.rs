@@ -1,6 +1,5 @@
 use std::{
     fs,
-    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::Command as StdCommand,
     time::Duration,
@@ -184,21 +183,39 @@ pub async fn stop_recording_process(
         RecorderBackend::Auto => "-TERM",
     };
 
-    let status = StdCommand::new("kill")
+    let output = StdCommand::new("kill")
         .arg(signal)
         .arg(pid.to_string())
-        .status()?;
-    if !status.success() {
-        return Err(RecordingError::InterruptFailed(status.to_string()));
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if stderr.is_empty() {
+            output.status.to_string()
+        } else {
+            format!("{} ({stderr})", output.status)
+        };
+        tracing::error!(
+            pid = pid,
+            signal = signal,
+            exit = ?output.status.code(),
+            stderr = %stderr,
+            "kill failed while stopping recorder",
+        );
+        return Err(RecordingError::InterruptFailed(detail));
     }
 
+    // After `kill -INT` succeeds the child has one of three outcomes:
+    //   - terminated via SIGINT (status.signal() == Some(2))
+    //   - cleaned up during its signal handler and exited with status 0 or
+    //     a non-zero code (pw-record returns 1 here, which is its normal
+    //     shutdown path)
+    //   - ignored SIGINT and kept running, in which case we fall through
+    //     to the 5s timeout branch below and SIGKILL it
+    // So the exit status alone does not tell us whether the recording is
+    // usable. Instead we verify the WAV file landed on disk with content.
     let wait_result = timeout(Duration::from_secs(5), recording.child.wait()).await;
     match wait_result {
-        Ok(Ok(status)) => {
-            if !(status.success() || status.signal() == Some(2)) {
-                return Err(RecordingError::InterruptFailed(status.to_string()));
-            }
-        }
+        Ok(Ok(_status)) => {}
         Ok(Err(error)) => return Err(RecordingError::Io(error)),
         Err(_) => {
             recording.child.start_kill()?;
@@ -207,13 +224,12 @@ pub async fn stop_recording_process(
         }
     }
 
-    if !recording.audio_file.is_file() {
-        return Err(RecordingError::MissingOutput(
+    match fs::metadata(&recording.audio_file) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Ok(recording.audio_file),
+        _ => Err(RecordingError::MissingOutput(
             recording.audio_file.display().to_string(),
-        ));
+        )),
     }
-
-    Ok(recording.audio_file)
 }
 
 pub fn maybe_cleanup_audio_file(audio_file: &Path, keep_audio: bool) -> Option<String> {
@@ -291,7 +307,12 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{recorder_diagnostics, resolve_recorder_backend};
+    use super::{
+        ActiveRecording, RecordingError, recorder_diagnostics, resolve_recorder_backend,
+        stop_recording_process,
+    };
+    use std::fs;
+    use tokio::process::Command;
     use voicelayer_core::RecorderBackend;
 
     #[test]
@@ -321,6 +342,88 @@ mod tests {
                 !diagnostics.pw_record_available && !diagnostics.arecord_available,
                 "selected_backend is None while a recorder is reported as available",
             ),
+        }
+    }
+
+    // Spawn a shell child that sleeps briefly and then exits with the
+    // requested code. This models `pw-record`'s real shutdown path —
+    // exits with code 1 after cleanup — without relying on SIGINT
+    // delivery to dash, which tokio's process spawn makes unreliable:
+    // dash inherits SIGINT with SIG_IGN from tokio's fork point, and
+    // POSIX dash cannot re-enable a signal that was ignored at exec.
+    // The production code path really does deliver SIGINT to
+    // `pw-record` (which installs its own sigaction handler and honors
+    // it), so what these tests pin is the post-wait invariant: once
+    // the child has exited, stop_recording_process decides pass/fail
+    // based on whether the WAV file landed, not on the exit status.
+    fn spawn_exiting_child(code: u8) -> tokio::process::Child {
+        let script = format!("sleep 0.2; exit {code}");
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[tokio::test]
+    async fn stop_recording_process_accepts_nonzero_exit_when_audio_file_has_content() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let audio_file = tempdir.path().join("fake.wav");
+        fs::write(&audio_file, b"fake-audio-bytes").expect("seed audio");
+
+        let child = spawn_exiting_child(1);
+        let recording = ActiveRecording {
+            backend: RecorderBackend::Pipewire,
+            audio_file: audio_file.clone(),
+            child,
+        };
+
+        let resolved = stop_recording_process(recording)
+            .await
+            .expect("nonzero child exit with populated audio file must succeed");
+        assert_eq!(resolved, audio_file);
+    }
+
+    #[tokio::test]
+    async fn stop_recording_process_reports_missing_output_when_audio_file_absent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let audio_file = tempdir.path().join("never_written.wav");
+        // Deliberately do not create audio_file.
+
+        let child = spawn_exiting_child(1);
+        let recording = ActiveRecording {
+            backend: RecorderBackend::Pipewire,
+            audio_file: audio_file.clone(),
+            child,
+        };
+
+        match stop_recording_process(recording).await {
+            Err(RecordingError::MissingOutput(path)) => {
+                assert!(path.contains("never_written.wav"), "got path: {path}")
+            }
+            other => panic!("expected MissingOutput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_recording_process_reports_missing_output_when_audio_file_empty() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let audio_file = tempdir.path().join("empty.wav");
+        fs::write(&audio_file, b"").expect("seed empty file");
+
+        let child = spawn_exiting_child(0);
+        let recording = ActiveRecording {
+            backend: RecorderBackend::Pipewire,
+            audio_file: audio_file.clone(),
+            child,
+        };
+
+        // A zero-byte file means the recorder started but captured no
+        // frames (or the user's audio path is broken). Do not pass that
+        // off to whisper as if it were usable input.
+        match stop_recording_process(recording).await {
+            Err(RecordingError::MissingOutput(_)) => {}
+            other => panic!("expected MissingOutput for empty file, got {other:?}"),
         }
     }
 }

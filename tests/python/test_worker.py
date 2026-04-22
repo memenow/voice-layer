@@ -441,6 +441,76 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
         assert response is not None
         self.assertEqual(response["result"]["text"], "Recognized transcript.")
 
+    def _create_silent_whisper_cli_script(self, output_body: str) -> tuple[str, str, str]:
+        temp_dir = tempfile.mkdtemp(prefix="voicelayer-whisper-silent-")
+        script_path = pathlib.Path(temp_dir) / "fake_silent_whisper_cli.py"
+        model_path = pathlib.Path(temp_dir) / "model.bin"
+        audio_path = pathlib.Path(temp_dir) / "sample.wav"
+        model_path.write_text("placeholder", encoding="utf-8")
+        audio_path.write_text("not-real-audio", encoding="utf-8")
+        script_path.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import argparse
+                from pathlib import Path
+
+                parser = argparse.ArgumentParser()
+                parser.add_argument("-m", dest="model_path")
+                parser.add_argument("-f", dest="audio_file")
+                parser.add_argument("-of", dest="output_file")
+                parser.add_argument("-l", dest="language", default="auto")
+                parser.add_argument("-tr", dest="translate", action="store_true")
+                parser.add_argument("-otxt", action="store_true")
+                parser.add_argument("-np", action="store_true")
+                parser.add_argument("-ng", action="store_true")
+                parser.add_argument("rest", nargs="*")
+                args, _ = parser.parse_known_args()
+
+                Path(args.output_file + ".txt").write_text({output_body!r}, encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        script_path.chmod(0o755)
+        return str(script_path), str(model_path), str(audio_path)
+
+    def test_transcribe_reports_empty_text_when_whisper_cli_finds_no_speech(self) -> None:
+        # Silent recordings must surface as completed + empty text so the CLI
+        # can decide whether to treat it as a no-op. whisper.cpp marks the
+        # all-silence case with [BLANK_AUDIO]; whisper-cli also sometimes
+        # writes a plain empty transcript for short clips.
+        for body in ("", "\n", " [BLANK_AUDIO]\n"):
+            with self.subTest(body=body):
+                script_path, model_path, audio_path = self._create_silent_whisper_cli_script(body)
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "VOICELAYER_WHISPER_BIN": script_path,
+                        "VOICELAYER_WHISPER_MODEL_PATH": model_path,
+                    },
+                    clear=False,
+                ):
+                    response = handle_request(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 11,
+                            "method": "transcribe",
+                            "params": {
+                                "audio_file": audio_path,
+                                "language": "auto",
+                                "translate_to_english": False,
+                            },
+                        }
+                    )
+                assert response is not None
+                result = response["result"]
+                self.assertEqual(result["text"], "")
+                self.assertIn(
+                    "whisper.cpp returned no speech for this audio.",
+                    result["notes"],
+                )
+
     def test_unknown_method_returns_method_not_found(self) -> None:
         response = handle_request({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
         assert response is not None
