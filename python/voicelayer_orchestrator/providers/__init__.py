@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 from collections.abc import Mapping
@@ -26,6 +27,72 @@ def provider_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
     runtime_dir = Path(base) / "voicelayer" / "providers"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     return runtime_dir
+
+
+def _read_pid_from_lock(lock_path: Path) -> int | None:
+    """Read the PID written by the lock owner. Returns None when unreadable."""
+
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _pid_runs_binary(pid: int, expected_binary: str) -> bool:
+    """Best-effort Linux-only check that ``pid`` still runs ``expected_binary``.
+
+    Reads ``/proc/<pid>/cmdline`` (NUL-separated argv) and compares the
+    basename of argv[0] to the basename of ``expected_binary`` so both
+    absolute paths and bare names resolve correctly. Returns False on any
+    failure (process gone, non-Linux platform, binary mismatch).
+    """
+
+    if pid <= 0:
+        return False
+    cmdline_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        raw = cmdline_path.read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+    argv0_bytes = raw.split(b"\x00", 1)[0]
+    if not argv0_bytes:
+        return False
+    try:
+        argv0 = argv0_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return Path(argv0).name == Path(expected_binary).name
+
+
+def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
+    """Remove ``lock_path`` if its recorded owner is no longer running.
+
+    Returns True when a stale lock was deleted so the caller can retry
+    the ``os.open(..., O_EXCL)`` happy path. Returns False when the lock
+    owner is still alive (the caller must wait) or when the state is
+    ambiguous (partially-written PID, /proc unreadable) so we err on the
+    safe side and leave the lock intact.
+    """
+
+    if not lock_path.exists():
+        return False
+    pid = _read_pid_from_lock(lock_path)
+    if pid is None:
+        # The owner may have just created the lock and not yet written
+        # its PID. Leave the lock alone; the caller will fall through to
+        # the shared `wait_for_endpoint` path.
+        return False
+    if _pid_runs_binary(pid, expected_binary):
+        return False
+    with contextlib.suppress(FileNotFoundError):
+        lock_path.unlink()
+    return True
 
 
 def supported_providers(

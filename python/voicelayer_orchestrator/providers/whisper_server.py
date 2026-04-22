@@ -32,7 +32,11 @@ from pathlib import Path
 from typing import Any
 
 from voicelayer_orchestrator.config import WhisperServerConfig
-from voicelayer_orchestrator.providers import ProviderInvocationError, provider_runtime_dir
+from voicelayer_orchestrator.providers import (
+    ProviderInvocationError,
+    provider_runtime_dir,
+    reclaim_stale_lock,
+)
 
 _BACKGROUND_PROCESSES: list[subprocess.Popen[bytes]] = []
 
@@ -128,6 +132,13 @@ def autostart_whisper_server(
         command = _build_whisper_server_command(config)
     except ProviderInvocationError as exc:
         return False, str(exc)
+
+    # If a previous owner crashed without cleanup, remove its orphaned lock
+    # so we can retake the launch path instead of waiting for a dead
+    # server. Benign TOCTOU: if another launcher creates the lock between
+    # this call and O_EXCL below, we fall into the FileExistsError branch
+    # and wait like before.
+    reclaim_stale_lock(lock_path, command[0])
 
     lock_fd: int | None = None
     acquired = False

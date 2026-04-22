@@ -16,7 +16,11 @@ from voicelayer_orchestrator.config import (
     OpenAICompatibleConfig,
     load_llama_server_launch_config,
 )
-from voicelayer_orchestrator.providers import ProviderInvocationError, provider_runtime_dir
+from voicelayer_orchestrator.providers import (
+    ProviderInvocationError,
+    provider_runtime_dir,
+    reclaim_stale_lock,
+)
 from voicelayer_orchestrator.providers.llm_openai_compatible import (
     is_local_endpoint,
     probe_llm_endpoint,
@@ -122,6 +126,13 @@ def autostart_llama_server(
         command = build_llama_server_command(config, launch)
     except ProviderInvocationError as exc:
         return False, str(exc)
+
+    # If a previous owner crashed without cleanup, remove its orphaned lock
+    # so we can retake the launch path instead of waiting 30s for a dead
+    # server. Benign TOCTOU: if another launcher creates the lock between
+    # this call and O_EXCL below, we fall into the FileExistsError branch
+    # and wait like before.
+    reclaim_stale_lock(lock_path, command[0])
 
     lock_fd: int | None = None
     acquired = False
