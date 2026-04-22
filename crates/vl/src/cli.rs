@@ -22,7 +22,7 @@ use crate::config::{
 };
 use crate::foreground_ptt::run_foreground_ptt;
 use crate::preview::{ready_receipt, worker_error_receipt};
-use crate::uds::{cli_socket_path, uds_get_json, uds_post_json};
+use crate::uds::{DaemonOutcome, cli_socket_path, try_daemon_post, uds_get_json, uds_post_json};
 
 #[derive(Debug, Parser)]
 #[command(name = "vl")]
@@ -712,23 +712,18 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // existing socket that rejects the request → stderr warning,
             // same split as TranscribeFile.
             let socket_path = cli_socket_path();
-            let daemon_outcome: Option<
-                Result<voicelayer_core::DictationCaptureResult, Box<dyn std::error::Error>>,
-            > = if socket_path.exists() {
-                Some(uds_post_json(&socket_path, "/v1/dictation/capture", &request).await)
-            } else {
-                None
-            };
-            let result = match daemon_outcome {
-                Some(Ok(result)) => result,
-                other => {
-                    if let Some(Err(error)) = other {
-                        eprintln!(
-                            "warning: daemon at {} rejected /v1/dictation/capture ({error}); \
-                             falling back to in-process capture",
-                            socket_path.display()
-                        );
-                    }
+            let outcome: DaemonOutcome<voicelayer_core::DictationCaptureResult> =
+                try_daemon_post(&socket_path, "/v1/dictation/capture", &request).await;
+            if let DaemonOutcome::Rejected(error) = &outcome {
+                eprintln!(
+                    "warning: daemon at {} rejected /v1/dictation/capture ({error}); \
+                     falling back to in-process capture",
+                    socket_path.display()
+                );
+            }
+            let result = match outcome {
+                DaemonOutcome::Ok(result) => result,
+                _ => {
                     let config =
                         DaemonConfig::with_project_root(socket_path, default_project_root());
                     capture_dictation_once(&config, request).await
@@ -752,29 +747,23 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // for pre-enable scripting, but the caller's shell must then
             // export VOICELAYER_WHISPER_* itself.
             //
-            // We pre-check socket existence so a "no daemon running" boot
-            // is a silent fallback, while "socket exists but rejected the
-            // request" surfaces a warning. Without the split, a broken
-            // daemon silently routes to the local worker and the
-            // underlying error is hidden from the operator.
+            // Missing socket is a silent fallback; an existing socket
+            // that rejects the request surfaces a warning. Without the
+            // split, a broken daemon would silently route to the local
+            // worker and the underlying error would be hidden.
             let socket_path = cli_socket_path();
-            let daemon_outcome: Option<
-                Result<voicelayer_core::TranscriptionResult, Box<dyn std::error::Error>>,
-            > = if socket_path.exists() {
-                Some(uds_post_json(&socket_path, "/v1/transcriptions", &request).await)
-            } else {
-                None
-            };
-            let result: voicelayer_core::TranscriptionResult = match daemon_outcome {
-                Some(Ok(result)) => result,
-                other => {
-                    if let Some(Err(error)) = other {
-                        eprintln!(
-                            "warning: daemon at {} rejected /v1/transcriptions ({error}); \
-                             falling back to a local worker",
-                            socket_path.display()
-                        );
-                    }
+            let outcome: DaemonOutcome<voicelayer_core::TranscriptionResult> =
+                try_daemon_post(&socket_path, "/v1/transcriptions", &request).await;
+            if let DaemonOutcome::Rejected(error) = &outcome {
+                eprintln!(
+                    "warning: daemon at {} rejected /v1/transcriptions ({error}); \
+                     falling back to a local worker",
+                    socket_path.display()
+                );
+            }
+            let result: voicelayer_core::TranscriptionResult = match outcome {
+                DaemonOutcome::Ok(result) => result,
+                _ => {
                     let config =
                         DaemonConfig::with_project_root(socket_path, default_project_root());
                     config.worker_command.transcribe(&request).await?
