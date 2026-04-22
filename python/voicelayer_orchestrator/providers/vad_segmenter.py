@@ -16,13 +16,24 @@ VAD or surface the error.
 from __future__ import annotations
 
 import wave
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 from voicelayer_orchestrator.config import WhisperVadConfig
 from voicelayer_orchestrator.providers import ProviderInvocationError
 
-_SESSION_CACHE: dict[str, Any] = {}
+# Bounded LRU: the worker almost always uses a single silero model path, but
+# we cap the cache so a misconfiguration that switches paths per request can
+# never grow ONNX sessions without bound.
+_SESSION_CACHE_MAX_ENTRIES = 2
+_SESSION_CACHE: OrderedDict[str, Any] = OrderedDict()
+
+# Hysteresis gap: once in-speech, the per-frame probability must drop at
+# least this far below the enter threshold before we consider the speech
+# region ended. Prevents chatter around the configured threshold without
+# exposing another knob to operators.
+_HYSTERESIS_MARGIN = 0.15
 
 
 def _lazy_imports() -> tuple[Any, Any]:
@@ -85,6 +96,7 @@ def _load_vad_session(model_path: str) -> Any:
 
     cached = _SESSION_CACHE.get(model_path)
     if cached is not None:
+        _SESSION_CACHE.move_to_end(model_path)
         return cached
 
     _, ort = _lazy_imports()
@@ -101,6 +113,8 @@ def _load_vad_session(model_path: str) -> Any:
         providers=["CPUExecutionProvider"],
     )
     _SESSION_CACHE[model_path] = session
+    while len(_SESSION_CACHE) > _SESSION_CACHE_MAX_ENTRIES:
+        _SESSION_CACHE.popitem(last=False)
     return session
 
 
@@ -159,19 +173,27 @@ def _frames_to_regions(
     config: WhisperVadConfig,
     frame_sec: float,
 ) -> list[tuple[int, int]]:
-    """Convert per-frame speech probs into frame-index [start, end) regions."""
+    """Convert per-frame speech probs into frame-index [start, end) regions.
 
-    is_speech = [p > config.threshold for p in probs]
+    Uses two-level thresholds (enter at ``config.threshold``, leave at
+    ``max(0, threshold - _HYSTERESIS_MARGIN)``) so borderline
+    probabilities don't cause the speech state to chatter frame-by-frame.
+    """
+
+    enter_threshold = config.threshold
+    leave_threshold = max(0.0, config.threshold - _HYSTERESIS_MARGIN)
     raw: list[tuple[int, int]] = []
     start: int | None = None
-    for i, speech in enumerate(is_speech):
-        if speech and start is None:
-            start = i
-        elif not speech and start is not None:
-            raw.append((start, i))
-            start = None
+    for i, prob in enumerate(probs):
+        if start is None:
+            if prob >= enter_threshold:
+                start = i
+        else:
+            if prob < leave_threshold:
+                raw.append((start, i))
+                start = None
     if start is not None:
-        raw.append((start, len(is_speech)))
+        raw.append((start, len(probs)))
 
     min_gap = max(1, int(round((config.min_silence_ms / 1000.0) / frame_sec)))
     merged: list[tuple[int, int]] = []
@@ -185,7 +207,7 @@ def _frames_to_regions(
     merged = [r for r in merged if r[1] - r[0] >= min_len]
 
     pad = int(round((config.speech_pad_ms / 1000.0) / frame_sec))
-    total = len(is_speech)
+    total = len(probs)
     padded: list[tuple[int, int]] = []
     for region in merged:
         lo = max(0, region[0] - pad)

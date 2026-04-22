@@ -158,6 +158,33 @@ class FramesToRegionsTest(unittest.TestCase):
         regions = _frames_to_regions(probs, config, self.FRAME_SEC)
         self.assertEqual(regions, [(0, 32), (32, 64), (64, 96), (96, 100)])
 
+    def test_hysteresis_holds_speech_through_borderline_dips(self) -> None:
+        # With enter=0.5 and hysteresis=0.15, leave threshold is 0.35.
+        # A 0.40 probability in the middle of an active speech span must
+        # not close the region (it only exits when the prob drops below
+        # leave_threshold for at least one frame).
+        probs = [0.9] * 10 + [0.40] * 5 + [0.9] * 10
+        config = _vad_config(
+            threshold=0.5,
+            min_silence_ms=10,
+            min_speech_ms=100,
+            speech_pad_ms=0,
+        )
+        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
+        self.assertEqual(regions, [(0, 25)])
+
+    def test_hysteresis_closes_on_true_silence(self) -> None:
+        # A dip all the way below leave_threshold does close the region.
+        probs = [0.9] * 10 + [0.1] * 20 + [0.9] * 10
+        config = _vad_config(
+            threshold=0.5,
+            min_silence_ms=10,
+            min_speech_ms=100,
+            speech_pad_ms=0,
+        )
+        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
+        self.assertEqual(regions, [(0, 10), (30, 40)])
+
 
 class VadWorkerIntegrationTest(unittest.TestCase):
     """VAD integration into the transcribe dispatch, using monkey-patched apply_vad_prepass."""
