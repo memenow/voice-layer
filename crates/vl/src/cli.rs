@@ -219,13 +219,20 @@ impl From<CliRewriteStyle> for RewriteStyle {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonHealthSource {
+    Daemon,
+    LocalWorker,
+}
+
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     socket_path: String,
     project_root: String,
     worker_command: String,
     daemon_reachable: bool,
-    daemon_health_source: &'static str,
+    daemon_health_source: DaemonHealthSource,
     worker_status: String,
     worker_error: Option<String>,
     asr_configured: bool,
@@ -541,7 +548,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let worker = response.worker;
                     (
                         true,
-                        "daemon",
+                        DaemonHealthSource::Daemon,
                         worker.status,
                         None,
                         worker.asr_configured,
@@ -570,7 +577,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         ..
                     }) => (
                         false,
-                        "local_worker",
+                        DaemonHealthSource::LocalWorker,
                         status,
                         None,
                         asr_configured,
@@ -585,7 +592,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     Err(error) => (
                         false,
-                        "local_worker",
+                        DaemonHealthSource::LocalWorker,
                         "unavailable".to_owned(),
                         Some(error.to_string()),
                         false,
@@ -692,17 +699,35 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // one-off local worker when no daemon is listening — useful
             // for pre-enable scripting, but the caller's shell must then
             // export VOICELAYER_WHISPER_* itself.
-            let result: voicelayer_core::TranscriptionResult =
-                match uds_post_json(&cli_socket_path(), "/v1/transcriptions", &request).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let config = DaemonConfig::with_project_root(
-                            default_socket_path(),
-                            default_project_root(),
+            //
+            // We pre-check socket existence so a "no daemon running" boot
+            // is a silent fallback, while "socket exists but rejected the
+            // request" surfaces a warning. Without the split, a broken
+            // daemon silently routes to the local worker and the
+            // underlying error is hidden from the operator.
+            let socket_path = cli_socket_path();
+            let daemon_outcome: Option<
+                Result<voicelayer_core::TranscriptionResult, Box<dyn std::error::Error>>,
+            > = if socket_path.exists() {
+                Some(uds_post_json(&socket_path, "/v1/transcriptions", &request).await)
+            } else {
+                None
+            };
+            let result: voicelayer_core::TranscriptionResult = match daemon_outcome {
+                Some(Ok(result)) => result,
+                other => {
+                    if let Some(Err(error)) = other {
+                        eprintln!(
+                            "warning: daemon at {} rejected /v1/transcriptions ({error}); \
+                             falling back to a local worker",
+                            socket_path.display()
                         );
-                        config.worker_command.transcribe(&request).await?
                     }
-                };
+                    let config =
+                        DaemonConfig::with_project_root(socket_path, default_project_root());
+                    config.worker_command.transcribe(&request).await?
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Preview { command } => match command {
