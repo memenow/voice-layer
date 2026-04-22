@@ -438,6 +438,7 @@ pub fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::sync::Mutex;
 
     use super::resolve_vl_binary;
@@ -446,59 +447,82 @@ mod tests {
     /// `crates/voicelayerd/src/worker.rs` for the rationale.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Snapshots an env var at construction and restores it on drop so
+    /// an assertion panic never leaks state into the next test's view.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: ENV_LOCK is held by the surrounding test for the
+            // lifetime of the guard, so no other thread can observe the
+            // intermediate state.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: ENV_LOCK must be held by the caller.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn unset_env(key: &str) {
+        // SAFETY: ENV_LOCK must be held by the caller.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn resolve_vl_binary_honors_explicit_override() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_LOCK is held for the duration of the mutation.
-        unsafe {
-            std::env::set_var("VOICELAYER_VL_BIN", "/custom/vl");
-        }
+        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_VL_BIN");
+        set_env("VOICELAYER_VL_BIN", "/custom/vl");
         assert_eq!(resolve_vl_binary().to_str(), Some("/custom/vl"));
-        unsafe {
-            std::env::remove_var("VOICELAYER_VL_BIN");
-        }
     }
 
     #[test]
     fn resolve_vl_binary_falls_back_to_local_bin_when_present() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_VL_BIN");
+        let _home_guard = EnvGuard::capture("HOME");
         let tmp = tempfile::tempdir().expect("tempdir should be creatable");
         let fake_local = tmp.path().join(".local/bin");
         std::fs::create_dir_all(&fake_local).expect("create fake ~/.local/bin");
         let vl_path = fake_local.join("vl");
         std::fs::write(&vl_path, b"#!/bin/sh\n").expect("write fake vl binary");
-        let previous_home = std::env::var_os("HOME");
-        // SAFETY: ENV_LOCK is held for the duration of the mutation.
-        unsafe {
-            std::env::remove_var("VOICELAYER_VL_BIN");
-            std::env::set_var("HOME", tmp.path());
-        }
+        unset_env("VOICELAYER_VL_BIN");
+        set_env("HOME", tmp.path());
         assert_eq!(resolve_vl_binary(), vl_path);
-        unsafe {
-            match previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 
     #[test]
     fn resolve_vl_binary_falls_back_to_path_lookup_as_last_resort() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_VL_BIN");
+        let _home_guard = EnvGuard::capture("HOME");
         let tmp = tempfile::tempdir().expect("tempdir should be creatable");
-        let previous_home = std::env::var_os("HOME");
-        // SAFETY: ENV_LOCK is held for the duration of the mutation.
-        unsafe {
-            std::env::remove_var("VOICELAYER_VL_BIN");
-            // Point HOME at an empty directory so `~/.local/bin/vl` misses.
-            std::env::set_var("HOME", tmp.path());
-        }
+        unset_env("VOICELAYER_VL_BIN");
+        // Point HOME at an empty directory so `~/.local/bin/vl` misses.
+        set_env("HOME", tmp.path());
         assert_eq!(resolve_vl_binary().to_str(), Some("vl"));
-        unsafe {
-            match previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 }
