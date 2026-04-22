@@ -45,6 +45,13 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
   echo ">> Reloading user-level systemd manager"
   systemctl --user daemon-reload || echo "   (daemon-reload failed; safe to ignore if systemd --user is unavailable)"
+  # If the unit was already running before the install, bounce it so the
+  # running daemon picks up the freshly copied binary. `try-restart` is a
+  # no-op when the unit isn't active, so this is safe on first install.
+  if systemctl --user is-active --quiet voicelayerd; then
+    echo ">> Restarting active voicelayerd.service to pick up new binary"
+    systemctl --user try-restart voicelayerd || echo "   (try-restart failed; run systemctl --user restart voicelayerd manually)"
+  fi
 fi
 
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
