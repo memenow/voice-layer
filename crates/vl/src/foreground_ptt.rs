@@ -429,20 +429,18 @@ fn apply_dictation_result_to_ui(
                 }
             }
         }
-        ForegroundInjectionTarget::Kitty { r#match } => {
+        ForegroundInjectionTarget::Kitty { r#match: selector } => {
             if matches!(ui.default_stop_action, StopAction::Inject) {
-                match paste_into_kitty_target(r#match, &result.transcription.text) {
+                match paste_into_kitty_target(selector, &result.transcription.text) {
                     Ok(()) => {
                         let prefix = ui
                             .last_injection_status
                             .clone()
                             .unwrap_or_else(|| "Done.".to_owned());
-                        let selector = r#match;
                         ui.last_injection_status =
                             Some(format!("{prefix} Sent to Kitty target {selector}."))
                     }
                     Err(error) => {
-                        let selector = r#match;
                         ui.last_error = Some(format!(
                             "[injection-failed] Kitty target {selector}: {error}"
                         ))
