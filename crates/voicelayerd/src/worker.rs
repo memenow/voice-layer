@@ -13,6 +13,29 @@ use voicelayer_core::{ProviderDescriptor, TranscriptionResult};
 const JSONRPC_VERSION: &str = "2.0";
 const WORKER_MODULE: &str = "voicelayer_orchestrator.worker";
 
+/// Upper bound on how long the daemon waits for a worker response.
+///
+/// `health` and `list_providers` are cheap probes and stay short so CLI
+/// commands that depend on them (e.g., `vl doctor`, `vl providers`) don't
+/// hang on a misconfigured worker. Every other method invokes real
+/// inference (whisper-cli / whisper-server for transcribe, llama-server
+/// for compose/rewrite/translate) and must outlast the provider's own
+/// timeout. The inference budget is overridable through the
+/// `VOICELAYER_WORKER_TIMEOUT_SECONDS` environment variable.
+const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_INFERENCE_TIMEOUT_SECS: u64 = 600;
+
+fn worker_call_timeout(method: &str) -> Duration {
+    let seconds = match method {
+        "health" | "list_providers" => DEFAULT_PROBE_TIMEOUT_SECS,
+        _ => std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INFERENCE_TIMEOUT_SECS),
+    };
+    Duration::from_secs(seconds)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
     pub executable: String,
@@ -137,7 +160,7 @@ impl WorkerCommand {
         drop(stdin);
 
         let mut reader = BufReader::new(stdout).lines();
-        let line = timeout(Duration::from_secs(10), reader.next_line())
+        let line = timeout(worker_call_timeout(method), reader.next_line())
             .await
             .map_err(|_| WorkerCallError::TimedOut)??
             .ok_or(WorkerCallError::EmptyResponse)?;
@@ -237,7 +260,50 @@ pub enum WorkerCallError {
 
 #[cfg(test)]
 mod tests {
-    use super::WorkerCommand;
+    use super::{
+        DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCommand,
+        worker_call_timeout,
+    };
+
+    #[test]
+    fn probe_methods_use_short_timeout() {
+        assert_eq!(
+            worker_call_timeout("health").as_secs(),
+            DEFAULT_PROBE_TIMEOUT_SECS,
+        );
+        assert_eq!(
+            worker_call_timeout("list_providers").as_secs(),
+            DEFAULT_PROBE_TIMEOUT_SECS,
+        );
+    }
+
+    #[test]
+    fn inference_methods_use_env_overridden_budget() {
+        // SAFETY: tests run serially in this crate and none of them rely on
+        // VOICELAYER_WORKER_TIMEOUT_SECONDS being unset; we restore it at the
+        // end so follow-up assertions see the default.
+        let previous = std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS").ok();
+        unsafe {
+            std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
+        }
+        assert_eq!(
+            worker_call_timeout("transcribe").as_secs(),
+            DEFAULT_INFERENCE_TIMEOUT_SECS,
+        );
+        unsafe {
+            std::env::set_var("VOICELAYER_WORKER_TIMEOUT_SECONDS", "42");
+        }
+        assert_eq!(worker_call_timeout("transcribe").as_secs(), 42);
+        assert_eq!(worker_call_timeout("compose").as_secs(), 42);
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("VOICELAYER_WORKER_TIMEOUT_SECONDS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
+            },
+        }
+    }
 
     #[tokio::test]
     async fn worker_command_can_call_health() {
