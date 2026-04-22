@@ -267,8 +267,7 @@ pub(crate) async fn run_foreground_ptt(
                 } else if let Some(session_id) = active_session.take() {
                     ui.status_label = "Transcribing".to_owned();
                     ui.push_event(format!(
-                        "Stopping session {} via key press toggle.",
-                        session_id
+                        "Stopping session {session_id} via key press toggle.",
                     ));
                     render_foreground_ptt_ui(&ui)?;
                     let result: DictationCaptureResult = uds_post_json(
@@ -291,7 +290,7 @@ pub(crate) async fn run_foreground_ptt(
             KeyEventKind::Release => {
                 if let Some(session_id) = active_session.take() {
                     ui.status_label = "Transcribing".to_owned();
-                    ui.push_event(format!("Stopping session {} via key release.", session_id));
+                    ui.push_event(format!("Stopping session {session_id} via key release."));
                     render_foreground_ptt_ui(&ui)?;
                     let result: DictationCaptureResult = uds_post_json(
                         &cli_socket_path(),
@@ -434,18 +433,18 @@ fn apply_dictation_result_to_ui(
             if matches!(ui.default_stop_action, StopAction::Inject) {
                 match paste_into_kitty_target(r#match, &result.transcription.text) {
                     Ok(()) => {
-                        ui.last_injection_status = Some(format!(
-                            "{} Sent to Kitty target {}.",
-                            ui.last_injection_status
-                                .clone()
-                                .unwrap_or_else(|| "Done.".to_owned()),
-                            r#match
-                        ))
+                        let prefix = ui
+                            .last_injection_status
+                            .clone()
+                            .unwrap_or_else(|| "Done.".to_owned());
+                        let selector = r#match;
+                        ui.last_injection_status =
+                            Some(format!("{prefix} Sent to Kitty target {selector}."))
                     }
                     Err(error) => {
+                        let selector = r#match;
                         ui.last_error = Some(format!(
-                            "[injection-failed] Kitty target {}: {error}",
-                            r#match
+                            "[injection-failed] Kitty target {selector}: {error}"
                         ))
                     }
                 }
@@ -557,8 +556,8 @@ fn describe_foreground_target(
             .map(|pane| format!("tmux pane {pane}"))
             .unwrap_or_else(|| "tmux disabled or no target pane".to_owned()),
         ForegroundInjectionTarget::Wezterm { pane_id } => format!("wezterm pane {pane_id}"),
-        ForegroundInjectionTarget::Kitty { r#match } => {
-            format!("kitty target {match}", match = r#match)
+        ForegroundInjectionTarget::Kitty { r#match: selector } => {
+            format!("kitty target {selector}")
         }
         ForegroundInjectionTarget::None => "stdout panel only".to_owned(),
     }
