@@ -94,15 +94,21 @@ def transcribe_with_whisper_cli(
         )
 
     text = transcript_file.read_text(encoding="utf-8").strip()
+    if text == "[BLANK_AUDIO]":
+        # whisper.cpp emits this token for silence-only input. Keep the text
+        # empty rather than raising so callers can decide whether silence is
+        # an error — this matches the whisper-server path.
+        text = ""
+    notes = [
+        f"Transcribed by `{config.binary}` using model `{config.model_path}`.",
+        "Input audio must be supported by whisper.cpp CLI; "
+        "the official example supports flac, mp3, ogg, and wav.",
+    ]
     if not text:
-        raise ProviderInvocationError("whisper.cpp produced an empty transcript.")
+        notes.append("whisper.cpp returned no speech for this audio.")
 
     return {
         "text": text,
         "detected_language": None if language == "auto" else language,
-        "notes": [
-            f"Transcribed by `{config.binary}` using model `{config.model_path}`.",
-            "Input audio must be supported by whisper.cpp CLI; "
-            "the official example supports flac, mp3, ogg, and wav.",
-        ],
+        "notes": notes,
     }

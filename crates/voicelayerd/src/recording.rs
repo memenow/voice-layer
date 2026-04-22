@@ -1,6 +1,5 @@
 use std::{
     fs,
-    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::Command as StdCommand,
     time::Duration,
@@ -184,21 +183,39 @@ pub async fn stop_recording_process(
         RecorderBackend::Auto => "-TERM",
     };
 
-    let status = StdCommand::new("kill")
+    let output = StdCommand::new("kill")
         .arg(signal)
         .arg(pid.to_string())
-        .status()?;
-    if !status.success() {
-        return Err(RecordingError::InterruptFailed(status.to_string()));
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if stderr.is_empty() {
+            output.status.to_string()
+        } else {
+            format!("{} ({stderr})", output.status)
+        };
+        tracing::error!(
+            pid = pid,
+            signal = signal,
+            exit = ?output.status.code(),
+            stderr = %stderr,
+            "kill failed while stopping recorder",
+        );
+        return Err(RecordingError::InterruptFailed(detail));
     }
 
+    // After `kill -INT` succeeds the child has one of three outcomes:
+    //   - terminated via SIGINT (status.signal() == Some(2))
+    //   - cleaned up during its signal handler and exited with status 0 or
+    //     a non-zero code (pw-record returns 1 here, which is its normal
+    //     shutdown path)
+    //   - ignored SIGINT and kept running, in which case we fall through
+    //     to the 5s timeout branch below and SIGKILL it
+    // So the exit status alone does not tell us whether the recording is
+    // usable. Instead we verify the WAV file landed on disk with content.
     let wait_result = timeout(Duration::from_secs(5), recording.child.wait()).await;
     match wait_result {
-        Ok(Ok(status)) => {
-            if !(status.success() || status.signal() == Some(2)) {
-                return Err(RecordingError::InterruptFailed(status.to_string()));
-            }
-        }
+        Ok(Ok(_status)) => {}
         Ok(Err(error)) => return Err(RecordingError::Io(error)),
         Err(_) => {
             recording.child.start_kill()?;
@@ -207,13 +224,12 @@ pub async fn stop_recording_process(
         }
     }
 
-    if !recording.audio_file.is_file() {
-        return Err(RecordingError::MissingOutput(
+    match fs::metadata(&recording.audio_file) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Ok(recording.audio_file),
+        _ => Err(RecordingError::MissingOutput(
             recording.audio_file.display().to_string(),
-        ));
+        )),
     }
-
-    Ok(recording.audio_file)
 }
 
 pub fn maybe_cleanup_audio_file(audio_file: &Path, keep_audio: bool) -> Option<String> {

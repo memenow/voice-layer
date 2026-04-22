@@ -713,12 +713,33 @@ fn save_transcript_to_target_dir(
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let base_dir = match save_dir {
         Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir()?,
+        None => default_save_dir(),
     };
     std::fs::create_dir_all(&base_dir)?;
     let path = unique_transcript_path(&base_dir, timestamp);
     std::fs::write(&path, text)?;
     Ok(path)
+}
+
+fn default_save_dir() -> PathBuf {
+    // Respect $XDG_STATE_HOME, then fall back to the spec default
+    // ($HOME/.local/state). Writing to the caller's cwd pollutes git
+    // checkouts, and transcripts are long-lived state (not cache or
+    // config), so `state` is the right bucket.
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        let path = PathBuf::from(state);
+        if path.is_absolute() {
+            return path.join("voicelayer").join("transcripts");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("voicelayer")
+            .join("transcripts");
+    }
+    std::env::temp_dir().join("voicelayer").join("transcripts")
 }
 
 fn unique_transcript_path(base_dir: &Path, timestamp: u64) -> PathBuf {
@@ -751,8 +772,14 @@ fn copy_result_to_clipboard(ui: &mut ForegroundPttUiState, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::unique_transcript_path;
+    use super::{default_save_dir, unique_transcript_path};
     use std::fs;
+    use std::sync::Mutex;
+
+    // The default_save_dir tests mutate XDG_STATE_HOME / HOME, so they
+    // must serialize. Rust's test harness parallelizes by default, and a
+    // sibling test clobbering the same variable would cause flakes.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn unique_transcript_path_is_primary_when_unused() {
@@ -784,6 +811,55 @@ mod tests {
         assert_eq!(
             path.file_name().and_then(|s| s.to_str()),
             Some("voicelayer-transcript-1700000000-2.txt")
+        );
+    }
+
+    #[test]
+    fn default_save_dir_honors_xdg_state_home() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let prior = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: serialized via ENV_LOCK within this test module; only
+        // other tests that also take that lock can race. The Rust 2024
+        // unsafe contract for env mutation is that the program is
+        // single-threaded at the call site, which ENV_LOCK enforces for
+        // every test that touches XDG_STATE_HOME.
+        unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/vl-xdg-state-probe") };
+        let dir = default_save_dir();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/tmp/vl-xdg-state-probe/voicelayer/transcripts"),
+        );
+    }
+
+    #[test]
+    fn default_save_dir_falls_back_to_home_state_spec() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        let prior_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::set_var("HOME", "/tmp/vl-home-probe");
+        }
+        let dir = default_save_dir();
+        unsafe {
+            match prior_xdg {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/tmp/vl-home-probe/.local/state/voicelayer/transcripts"),
         );
     }
 }
