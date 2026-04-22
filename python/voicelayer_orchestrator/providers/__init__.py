@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -17,6 +18,55 @@ from voicelayer_orchestrator.config import (
 
 class ProviderInvocationError(RuntimeError):
     """Raised when the configured provider cannot satisfy a request."""
+
+
+# Whisper emits "decorative" annotations for non-speech audio: music,
+# ambient noise, speaker changes, foreign language, inaudible passages,
+# stage directions, and the `[BLANK_AUDIO]` silence token. These are
+# descriptors of what the model heard rather than what was said. When
+# such an annotation is the entire transcript, callers want empty text
+# so default stop actions (copy / save / inject) don't publish garbage
+# into the target pane.
+#
+# Whisper's convention is that square brackets and parentheses are
+# reserved for annotations — real speech is never emitted that way. We
+# therefore collapse on *structure* (the whole line is a single
+# `[...]` or `(...)` block) rather than on a fixed allowlist. The
+# allowlist approach kept missing novel annotations like
+# `(dramatic music)` or `(phone rings)` the model invented from
+# training context, so the filter now treats any standalone bracket /
+# paren block as decorative.
+#
+# Mixed content — a line with both annotation and speech, or a block
+# with some substance and some annotations — is preserved verbatim so
+# we never silently drop real words. Future refinement could prune
+# annotation-only lines from multi-line transcripts, but pinning that
+# behavior under test is out of scope here.
+_ANNOTATION_RE = re.compile(r"^\s*[\[\(][^\[\]\(\)]+[\]\)]\s*$")
+
+
+def _is_decorative_annotation(line: str) -> bool:
+    return _ANNOTATION_RE.fullmatch(line) is not None
+
+
+def collapse_nonspeech_transcript(text: str) -> str:
+    """Return an empty string if ``text`` is entirely whisper decorative
+    annotations; otherwise return ``text`` unchanged.
+
+    Handles both single-line cases (`(speaks in foreign language)`,
+    `(dramatic music)`, `[BLANK_AUDIO]`) and multi-line blocks where
+    every non-empty line is itself an annotation. Mixed transcripts —
+    any line containing real speech — are preserved verbatim to avoid
+    silently dropping substance.
+    """
+
+    stripped_lines = [line.strip() for line in text.splitlines()]
+    candidate_lines = [line for line in stripped_lines if line]
+    if not candidate_lines:
+        return ""
+    if all(_is_decorative_annotation(line) for line in candidate_lines):
+        return ""
+    return text
 
 
 def provider_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
