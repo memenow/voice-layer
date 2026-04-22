@@ -21,9 +21,29 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v5
 
+      - name: Install system dependencies for vl-desktop (iced + ashpd)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libwayland-cursor0 \
+            libwayland-egl1 \
+            libdbus-1-dev \
+            libgl1-mesa-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.86"
           components: rustfmt, clippy
 
       - name: Cache cargo registry and target
