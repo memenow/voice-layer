@@ -249,6 +249,19 @@ struct DoctorReport {
     xdg_runtime_dir: Option<String>,
 }
 
+fn env_is_set(key: &str) -> bool {
+    std::env::var_os(key)
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+}
+
+fn env_is_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
 fn detect_whisper_mode() -> &'static str {
     let server_configured = [
         "VOICELAYER_WHISPER_SERVER_HOST",
@@ -256,25 +269,13 @@ fn detect_whisper_mode() -> &'static str {
         "VOICELAYER_WHISPER_SERVER_BIN",
     ]
     .iter()
-    .any(|key| {
-        std::env::var_os(key)
-            .map(|value| !value.is_empty())
-            .unwrap_or(false)
-    }) || matches!(
-        std::env::var("VOICELAYER_WHISPER_SERVER_AUTO_START")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(ref value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
-    );
+    .any(|key| env_is_set(key))
+        || env_is_truthy("VOICELAYER_WHISPER_SERVER_AUTO_START");
 
     if server_configured {
         return "server";
     }
-
-    let cli_configured = std::env::var_os("VOICELAYER_WHISPER_MODEL_PATH")
-        .map(|value| !value.is_empty())
-        .unwrap_or(false);
-    if cli_configured {
+    if env_is_set("VOICELAYER_WHISPER_MODEL_PATH") {
         "cli"
     } else {
         "unconfigured"
@@ -288,11 +289,32 @@ fn provider_state_dir() -> PathBuf {
     base.join("voicelayer").join("providers")
 }
 
-fn is_pid_alive(pid: i32) -> bool {
+fn pid_matches_command(pid: i32, expected_executable: &str) -> bool {
     if pid <= 0 {
         return false;
     }
-    Path::new(&format!("/proc/{pid}")).exists()
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    // `/proc/<pid>/cmdline` is NUL-separated argv. Reading it also serves
+    // as the liveness probe: the file disappears when the process exits.
+    let Ok(bytes) = fs::read(&cmdline_path) else {
+        return false;
+    };
+    let argv0 = bytes.split(|b| *b == 0).next().unwrap_or(&[]);
+    let Ok(argv0) = std::str::from_utf8(argv0) else {
+        return false;
+    };
+    // `expected_executable` may be an absolute path ("/usr/bin/llama-server")
+    // or a bare name ("llama-server"). Match by file name so `$PATH`
+    // resolution and explicit paths both work.
+    let expected_name = Path::new(expected_executable)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(expected_executable);
+    let argv0_name = Path::new(argv0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(argv0);
+    argv0_name == expected_name
 }
 
 fn llama_autostart_active() -> bool {
@@ -319,7 +341,14 @@ fn llama_autostart_active() -> bool {
         let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) else {
             continue;
         };
-        if is_pid_alive(pid as i32) {
+        // Cross-check argv[0] against the command recorded at launch so a
+        // recycled PID can't falsely report "autostart active".
+        let expected = value
+            .get("command")
+            .and_then(|c| c.get(0))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("llama-server");
+        if pid_matches_command(pid as i32, expected) {
             return true;
         }
     }
