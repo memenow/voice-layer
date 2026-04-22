@@ -550,7 +550,13 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         true,
                         DaemonHealthSource::Daemon,
                         worker.status,
-                        None,
+                        // The daemon writes the underlying `worker_command.health()`
+                        // failure into `worker.message` when it marks the worker
+                        // "unavailable". Forward it so `vl doctor` surfaces the
+                        // actionable reason (Python import error, missing uv,
+                        // crashed subprocess, ...) instead of reporting an
+                        // unavailable worker with no explanation.
+                        worker.message,
                         worker.asr_configured,
                         worker.asr_binary,
                         worker.asr_model_path,
