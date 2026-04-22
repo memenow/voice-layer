@@ -130,8 +130,10 @@ def autostart_whisper_server(
         return False, str(exc)
 
     lock_fd: int | None = None
+    acquired = False
     try:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        acquired = True
         with os.fdopen(lock_fd, "w", encoding="utf-8") as lock_file:
             lock_fd = None
             lock_file.write(str(os.getpid()))
@@ -160,14 +162,19 @@ def autostart_whisper_server(
         )
         return _wait_for_whisper_server(config)
     except FileExistsError:
+        # Another process owns the lock and is either launching or has
+        # launched the server. Wait for its endpoint without touching the
+        # lock file -- removing it would let a third caller racing with us
+        # re-enter the launch path and spawn a duplicate server.
         return _wait_for_whisper_server(config)
     except FileNotFoundError as exc:
         return False, f"Unable to find `{config.server_bin}`: {exc}"
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
-        with contextlib.suppress(FileNotFoundError):
-            lock_path.unlink()
+        if acquired:
+            with contextlib.suppress(FileNotFoundError):
+                lock_path.unlink()
 
 
 def _wait_for_whisper_server(config: WhisperServerConfig) -> tuple[bool, str | None]:

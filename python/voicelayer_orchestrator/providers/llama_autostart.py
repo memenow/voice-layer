@@ -124,8 +124,10 @@ def autostart_llama_server(
         return False, str(exc)
 
     lock_fd: int | None = None
+    acquired = False
     try:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        acquired = True
         with os.fdopen(lock_fd, "w", encoding="utf-8") as lock_file:
             lock_fd = None
             lock_file.write(str(os.getpid()))
@@ -158,6 +160,10 @@ def autostart_llama_server(
             poll_interval_seconds=launch.poll_interval_seconds,
         )
     except FileExistsError:
+        # Another process owns the lock and is either launching or has
+        # launched the server. Wait for its endpoint without touching the
+        # lock file -- removing it would let a third caller racing with us
+        # re-enter the launch path and spawn a duplicate server.
         return wait_for_llm_endpoint(
             config,
             timeout_seconds=launch.launch_timeout_seconds,
@@ -168,8 +174,9 @@ def autostart_llama_server(
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
-        with contextlib.suppress(FileNotFoundError):
-            lock_path.unlink()
+        if acquired:
+            with contextlib.suppress(FileNotFoundError):
+                lock_path.unlink()
 
 
 def ensure_llm_endpoint(
