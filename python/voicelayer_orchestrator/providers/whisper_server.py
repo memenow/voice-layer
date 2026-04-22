@@ -220,6 +220,24 @@ def ensure_whisper_server(
     return autostart_whisper_server(config, environ)
 
 
+def validate_autostart_prerequisites(
+    config: WhisperServerConfig,
+) -> tuple[bool, str | None]:
+    """Return (ok, error) for whether autostart can spawn a whisper-server.
+
+    Mirrors :func:`_build_whisper_server_command` so callers like the health
+    handler can preempt false-positive ``asr_configured`` reports when
+    ``VOICELAYER_WHISPER_SERVER_AUTO_START=1`` is set without the binary and
+    model path that ``transcribe`` would need on first call.
+    """
+
+    try:
+        _build_whisper_server_command(config)
+    except ProviderInvocationError as exc:
+        return False, str(exc)
+    return True, None
+
+
 def _encode_multipart(
     file_path: str,
     file_bytes: bytes,

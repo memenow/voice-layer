@@ -33,6 +33,7 @@ from voicelayer_orchestrator.providers.whisper_server import (
     ensure_whisper_server,
     probe_whisper_server,
     transcribe_with_whisper_server,
+    validate_autostart_prerequisites,
 )
 
 PROVIDER_UNAVAILABLE_CODE = -32004
@@ -127,10 +128,16 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 asr_configured = True
                 asr_error = None
             elif whisper_server_config.auto_start:
-                # Autostart will launch on first transcribe; treat as
-                # configured for now, report why we didn't probe-connect.
-                asr_configured = True
-                asr_error = None
+                # Autostart is requested but transcribe would immediately
+                # fail if the launcher prereqs (server binary, model) are
+                # missing — keep ASR marked unhealthy in that case so
+                # `/health` and `vl doctor` don't report a false positive.
+                prereq_ok, prereq_error = validate_autostart_prerequisites(whisper_server_config)
+                if prereq_ok:
+                    asr_configured = True
+                    asr_error = None
+                else:
+                    asr_error = prereq_error
             else:
                 asr_error = probe_error or "whisper-server is not reachable"
 
