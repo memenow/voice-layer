@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use iced::futures::SinkExt;
 use iced::futures::channel::mpsc as futures_mpsc;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
@@ -370,14 +373,38 @@ async fn stop_session_request(
     .map_err(|error| Arc::new(error.to_string()))
 }
 
+fn resolve_vl_binary() -> PathBuf {
+    // Prefer an explicit override for development setups, then the install.sh
+    // target, then $PATH. Falling back to the bare name lets `Command::spawn`
+    // surface the usual "program not found" error with a clear hint.
+    if let Some(explicit) = std::env::var_os("VOICELAYER_VL_BIN") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".local/bin/vl");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("vl")
+}
+
 async fn spawn_daemon() -> Result<(), SharedError> {
-    let result = Command::new("vl")
+    let binary = resolve_vl_binary();
+    let mut command = Command::new(&binary);
+    command
         .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match result {
+        .stderr(Stdio::null());
+    // Detach from the GUI's process group so closing the desktop shell does
+    // not SIGHUP the daemon. `process_group(0)` makes the child the leader
+    // of a new group; on non-Unix platforms this degrades to the default
+    // attached behavior.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    match command.spawn() {
         Ok(_) => {
             // Give the daemon a moment to open its socket before the caller
             // re-probes health; without this the probe often loses the race.
@@ -385,7 +412,9 @@ async fn spawn_daemon() -> Result<(), SharedError> {
             Ok(())
         }
         Err(error) => Err(Arc::new(format!(
-            "could not execute `vl daemon run`: {error}. Is `vl` on your PATH?",
+            "could not execute `{}`: {error}. Set VOICELAYER_VL_BIN or add \
+             ~/.local/bin to PATH.",
+            binary.display(),
         ))),
     }
 }
