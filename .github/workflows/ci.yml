@@ -22,9 +22,33 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install system dependencies for vl-desktop and the recorder probe
+        # The Azure apt mirror on hosted runners occasionally stalls on
+        # `Ign:` responses and drags `apt-get update` past the job
+        # timeout (observed 2026-04-22, run 24774249846). Cap per-request
+        # HTTP(S) timeouts and wrap update + install in a bounded retry
+        # so a dead mirror fails fast and we get a second chance to pick
+        # up a healthy one.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          set -euo pipefail
+          apt_opts=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          run_with_retry() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@"; then
+                return 0
+              fi
+              echo "::warning::apt command failed on attempt ${attempt}: $*" >&2
+              sleep $((attempt * 15))
+            done
+            echo "::error::apt command failed after 3 attempts: $*" >&2
+            return 1
+          }
+          run_with_retry sudo apt-get "${apt_opts[@]}" update
+          run_with_retry sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends \
             pkg-config \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
