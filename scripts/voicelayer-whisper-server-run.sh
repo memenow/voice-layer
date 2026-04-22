@@ -34,9 +34,12 @@
 #
 #   See docs/guides/systemd.md for the full docker recipe.
 #
-# VOICELAYER_WHISPER_SERVER_ARGS is split on whitespace with default
-# bash IFS; embedded-space arguments are not supported here. Operators
-# needing complex flags should edit ExecStart directly.
+# VOICELAYER_WHISPER_SERVER_ARGS is tokenised through Python's
+# shlex.split (via python3) so quoting rules match the Python autostart
+# path. Bash word-splitting would break `--prompt "hello world"` (into
+# three tokens) and would expand globs like `-f *.txt` against the
+# working directory; shlex.split does neither, matching the Python
+# helper exactly. The regression test pins the two sides together.
 
 set -euo pipefail
 
@@ -48,8 +51,24 @@ port="${VOICELAYER_WHISPER_SERVER_PORT:-8188}"
 
 extra_args=()
 if [[ -n "${VOICELAYER_WHISPER_SERVER_ARGS:-}" ]]; then
-  # shellcheck disable=SC2206  # intentional word-splitting
-  extra_args=(${VOICELAYER_WHISPER_SERVER_ARGS})
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 is required to parse VOICELAYER_WHISPER_SERVER_ARGS" >&2
+    exit 1
+  fi
+  # Null-separated output preserves tokens containing whitespace or
+  # newlines, matching shlex.split's guarantees.
+  while IFS= read -r -d '' token; do
+    extra_args+=("${token}")
+  done < <(
+    python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ.get("VOICELAYER_WHISPER_SERVER_ARGS", "")):
+    sys.stdout.write(token + "\0")
+PY
+  )
 fi
 
 exec "${VOICELAYER_WHISPER_SERVER_BIN}" \

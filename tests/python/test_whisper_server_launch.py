@@ -126,6 +126,42 @@ class WrapperPythonParityTest(unittest.TestCase):
         python_argv = _build_whisper_server_command(config)
         self.assertEqual(wrapper_argv, python_argv[1:])
 
+    def test_wrapper_argv_preserves_quoted_args_with_spaces(self) -> None:
+        # Bash's default word-splitting would shatter this into three
+        # tokens; the wrapper must go through shlex so the quoted
+        # phrase survives as a single argument — same as the Python
+        # autostart path.
+        env, config = self._fake_env(extra_args='--prompt "hello world"')
+        wrapper_argv = _wrapper_argv(env)
+        python_argv = _build_whisper_server_command(config)
+        self.assertEqual(wrapper_argv, python_argv[1:])
+        self.assertIn("hello world", wrapper_argv)
+
+    def test_wrapper_argv_does_not_glob_expand_extra_args(self) -> None:
+        # Create files in the wrapper's cwd that would match `*.txt` if
+        # bash's pathname expansion kicked in. shlex.split does no
+        # globbing, so both sides must deliver the literal glob token.
+        work_dir = self.tmp_dir / "glob-cwd"
+        work_dir.mkdir()
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (work_dir / name).touch()
+        env, config = self._fake_env(extra_args="-f *.txt")
+        env["PWD"] = str(work_dir)
+
+        merged = {**os.environ, **env}
+        result = subprocess.run(
+            [str(WRAPPER)],
+            env=merged,
+            cwd=str(work_dir),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        wrapper_argv = [line for line in result.stdout.splitlines() if line]
+        python_argv = _build_whisper_server_command(config)
+        self.assertEqual(wrapper_argv, python_argv[1:])
+        self.assertIn("*.txt", wrapper_argv)
+
     def test_wrapper_fails_clearly_without_server_bin(self) -> None:
         env = {
             "VOICELAYER_WHISPER_MODEL_PATH": "/tmp/ggml-base.en.bin",
