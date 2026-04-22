@@ -42,7 +42,13 @@ the unit.
 - `VOICELAYER_PROJECT_ROOT` — repository root the daemon uses to locate the
   Python worker (`python/voicelayer_orchestrator`).
 - `VOICELAYER_SOCKET_PATH` — optional override for the daemon socket path.
-  Defaults to `$XDG_RUNTIME_DIR/voicelayer/daemon.sock`.
+  Defaults to `$XDG_RUNTIME_DIR/voicelayer/daemon.sock`. The shipped unit
+  hardcodes `--socket-path %t/voicelayer/daemon.sock`, so this env var is
+  only consulted when the daemon is launched outside systemd.
+- `VOICELAYER_WORKER_TIMEOUT_SECONDS` — per-call upper bound on worker
+  JSON-RPC inference calls (`transcribe`, `compose`, `rewrite`,
+  `translate`). Probes (`health`, `list_providers`) use a fixed 15s
+  budget. Defaults to 600.
 
 ### whisper.cpp (ASR)
 
