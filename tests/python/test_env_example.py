@@ -24,6 +24,10 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 PYTHON_ROOT = PROJECT_ROOT / "python" / "voicelayer_orchestrator"
 ENV_EXAMPLE = PROJECT_ROOT / "systemd" / "voicelayerd.env.example"
 
+# The regex matches only static string literals. Dynamic lookups like
+# `source.get(f"VOICELAYER_{suffix}")` would escape this scan; the
+# codebase has no such lookups today and adding one should be rare
+# enough that hand-maintenance is fine.
 ENV_VAR_PATTERN = re.compile(r"VOICELAYER_[A-Z][A-Z0-9_]*")
 
 
@@ -31,7 +35,7 @@ def _extract_env_var_names(text: str) -> set[str]:
     return set(ENV_VAR_PATTERN.findall(text))
 
 
-def _iter_python_sources() -> list[pathlib.Path]:
+def _list_python_sources() -> list[pathlib.Path]:
     return sorted(PYTHON_ROOT.rglob("*.py"))
 
 
@@ -44,7 +48,7 @@ class EnvExampleCoverageTest(unittest.TestCase):
 
     def test_every_python_env_var_is_declared_in_env_example(self) -> None:
         python_vars: set[str] = set()
-        for source in _iter_python_sources():
+        for source in _list_python_sources():
             python_vars.update(_extract_env_var_names(source.read_text(encoding="utf-8")))
 
         env_vars = _extract_env_var_names(ENV_EXAMPLE.read_text(encoding="utf-8"))
