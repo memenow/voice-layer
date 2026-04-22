@@ -30,7 +30,13 @@ def provider_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
 
 
 def _read_pid_from_lock(lock_path: Path) -> int | None:
-    """Read the PID written by the lock owner. Returns None when unreadable."""
+    """Read the PID written by the lock owner.
+
+    Returns ``None`` when the file is missing, unreadable, partially
+    written (empty), non-integer, or contains a non-positive value. The
+    latter is treated as "unknown" so a malformed file never routes into
+    the liveness probe against ``/proc/0`` or negative PIDs.
+    """
 
     try:
         raw = lock_path.read_text(encoding="utf-8").strip()
@@ -39,9 +45,10 @@ def _read_pid_from_lock(lock_path: Path) -> int | None:
     if not raw:
         return None
     try:
-        return int(raw)
+        pid = int(raw)
     except ValueError:
         return None
+    return pid if pid > 0 else None
 
 
 def _pid_runs_binary(pid: int, expected_binary: str) -> bool:
@@ -51,6 +58,12 @@ def _pid_runs_binary(pid: int, expected_binary: str) -> bool:
     basename of argv[0] to the basename of ``expected_binary`` so both
     absolute paths and bare names resolve correctly. Returns False on any
     failure (process gone, non-Linux platform, binary mismatch).
+
+    TODO(portable): on non-Linux targets ``/proc`` is absent and this
+    function always returns False, so :func:`reclaim_stale_lock` would
+    evict every lock regardless of owner liveness. When VoiceLayer grows
+    a macOS or BSD target, derive the cmdline check from ``ps``,
+    ``sysctl``, or ``psutil`` instead.
     """
 
     if pid <= 0:
