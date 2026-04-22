@@ -1,0 +1,8 @@
+[toolchain]
+# Keep in sync with `rust-version` in the workspace Cargo.toml and with the
+# `toolchain:` pin in .github/workflows/ci.yml. iced 0.14 and ashpd 0.13
+# together require >= 1.88, so both local `cargo` and CI should use the
+# same floor.
+channel = "1.88"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
