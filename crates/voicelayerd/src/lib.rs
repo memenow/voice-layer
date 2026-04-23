@@ -980,19 +980,7 @@ async fn run_segmented_dictation_session(
     }
 
     segments.sort_by_key(|segment| segment.id);
-    // Preserve whisper's native leading whitespace on Latin transcripts
-    // (it already separates words) and concatenate CJK transcripts
-    // without adding artificial spaces. A final `trim` strips any
-    // outer whitespace whisper may have emitted at the edges.
-    let combined_text: String = segments
-        .iter()
-        .filter_map(|segment| segment.transcript.as_deref())
-        .filter(|chunk| !chunk.is_empty())
-        .collect();
-    let combined_text = combined_text.trim().to_owned();
-    let detected_language = segments
-        .iter()
-        .find_map(|segment| segment.detected_language.clone());
+    let (combined_text, detected_language) = stitch_segment_transcripts(&segments);
 
     // When `keep_audio` is set the operator usually wants the whole
     // segment set, not just the first file. Return the directory path so
@@ -1008,21 +996,7 @@ async fn run_segmented_dictation_session(
     };
 
     let (final_state, failure_kind, failure_detail) =
-        if let Some(detail) = recording_failure.clone() {
-            (
-                SessionState::Failed,
-                Some(DictationFailureKind::RecordingFailed),
-                Some(detail),
-            )
-        } else if let Some(detail) = transcription_failure.clone() {
-            (
-                SessionState::Failed,
-                Some(DictationFailureKind::AsrFailed),
-                Some(detail),
-            )
-        } else {
-            (SessionState::Completed, None, None)
-        };
+        classify_segmented_outcome(recording_failure, transcription_failure);
     session = transition_session_state(session, final_state);
     update_session_map(&sessions, session.clone()).await;
 
@@ -1076,6 +1050,52 @@ fn emit_segment_recorded(
         Some(session_id),
         format!("Segment {segment_id} recorded at {}.", path.display()),
     ));
+}
+
+/// Concatenate every non-empty segment transcript and pick the first detected
+/// language. Whisper emits a leading space on Latin transcripts (which
+/// naturally joins adjacent words) and no surrounding whitespace on CJK, so a
+/// raw `collect::<String>()` handles both scripts; the final `trim` drops any
+/// leading/trailing whitespace whisper left on the first or last segment.
+///
+/// The caller is expected to sort `segments` by `id` before calling this;
+/// this helper only reads order, never reorders.
+fn stitch_segment_transcripts(segments: &[SegmentRecord]) -> (String, Option<String>) {
+    let combined_text: String = segments
+        .iter()
+        .filter_map(|segment| segment.transcript.as_deref())
+        .filter(|chunk| !chunk.is_empty())
+        .collect();
+    let detected_language = segments
+        .iter()
+        .find_map(|segment| segment.detected_language.clone());
+    (combined_text.trim().to_owned(), detected_language)
+}
+
+/// Map the two independent failure channels onto the final session state,
+/// failure kind, and user-facing detail string. Recording errors dominate
+/// transcription errors: when the recorder subprocess fails, every segment's
+/// ASR attempt will also fail for reasons downstream of the original fault,
+/// and surfacing `RecordingFailed` to the operator points at the root cause.
+fn classify_segmented_outcome(
+    recording_failure: Option<String>,
+    transcription_failure: Option<String>,
+) -> (SessionState, Option<DictationFailureKind>, Option<String>) {
+    if let Some(detail) = recording_failure {
+        (
+            SessionState::Failed,
+            Some(DictationFailureKind::RecordingFailed),
+            Some(detail),
+        )
+    } else if let Some(detail) = transcription_failure {
+        (
+            SessionState::Failed,
+            Some(DictationFailureKind::AsrFailed),
+            Some(detail),
+        )
+    } else {
+        (SessionState::Completed, None, None)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,8 +1186,25 @@ fn preview_event_message(preview: &PreviewArtifact) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonConfig, default_project_root, default_socket_path};
+    use super::{
+        DaemonConfig, DictationFailureKind, SegmentRecord, SessionState,
+        classify_segmented_outcome, default_project_root, default_socket_path,
+        stitch_segment_transcripts,
+    };
     use std::path::PathBuf;
+
+    fn make_segment(
+        id: usize,
+        transcript: Option<&str>,
+        detected_language: Option<&str>,
+    ) -> SegmentRecord {
+        SegmentRecord {
+            id,
+            audio_path: PathBuf::from(format!("/tmp/segment-{id:05}.wav")),
+            transcript: transcript.map(str::to_owned),
+            detected_language: detected_language.map(str::to_owned),
+        }
+    }
 
     #[test]
     fn daemon_config_tracks_version() {
@@ -1179,5 +1216,121 @@ mod tests {
     fn default_paths_are_resolved() {
         assert!(!default_socket_path().as_os_str().is_empty());
         assert!(!default_project_root().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn stitch_segment_transcripts_on_empty_input_returns_empty_string_and_no_language() {
+        let (text, language) = stitch_segment_transcripts(&[]);
+        assert!(text.is_empty());
+        assert_eq!(language, None);
+    }
+
+    #[test]
+    fn stitch_segment_transcripts_trims_whispers_leading_space_on_latin_output() {
+        // whisper-cli emits a leading space on Latin transcripts; the stitcher
+        // should trim the overall string so the first segment doesn't start
+        // with whitespace but interior word spacing survives.
+        let segments = [
+            make_segment(0, Some(" Hello"), Some("en")),
+            make_segment(1, Some(" world"), None),
+        ];
+        let (text, language) = stitch_segment_transcripts(&segments);
+        assert_eq!(text, "Hello world");
+        assert_eq!(language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn stitch_segment_transcripts_concatenates_cjk_without_adding_spaces() {
+        // whisper-cli emits CJK transcripts without leading whitespace; a
+        // naive `.join(" ")` would corrupt them, so the stitcher must plain-
+        // concat.
+        let segments = [
+            make_segment(0, Some("你好"), Some("zh")),
+            make_segment(1, Some("世界"), None),
+        ];
+        let (text, language) = stitch_segment_transcripts(&segments);
+        assert_eq!(text, "你好世界");
+        assert_eq!(language.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn stitch_segment_transcripts_skips_none_and_empty_segments() {
+        let segments = [
+            make_segment(0, Some(" alpha"), None),
+            make_segment(1, None, None),
+            make_segment(2, Some(""), None),
+            make_segment(3, Some(" beta"), None),
+        ];
+        let (text, language) = stitch_segment_transcripts(&segments);
+        assert_eq!(text, "alpha beta");
+        assert_eq!(language, None);
+    }
+
+    #[test]
+    fn stitch_segment_transcripts_respects_caller_supplied_order() {
+        // The caller is expected to sort by segment id before invoking the
+        // stitcher. This test documents that invariant — pre-sorted input
+        // produces the expected order; the stitcher itself does not reorder.
+        let segments = [
+            make_segment(0, Some(" first"), None),
+            make_segment(1, Some(" second"), None),
+            make_segment(2, Some(" third"), None),
+        ];
+        let (text, _) = stitch_segment_transcripts(&segments);
+        assert_eq!(text, "first second third");
+    }
+
+    #[test]
+    fn stitch_segment_transcripts_picks_first_detected_language_it_finds() {
+        // Whisper may report different languages for consecutive segments if
+        // the speaker switches mid-session, but the aggregate result needs a
+        // single label. The first non-None wins.
+        let segments = [
+            make_segment(0, Some(" hola"), None),
+            make_segment(1, Some(" mundo"), Some("es")),
+            make_segment(2, Some(" amigo"), Some("en")),
+        ];
+        let (_, language) = stitch_segment_transcripts(&segments);
+        assert_eq!(language.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn classify_segmented_outcome_without_failures_yields_completed_state() {
+        let (state, kind, detail) = classify_segmented_outcome(None, None);
+        assert_eq!(state, SessionState::Completed);
+        assert_eq!(kind, None);
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn classify_segmented_outcome_maps_recording_failure_to_recording_failed() {
+        let (state, kind, detail) =
+            classify_segmented_outcome(Some("recorder exited".to_owned()), None);
+        assert_eq!(state, SessionState::Failed);
+        assert_eq!(kind, Some(DictationFailureKind::RecordingFailed));
+        assert_eq!(detail.as_deref(), Some("recorder exited"));
+    }
+
+    #[test]
+    fn classify_segmented_outcome_maps_transcription_failure_to_asr_failed() {
+        let (state, kind, detail) =
+            classify_segmented_outcome(None, Some("worker RPC timed out".to_owned()));
+        assert_eq!(state, SessionState::Failed);
+        assert_eq!(kind, Some(DictationFailureKind::AsrFailed));
+        assert_eq!(detail.as_deref(), Some("worker RPC timed out"));
+    }
+
+    #[test]
+    fn classify_segmented_outcome_lets_recording_failure_dominate_transcription_failure() {
+        // A failed recorder usually causes every segment's ASR call to fail
+        // too; surfacing the ASR error would mislead the operator away from
+        // the root cause. Recording wins when both are Some.
+        let (state, kind, detail) = classify_segmented_outcome(
+            Some("pw-record crashed".to_owned()),
+            Some("no audio on disk".to_owned()),
+        );
+        assert_eq!(state, SessionState::Failed);
+        assert_eq!(kind, Some(DictationFailureKind::RecordingFailed));
+        assert_eq!(detail.as_deref(), Some("pw-record crashed"));
     }
 }
