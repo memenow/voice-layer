@@ -55,12 +55,15 @@ if [[ -n "${VOICELAYER_WHISPER_SERVER_ARGS:-}" ]]; then
     echo "error: python3 is required to parse VOICELAYER_WHISPER_SERVER_ARGS" >&2
     exit 1
   fi
-  # Null-separated output preserves tokens containing whitespace or
-  # newlines, matching shlex.split's guarantees.
-  while IFS= read -r -d '' token; do
-    extra_args+=("${token}")
-  done < <(
-    python3 - <<'PY'
+  # Tokenize through a tempfile so we can inspect python3's exit status
+  # before reading. Process substitution would swallow a failure from
+  # shlex.split (e.g., an unmatched quote in the env value) and let the
+  # wrapper exec whisper-server with empty extra_args — silent
+  # misconfiguration. Null-separated output still preserves tokens
+  # with whitespace or embedded newlines.
+  tokens_file=$(mktemp -t voicelayer-whisper-server-args.XXXXXX)
+  trap 'rm -f "${tokens_file}"' EXIT
+  if ! python3 - <<'PY' > "${tokens_file}"
 import os
 import shlex
 import sys
@@ -68,7 +71,17 @@ import sys
 for token in shlex.split(os.environ.get("VOICELAYER_WHISPER_SERVER_ARGS", "")):
     sys.stdout.write(token + "\0")
 PY
-  )
+  then
+    echo "error: failed to parse VOICELAYER_WHISPER_SERVER_ARGS (check quoting)" >&2
+    exit 1
+  fi
+  while IFS= read -r -d '' token; do
+    extra_args+=("${token}")
+  done < "${tokens_file}"
+  # Clean up manually before exec since EXIT traps do not fire across
+  # the process-image replacement.
+  rm -f "${tokens_file}"
+  trap - EXIT
 fi
 
 exec "${VOICELAYER_WHISPER_SERVER_BIN}" \

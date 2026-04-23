@@ -205,6 +205,43 @@ class WrapperPythonParityTest(unittest.TestCase):
         )
         self.assertIn("VOICELAYER_WHISPER_MODEL_PATH", result.stderr)
 
+    def test_wrapper_fails_on_invalid_extra_args_quoting(self) -> None:
+        # An unmatched quote makes shlex.split raise ValueError and
+        # python3 exit non-zero. The wrapper must surface that instead
+        # of silently exec'ing whisper-server with an empty argv tail.
+        # We build env directly instead of going through _fake_env /
+        # load_whisper_server_config because that loader also shlex-
+        # splits the value and would raise inside the test harness
+        # before the subprocess ever sees the bad input.
+        fake = _write_fake_server(self.tmp_dir)
+        env = {
+            "VOICELAYER_WHISPER_SERVER_BIN": str(fake),
+            "VOICELAYER_WHISPER_MODEL_PATH": "/tmp/ggml-base.en.bin",
+            "VOICELAYER_WHISPER_SERVER_ARGS": '--prompt "unterminated',
+        }
+        merged = {**os.environ, **env}
+        result = subprocess.run(
+            [str(WRAPPER)],
+            env=merged,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            (
+                "wrapper must fail fast when shlex.split rejects "
+                "VOICELAYER_WHISPER_SERVER_ARGS — silent fallback to an "
+                "empty argv would be a misconfiguration that reaches prod"
+            ),
+        )
+        self.assertIn(
+            "VOICELAYER_WHISPER_SERVER_ARGS",
+            result.stderr,
+            "error message should name the env var that failed to parse",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
