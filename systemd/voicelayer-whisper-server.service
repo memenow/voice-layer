@@ -1,0 +1,17 @@
+[Unit]
+Description=VoiceLayer whisper-server (whisper.cpp HTTP inference)
+# The daemon can tolerate an absent whisper-server (it falls back to
+# whisper-cli), so this unit stays optional and starts independently.
+# If you rely on server-mode ASR you may add it to voicelayerd.service's
+# Wants= via a drop-in; the core unit does not require it.
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/voicelayer/voicelayerd.env
+ExecStart=%h/.local/bin/voicelayer-whisper-server-run.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

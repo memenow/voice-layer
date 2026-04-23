@@ -28,10 +28,18 @@ echo ">> Installing binaries to ${BIN_DIR}"
 install -d "${BIN_DIR}"
 install -m 0755 "${REPO_ROOT}/target/release/vl" "${BIN_DIR}/vl"
 install -m 0755 "${REPO_ROOT}/target/release/vl-desktop" "${BIN_DIR}/vl-desktop"
+install -m 0755 "${REPO_ROOT}/scripts/voicelayer-whisper-server-run.sh" \
+  "${BIN_DIR}/voicelayer-whisper-server-run.sh"
 
-echo ">> Installing user-level systemd unit to ${UNIT_DIR}"
+echo ">> Installing user-level systemd units to ${UNIT_DIR}"
 install -d "${UNIT_DIR}"
 install -m 0644 "${REPO_ROOT}/systemd/voicelayerd.service" "${UNIT_DIR}/voicelayerd.service"
+# voicelayer-whisper-server.service is installed but not enabled. Enable
+# it explicitly with `systemctl --user enable --now voicelayer-whisper-server`
+# when you want the daemon to reach whisper-server instead of spawning
+# whisper-cli per request. See docs/guides/systemd.md.
+install -m 0644 "${REPO_ROOT}/systemd/voicelayer-whisper-server.service" \
+  "${UNIT_DIR}/voicelayer-whisper-server.service"
 
 echo ">> Seeding environment file (existing file is preserved)"
 install -d "${ENV_DIR}"
@@ -45,13 +53,17 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
   echo ">> Reloading user-level systemd manager"
   systemctl --user daemon-reload || echo "   (daemon-reload failed; safe to ignore if systemd --user is unavailable)"
-  # If the unit was already running before the install, bounce it so the
-  # running daemon picks up the freshly copied binary. `try-restart` is a
-  # no-op when the unit isn't active, so this is safe on first install.
-  if systemctl --user is-active --quiet voicelayerd; then
-    echo ">> Restarting active voicelayerd.service to pick up new binary"
-    systemctl --user try-restart voicelayerd || echo "   (try-restart failed; run systemctl --user restart voicelayerd manually)"
-  fi
+  # If either unit was already running before the install, bounce it so
+  # the running process picks up the freshly copied binary or wrapper.
+  # `try-restart` is a no-op when the unit isn't active, so this is
+  # safe on first install.
+  for unit in voicelayerd voicelayer-whisper-server; do
+    if systemctl --user is-active --quiet "${unit}"; then
+      echo ">> Restarting active ${unit}.service to pick up new binary"
+      systemctl --user try-restart "${unit}" \
+        || echo "   (try-restart failed; run systemctl --user restart ${unit} manually)"
+    fi
+  done
 fi
 
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
@@ -69,6 +81,11 @@ Next steps:
   1. Edit ~/.config/voicelayer/voicelayerd.env to point at your models.
   2. Enable the daemon on login:
        systemctl --user enable --now voicelayerd
-  3. Launch the desktop shell:
+  3. (Optional) Run whisper-server as a persistent unit instead of
+     one-shot whisper-cli per capture:
+       systemctl --user enable --now voicelayer-whisper-server
+     See docs/guides/systemd.md for when to pick this over the
+     VOICELAYER_WHISPER_SERVER_AUTO_START path.
+  4. Launch the desktop shell:
        vl-desktop
 EOM
