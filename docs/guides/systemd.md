@@ -89,6 +89,12 @@ the unit.
   `VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS`,
   `VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS` — optional llama-server autostart.
 
+### Client-side only (vl-desktop)
+
+`VOICELAYER_VL_BIN` and `VOICELAYER_LOG` are read by `vl-desktop`, not
+the daemon, and are intentionally kept out of `voicelayerd.env`. See
+[desktop.md](./desktop.md) for details.
+
 ## Persistent whisper-server
 
 whisper.cpp's `whisper-server` keeps the ggml model mmapped across

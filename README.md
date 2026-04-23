@@ -111,6 +111,10 @@ See [docs/guides/local-llm-provider.md](/home/billduke/Documents/memenow/voice-l
 
 See [docs/guides/local-asr-provider.md](/home/billduke/Documents/memenow/voice-layer/docs/guides/local-asr-provider.md) for the `whisper.cpp` file transcription path and environment variables.
 
+### Launch the Desktop Shell
+
+See [docs/guides/desktop.md](/home/billduke/Documents/memenow/voice-layer/docs/guides/desktop.md) for `vl-desktop` usage and the two client-side environment variables (`VOICELAYER_VL_BIN`, `VOICELAYER_LOG`).
+
 ### Render a Bracketed Paste Payload
 
 ```bash
