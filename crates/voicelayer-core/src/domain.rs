@@ -538,8 +538,8 @@ mod tests {
             .lines()
             .skip_while(|line| *line != "      required:")
             .skip(1)
-            .take_while(|line| line.starts_with("        - "))
-            .map(|line| line.trim_start_matches("        - ").trim())
+            .map_while(|line| line.strip_prefix("        - "))
+            .map(str::trim)
             .collect();
 
         for (field, field_value) in object {
