@@ -518,5 +518,46 @@ mod tests {
                  Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
             );
         }
+
+        // Cross-check the `required` list: every non-Option Rust field must
+        // appear under required, and every Option field must not. `None`
+        // serialises as JSON `null`, so the serialized value's nullness
+        // identifies Rust-side optionality without any type reflection. If
+        // required shifts to inline form (`required: [a, b]`) the scan below
+        // breaks — the header assertion calls that out loudly.
+        let required_header = section
+            .lines()
+            .find(|line| line.trim_start().starts_with("required:"))
+            .expect("WorkerHealthSummary declares a required list");
+        assert_eq!(
+            required_header, "      required:",
+            "required list must stay in YAML block form so the scan can parse it \
+             (found {required_header:?})",
+        );
+        let required_set: std::collections::BTreeSet<&str> = section
+            .lines()
+            .skip_while(|line| *line != "      required:")
+            .skip(1)
+            .take_while(|line| line.starts_with("        - "))
+            .map(|line| line.trim_start_matches("        - ").trim())
+            .collect();
+
+        for (field, field_value) in object {
+            let is_option = field_value.is_null();
+            let listed = required_set.contains(field.as_str());
+            match (is_option, listed) {
+                (false, false) => panic!(
+                    "openapi WorkerHealthSummary required list is missing `{field}`; \
+                     the Rust field is non-Option so it always serialises — the schema \
+                     must list it under required."
+                ),
+                (true, true) => panic!(
+                    "openapi WorkerHealthSummary required list contains `{field}`, but \
+                     the Rust field is Option<_> and may legitimately be absent. Drop it \
+                     from required (or change the Rust side to a non-Option type)."
+                ),
+                _ => {}
+            }
+        }
     }
 }
