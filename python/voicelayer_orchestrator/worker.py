@@ -24,7 +24,7 @@ from voicelayer_orchestrator.providers.llm_openai_compatible import (
     build_rewrite_payload,
     build_translate_payload,
 )
-from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
+from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass, probe_audio_file
 from voicelayer_orchestrator.providers.whisper_cli import (
     transcribe_with_whisper_cli,
     validate_whisper_provider,
@@ -222,6 +222,40 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
         if extra_notes:
             result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
+        return make_result(identifier, result)
+
+    if method == "segment_probe":
+        vad_config = load_whisper_vad_config()
+        if vad_config is None:
+            return make_error(
+                identifier,
+                PROVIDER_UNAVAILABLE_CODE,
+                (
+                    "Silero-vad is not configured. Set "
+                    "VOICELAYER_WHISPER_VAD_ENABLED=true and "
+                    "VOICELAYER_WHISPER_VAD_MODEL_PATH to a silero-vad ONNX file."
+                ),
+                {"method": method},
+            )
+
+        audio_file = (params or {}).get("audio_file")
+        if not isinstance(audio_file, str) or not audio_file:
+            return make_error(
+                identifier,
+                INVALID_REQUEST_CODE,
+                "segment_probe requires params.audio_file (non-empty string).",
+                {"method": method},
+            )
+
+        try:
+            result = probe_audio_file(audio_file, vad_config)
+        except ProviderInvocationError as exc:
+            return make_error(
+                identifier,
+                PROVIDER_REQUEST_FAILED_CODE,
+                str(exc),
+                {"method": method},
+            )
         return make_result(identifier, result)
 
     if method in {"compose", "rewrite", "translate"}:
