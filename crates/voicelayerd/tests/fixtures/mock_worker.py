@@ -24,7 +24,11 @@ Config schema::
     {
       "transcribe_map": {"<stem>": "<text>"},
       "fail_stems": ["<stem>", ...],
-      "default_transcribe_text": "<text>"
+      "default_transcribe_text": "<text>",
+      "compose_payload": {"title": "...", "generated_text": "...", "notes": [...]},
+      "rewrite_payload": {"title": "...", "generated_text": "...", "notes": [...]},
+      "translate_payload": {"title": "...", "generated_text": "...", "notes": [...]},
+      "fail_methods": ["compose", "rewrite", "translate"]
     }
 
 A ``transcribe`` request whose ``params.audio_file`` basename (without
@@ -38,6 +42,15 @@ When the stem matches neither ``transcribe_map`` nor ``fail_stems``,
 the key is absent. This keeps the fixture useful for callers whose
 audio paths are not under test control (e.g. the one-shot capture
 path uses a UUID-named file in ``$TMPDIR``).
+
+``compose``, ``rewrite``, and ``translate`` return the matching
+``<method>_payload`` object from config, or a default preview when the
+key is absent. The payload shape mirrors
+``python/voicelayer_orchestrator/providers/llm_openai_compatible.py``:
+``{"title": str, "generated_text": str, "notes": list[str]}``. Adding
+``<method>`` to ``fail_methods`` forces a JSON-RPC error for that
+method instead of a result, which lets tests exercise the
+``worker_error_receipt`` branch of each handler.
 
 ``health`` and ``list_providers`` return static payloads. Tests do not
 exercise them today, but keeping them here makes the script a drop-in
@@ -120,6 +133,37 @@ def _list_providers_response(request_id: object) -> dict:
     }
 
 
+def _preview_response(
+    request_id: object,
+    method: str,
+    config: dict,
+    default_title: str,
+    default_generated_text: str,
+) -> dict:
+    fail_methods = set(config.get("fail_methods", []))
+    if method in fail_methods:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": f"mock worker failing on request for method {method}",
+            },
+        }
+
+    payload = config.get(f"{method}_payload") or {}
+    result = {
+        "title": str(payload.get("title", default_title)),
+        "generated_text": str(payload.get("generated_text", default_generated_text)),
+        "notes": list(payload.get("notes", [])),
+    }
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
+    }
+
+
 def main() -> int:
     line = sys.stdin.readline()
     if not line:
@@ -136,6 +180,30 @@ def main() -> int:
 
     if method == "transcribe":
         response = _transcribe_response(request_id, params, config)
+    elif method == "compose":
+        response = _preview_response(
+            request_id,
+            "compose",
+            config,
+            default_title="Compose preview",
+            default_generated_text="mock compose output",
+        )
+    elif method == "rewrite":
+        response = _preview_response(
+            request_id,
+            "rewrite",
+            config,
+            default_title="Rewrite preview",
+            default_generated_text="mock rewrite output",
+        )
+    elif method == "translate":
+        response = _preview_response(
+            request_id,
+            "translate",
+            config,
+            default_title="Translate preview",
+            default_generated_text="mock translate output",
+        )
     elif method == "health":
         response = _health_response(request_id)
     elif method == "list_providers":
