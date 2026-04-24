@@ -1738,7 +1738,7 @@ mod http_api_tests {
     use super::worker::WorkerCommand;
     use super::{DaemonConfig, build_app_router, build_app_state};
 
-    fn test_config(worker_command: WorkerCommand) -> DaemonConfig {
+    pub(super) fn test_config(worker_command: WorkerCommand) -> DaemonConfig {
         DaemonConfig {
             socket_path: std::path::PathBuf::from("/unused-in-tests.sock"),
             project_root: worker_command.project_root.clone(),
@@ -1747,7 +1747,7 @@ mod http_api_tests {
         }
     }
 
-    async fn post_json<R>(
+    pub(super) async fn post_json<R>(
         router: axum::Router,
         uri: &str,
         body: serde_json::Value,
@@ -2021,6 +2021,326 @@ mod http_api_tests {
         assert_ne!(
             result.session.session_id, unknown_id,
             "response session_id currently does not echo the request; update this assertion if the contract changes",
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_dictation_http_roundtrip_returns_completed_session() {
+        // The one-shot branch of `create_dictation_session` takes a
+        // different path than the segmented one — it holds an
+        // `ActiveRecording` directly in `active_dictations`, and stop
+        // synchronously calls `stop_recording_process` +
+        // `worker.transcribe`. Pin the handler-level roundtrip so a
+        // regression on either side surfaces the same way the
+        // segmented test catches regressions on the segmented side.
+        //
+        // The mock worker's `default_transcribe_text` knob handles the
+        // UUID-named `temp_audio_path()` output that one-shot produces:
+        // the stem is unknown-to-map, so the default reply fills in.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "default_transcribe_text": " oneshot reply",
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::OneShot,
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            session.state,
+            SessionState::Listening,
+            "one-shot start must ready the active recording, not short-circuit",
+        );
+        let session_id = session.session_id;
+
+        // Let the fake recorder child live for a handful of milliseconds
+        // before stop so `stop_recording_process`'s wait returns after
+        // a natural child exit (~200ms) rather than racing the SIGINT
+        // timeout path.
+        sleep(Duration::from_millis(50)).await;
+
+        let (status, result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest { session_id }).expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.session.session_id, session_id);
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert_eq!(
+            result.transcription.text, " oneshot reply",
+            "one-shot returns the worker transcript verbatim — unlike the segmented path, no trim is applied because there is only one transcript and no stitching seam where leading whitespace could matter",
+        );
+        assert_eq!(result.failure_kind, None);
+    }
+}
+
+#[cfg(test)]
+mod sse_stream_tests {
+    //! Integration tests for `GET /v1/events/stream`.
+    //!
+    //! The SSE handler wraps the daemon's broadcast channel in
+    //! `BroadcastStream` and frames each `EventEnvelope` into an SSE
+    //! `event: <type>\ndata: <json>\n\n` block. The broadcast
+    //! plumbing is already covered by the orchestrator tests that
+    //! subscribe directly to the channel; what lives only in the HTTP
+    //! layer is:
+    //!   1. the per-request subscription creation,
+    //!   2. the envelope → `Event::default().event(type).data(json)`
+    //!      framing,
+    //!   3. the keep-alive + stream filter shape.
+    //!
+    //! These tests drive the handler in-process via
+    //! `tower::ServiceExt::oneshot`, which returns the response as
+    //! soon as headers are ready; the streaming body is then pulled
+    //! frame-by-frame. Both tests subscribe before emitting so there
+    //! is no event-ordering race.
+    use std::time::Duration;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use futures_util::StreamExt;
+    use tokio::time::{sleep, timeout};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+    use voicelayer_core::{
+        CaptureSession, DictationCaptureResult, EventEnvelope, RecorderBackend, SegmentationMode,
+        StartDictationRequest, StopDictationRequest, TriggerKind,
+    };
+
+    use super::http_api_tests::{post_json, test_config};
+    use super::test_support::{fake_successful_spawner, mock_worker_command};
+    use super::{build_app_router, build_app_state};
+
+    /// Read body chunks until `accumulated` contains `expected_frames`
+    /// SSE frame terminators (`\n\n`) or the `overall_timeout`
+    /// elapses, whichever comes first. SSE frames may straddle chunk
+    /// boundaries, so the caller is expected to split the result on
+    /// `\n\n` afterwards.
+    async fn read_sse_frames_until(
+        body: Body,
+        expected_frames: usize,
+        overall_timeout: Duration,
+    ) -> String {
+        let mut stream = body.into_data_stream();
+        let mut buffer = String::new();
+        let deadline = tokio::time::Instant::now() + overall_timeout;
+        while buffer.matches("\n\n").count() < expected_frames {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    buffer.push_str(std::str::from_utf8(&bytes).expect("utf-8 SSE frame"));
+                }
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
+        }
+        buffer
+    }
+
+    /// Extract the `event: <type>` header from each SSE frame in
+    /// `raw`, in order. Ignores keep-alive frames (they do not carry
+    /// an `event:` line).
+    fn event_types(raw: &str) -> Vec<&str> {
+        raw.split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("event: ")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn events_stream_frames_a_single_broadcast_envelope() {
+        // Minimum viable SSE test: subscribe, emit one envelope, read
+        // one frame, verify the event type and payload round-trip
+        // through the axum `Sse` framing. Nothing else runs concurrently
+        // so the frame ordering is deterministic.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let events_tx = state.events.clone();
+        let router = build_app_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/events/stream")
+                    .body(Body::empty())
+                    .expect("request build"),
+            )
+            .await
+            .expect("router oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream"),
+            "SSE handler must advertise the event-stream MIME type",
+        );
+
+        // The handler subscribed to the broadcast channel before
+        // returning the response; the send below will reach that
+        // subscription. Any envelope sent *before* `.oneshot().await`
+        // returned would be lost.
+        let session_id = Uuid::new_v4();
+        events_tx
+            .send(EventEnvelope::new(
+                "test.single_event",
+                Some(session_id),
+                "single frame",
+            ))
+            .expect("broadcast send");
+
+        let raw = read_sse_frames_until(response.into_body(), 1, Duration::from_secs(2)).await;
+        let types = event_types(&raw);
+        assert_eq!(
+            types,
+            vec!["test.single_event"],
+            "the broadcast envelope's event_type must land on the SSE `event:` line; got frames: {raw:?}",
+        );
+        assert!(
+            raw.contains(&session_id.to_string()),
+            "SSE data payload must include the envelope's session_id; got: {raw:?}",
+        );
+        assert!(
+            raw.contains(r#""message":"single frame""#),
+            "SSE data payload must include the envelope's message; got: {raw:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn events_stream_surfaces_segmented_dictation_lifecycle_events() {
+        // End-to-end: the SSE subscriber must see `segmented_started`
+        // (emitted by `create_dictation_session`), `segment_recorded`
+        // and `segment_transcribed` (emitted from the orchestrator task
+        // during stop-path drain), and a terminal `completed` event.
+        // This is the closest an HTTP-level test can get to what a
+        // real vl-desktop overlay or foreground-ptt panel observes
+        // during a dictation session.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " streamed"},
+                "fail_stems": [],
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        // Open the SSE stream first so the broadcast subscription
+        // exists before any event is emitted. The handler's
+        // `state.events.subscribe()` runs inside the GET handler body,
+        // so by the time `oneshot().await` returns, the subscription
+        // is live.
+        let sse_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/events/stream")
+                    .body(Body::empty())
+                    .expect("request build"),
+            )
+            .await
+            .expect("sse oneshot");
+        assert_eq!(sse_response.status(), StatusCode::OK);
+
+        // Spawn a concurrent reader that drains frames until the
+        // full lifecycle (>= 5 frames: segmented_started,
+        // session_created, segment_recorded, segment_transcribed,
+        // completed) has arrived or the timeout lapses.
+        let reader = tokio::spawn(async move {
+            read_sse_frames_until(sse_response.into_body(), 5, Duration::from_secs(5)).await
+        });
+
+        // Kick off a segmented session and stop it immediately so the
+        // full event sequence flows through the subscription.
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::Fixed {
+                segment_secs: 60,
+                overlap_secs: 0,
+            },
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        sleep(Duration::from_millis(50)).await;
+
+        let (status, _result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest {
+                session_id: session.session_id,
+            })
+            .expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let raw = reader.await.expect("SSE reader joined");
+        let types = event_types(&raw);
+        assert!(
+            types.contains(&"dictation.segmented_started"),
+            "segmented_started must appear; actual types: {types:?}",
+        );
+        assert!(
+            types.contains(&"dictation.session_created"),
+            "session_created must appear; actual types: {types:?}",
+        );
+        assert!(
+            types.contains(&"dictation.segment_recorded"),
+            "segment_recorded must appear; actual types: {types:?}",
+        );
+        assert!(
+            types.contains(&"dictation.segment_transcribed"),
+            "segment_transcribed must appear; actual types: {types:?}",
+        );
+        assert_eq!(
+            types.last().copied(),
+            Some("dictation.completed"),
+            "the terminal frame must be `dictation.completed`; actual types: {types:?}",
+        );
+        assert!(
+            raw.contains(&session.session_id.to_string()),
+            "every lifecycle frame should carry the session_id; got raw: {raw:?}",
         );
     }
 }
