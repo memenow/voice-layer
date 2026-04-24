@@ -23,7 +23,8 @@ Config schema::
 
     {
       "transcribe_map": {"<stem>": "<text>"},
-      "fail_stems": ["<stem>", ...]
+      "fail_stems": ["<stem>", ...],
+      "default_transcribe_text": "<text>"
     }
 
 A ``transcribe`` request whose ``params.audio_file`` basename (without
@@ -31,6 +32,12 @@ extension) matches a map entry returns ``{"text": <text>,
 "detected_language": "en", "notes": []}`` (or an empty
 ``detected_language`` when ``<text>`` is empty). A stem listed in
 ``fail_stems`` returns a JSON-RPC error instead of a result.
+
+When the stem matches neither ``transcribe_map`` nor ``fail_stems``,
+``default_transcribe_text`` fills in the reply — or an empty text if
+the key is absent. This keeps the fixture useful for callers whose
+audio paths are not under test control (e.g. the one-shot capture
+path uses a UUID-named file in ``$TMPDIR``).
 
 ``health`` and ``list_providers`` return static payloads. Tests do not
 exercise them today, but keeping them here makes the script a drop-in
@@ -69,7 +76,8 @@ def _transcribe_response(request_id: object, params: dict, config: dict) -> dict
         }
 
     mapping = config.get("transcribe_map", {})
-    text = mapping.get(stem, "")
+    default_text = str(config.get("default_transcribe_text", ""))
+    text = mapping.get(stem, default_text)
     return {
         "jsonrpc": "2.0",
         "id": request_id,
