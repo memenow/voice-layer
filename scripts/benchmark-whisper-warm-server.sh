@@ -47,6 +47,23 @@ LANGUAGE="${LANGUAGE:-auto}"
 TRANSLATE="${TRANSLATE:-false}"
 COLD_START_SECONDS="${COLD_START_SECONDS:-}"
 
+# Validate RUNS before anything else: the timed loop divides by it when
+# computing the mean, and awk's divide-by-zero failure surfaces as an
+# opaque runtime error instead of a clear "bad input" message. A value
+# of zero or a non-integer makes no sense for a latency benchmark.
+if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: RUNS must be a positive integer (got: $RUNS)" >&2
+  exit 64
+fi
+
+# WARMUP_RUNS may legitimately be zero (skip warmup entirely), but it
+# must still be a non-negative integer so the printf on the summary
+# line and the seq below do not spray confusing errors.
+if ! [[ "$WARMUP_RUNS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "error: WARMUP_RUNS must be a non-negative integer (got: $WARMUP_RUNS)" >&2
+  exit 64
+fi
+
 if ! command -v curl >/dev/null 2>&1; then
   echo "error: curl is not on PATH" >&2
   exit 64
