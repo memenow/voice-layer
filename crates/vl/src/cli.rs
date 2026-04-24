@@ -7,8 +7,8 @@ use serde::Serialize;
 use voicelayer_core::{
     ComposeRequest, CompositionArchetype, DictationCaptureRequest, HealthResponse, InjectRequest,
     InjectTarget, InjectionPlan, LanguageProfile, LanguageStrategy, RecorderBackend,
-    RewriteRequest, RewriteStyle, SegmentationMode, SessionMode, StartDictationRequest,
-    StopDictationRequest, TranscribeRequest, TranslateRequest, TriggerKind,
+    RewriteRequest, RewriteStyle, SessionMode, StartDictationRequest, StopDictationRequest,
+    TranscribeRequest, TranslateRequest, TriggerKind,
 };
 use voicelayerd::{
     DaemonConfig, RecorderDiagnostics, WorkerHealthResult, capture_dictation_once,
@@ -17,8 +17,8 @@ use voicelayerd::{
 };
 
 use crate::config::{
-    CliPttKey, CliRecorderBackend, StopAction, VlConfig, load_vl_config, set_config_value,
-    vl_config_path, write_vl_config,
+    CliPttKey, CliRecorderBackend, CliSegmentationMode, StopAction, VlConfig,
+    build_segmentation_mode, load_vl_config, set_config_value, vl_config_path, write_vl_config,
 };
 use crate::foreground_ptt::run_foreground_ptt;
 use crate::preview::{ready_receipt, worker_error_receipt};
@@ -129,6 +129,49 @@ enum DictationCommand {
         translate_to_english: bool,
         #[arg(long, default_value_t = false)]
         keep_audio: bool,
+        /// Segmentation strategy. `one-shot` runs a single recorder for the
+        /// whole session (default); `fixed` rolls the recorder every
+        /// `--segment-secs` seconds; `vad-gated` rolls at `--probe-secs`
+        /// cadence and flushes on silence (requires the worker's silero-vad
+        /// to be configured).
+        #[arg(long, value_enum, default_value_t = CliSegmentationMode::OneShot)]
+        mode: CliSegmentationMode,
+        /// Fixed-mode: duration of each segment in whole seconds. Required
+        /// when `--mode fixed`; ignored otherwise. Must be >= 1; the
+        /// daemon also rejects 0 but catching it at parse time gives a
+        /// cleaner error.
+        #[arg(
+            long,
+            required_if_eq("mode", "fixed"),
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        segment_secs: Option<u32>,
+        /// Fixed-mode: reserved for future overlap-based stitching; the
+        /// current implementation records each segment back-to-back.
+        #[arg(long, default_value_t = 0)]
+        overlap_secs: u32,
+        /// VAD-gated: duration of each classification probe in whole
+        /// seconds. Required when `--mode vad-gated`. Must be >= 1.
+        #[arg(
+            long,
+            required_if_eq("mode", "vad-gated"),
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        probe_secs: Option<u32>,
+        /// VAD-gated: upper bound on a buffered speech unit before a
+        /// forced flush, in whole seconds. Required when
+        /// `--mode vad-gated`. Must be >= 1.
+        #[arg(
+            long,
+            required_if_eq("mode", "vad-gated"),
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        max_segment_secs: Option<u32>,
+        /// VAD-gated: number of consecutive silent probes that must
+        /// arrive after speech before the pending buffer flushes.
+        /// Defaults to 1 (flush on the first silent probe after speech).
+        #[arg(long, default_value_t = 1)]
+        silence_gap_probes: u32,
     },
     Stop {
         session_id: uuid::Uuid,
@@ -484,7 +527,21 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 backend,
                 translate_to_english,
                 keep_audio,
+                mode,
+                segment_secs,
+                overlap_secs,
+                probe_secs,
+                max_segment_secs,
+                silence_gap_probes,
             } => {
+                let segmentation = build_segmentation_mode(
+                    mode,
+                    segment_secs,
+                    overlap_secs,
+                    probe_secs,
+                    max_segment_secs,
+                    silence_gap_probes,
+                );
                 let request = StartDictationRequest {
                     trigger: TriggerKind::Cli,
                     language_profile: language.map(|language| LanguageProfile {
@@ -495,7 +552,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     recorder_backend: Some(backend.into()),
                     translate_to_english,
                     keep_audio,
-                    segmentation: SegmentationMode::default(),
+                    segmentation,
                 };
                 let session: voicelayer_core::CaptureSession =
                     uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request).await?;
@@ -965,5 +1022,133 @@ mod tests {
         assert!(!pid_matches_command(-1, "anything"));
         // PID 1 (init/systemd) should not match a name we never ran.
         assert!(!pid_matches_command(1, "definitely-not-a-real-binary"));
+    }
+
+    /// Pin clap's `required_if_eq` and range value-parser wiring on the
+    /// `vl dictation start` command. These tests catch the failure modes
+    /// that the runtime `build_segmentation_mode` `#[should_panic]`
+    /// checks would otherwise only catch *after* the binary has parsed
+    /// args — here we stop the regression at parse time, where the user
+    /// sees the error.
+    mod dictation_start_parsing {
+        use clap::Parser;
+
+        use super::super::Args;
+
+        fn try_parse(args: &[&str]) -> Result<Args, clap::Error> {
+            Args::try_parse_from(args)
+        }
+
+        #[test]
+        fn one_shot_default_parses_without_numeric_knobs() {
+            try_parse(&["vl", "dictation", "start"])
+                .expect("default one-shot mode must parse with no numeric flags");
+        }
+
+        #[test]
+        fn fixed_mode_requires_segment_secs() {
+            let error = try_parse(&["vl", "dictation", "start", "--mode", "fixed"])
+                .expect_err("--mode fixed without --segment-secs must error at parse time");
+            assert!(
+                error.to_string().contains("--segment-secs"),
+                "error should name the missing flag; got {error}",
+            );
+        }
+
+        #[test]
+        fn vad_gated_mode_requires_probe_secs() {
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "vad-gated",
+                "--max-segment-secs",
+                "30",
+            ])
+            .expect_err("--mode vad-gated without --probe-secs must error");
+        }
+
+        #[test]
+        fn vad_gated_mode_requires_max_segment_secs() {
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "vad-gated",
+                "--probe-secs",
+                "2",
+            ])
+            .expect_err("--mode vad-gated without --max-segment-secs must error");
+        }
+
+        #[test]
+        fn vad_gated_mode_accepts_full_arg_set() {
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "vad-gated",
+                "--probe-secs",
+                "2",
+                "--max-segment-secs",
+                "30",
+                "--silence-gap-probes",
+                "2",
+            ])
+            .expect("complete vad-gated arg set must parse cleanly");
+        }
+
+        #[test]
+        fn fixed_mode_rejects_zero_segment_secs() {
+            // The clap range parser must catch 0 before the request
+            // reaches the daemon. Without `value_parser = ..range(1..)`
+            // this would round-trip to the daemon and return a Failed
+            // session — the user-facing error would be far less direct.
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "fixed",
+                "--segment-secs",
+                "0",
+            ])
+            .expect_err("--segment-secs 0 must be rejected at parse time");
+        }
+
+        #[test]
+        fn vad_gated_mode_rejects_zero_probe_secs() {
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "vad-gated",
+                "--probe-secs",
+                "0",
+                "--max-segment-secs",
+                "30",
+            ])
+            .expect_err("--probe-secs 0 must be rejected at parse time");
+        }
+
+        #[test]
+        fn vad_gated_mode_rejects_zero_max_segment_secs() {
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "vad-gated",
+                "--probe-secs",
+                "2",
+                "--max-segment-secs",
+                "0",
+            ])
+            .expect_err("--max-segment-secs 0 must be rejected at parse time");
+        }
     }
 }
