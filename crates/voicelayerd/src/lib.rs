@@ -2215,6 +2215,57 @@ mod http_api_tests {
     }
 
     #[tokio::test]
+    async fn compose_http_roundtrip_surfaces_worker_error_as_needs_provider_receipt() {
+        // Complements the happy-path compose test by driving the
+        // `Err(error)` arm of `create_composition_job` through the
+        // mock worker's `fail_methods` knob. The handler wraps the
+        // JSON-RPC error as a `CompositionReceipt` with
+        // `PreviewStatus::NeedsProvider`, returns HTTP 200 (not 5xx)
+        // so the CLI/UI can render the preview state, and appends a
+        // `"Worker bridge detail: ..."` note for diagnostics.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "fail_methods": ["compose"],
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request_body = serde_json::json!({
+            "spoken_prompt": "draft a short status update for the team email",
+            "archetype": CompositionArchetype::Email,
+            "output_language": "en",
+        });
+        let (status, receipt): (StatusCode, CompositionReceipt) =
+            post_json(router, "/v1/sessions/compose", request_body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(receipt.preview.status, PreviewStatus::NeedsProvider);
+        assert_eq!(
+            receipt.preview.title,
+            "Composition preview is waiting for a configured provider.",
+        );
+        assert!(
+            receipt.preview.generated_text.is_none(),
+            "NeedsProvider receipts must not carry fabricated generated_text; got {:?}",
+            receipt.preview.generated_text,
+        );
+        assert!(
+            receipt
+                .preview
+                .notes
+                .iter()
+                .any(|note| note.starts_with("Worker bridge detail:")),
+            "error path must append a `Worker bridge detail:` diagnostic note; got {:?}",
+            receipt.preview.notes,
+        );
+    }
+
+    #[tokio::test]
     async fn rewrite_http_roundtrip_returns_ready_receipt_from_worker_preview() {
         // Mirrors the compose test for `create_rewrite_job`. The mock
         // worker returns a configured preview for the `rewrite` method
