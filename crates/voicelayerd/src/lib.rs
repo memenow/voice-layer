@@ -2263,6 +2263,20 @@ mod http_api_tests {
             "error path must append a `Worker bridge detail:` diagnostic note; got {:?}",
             receipt.preview.notes,
         );
+        // Mode-specific pin: `PreviewArtifact::needs_provider` derives the
+        // first note from the `SessionMode` passed by the handler. If
+        // `create_composition_job` were wired to the wrong mode, the
+        // title assertion above would still pass but this note would
+        // identify the wrong workflow.
+        assert!(
+            receipt
+                .preview
+                .notes
+                .iter()
+                .any(|note| note.contains("composition workflow")),
+            "first note must identify the composition workflow; got {:?}",
+            receipt.preview.notes,
+        );
     }
 
     #[tokio::test]
