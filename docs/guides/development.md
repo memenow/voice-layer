@@ -33,6 +33,8 @@ cargo run -p vl -- preview compose "Write a concise technical summary."
 cargo run -p vl -- transcribe-file /path/to/sample.wav --language auto
 cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto
 cargo run -p vl -- dictation start --backend pipewire --language auto
+cargo run -p vl -- dictation start --mode fixed --segment-secs 8 --language auto
+cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
 cargo run -p vl -- dictation stop <session-id>
 cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto
 cargo run -p vl -- hotkeys portal-status
@@ -70,7 +72,7 @@ For file-based ASR, configure `VOICELAYER_WHISPER_BIN` and `VOICELAYER_WHISPER_M
 - `vl record-transcribe` records a short WAV clip with `pw-record` or `arecord`, then reuses the daemon's one-shot capture path into the same transcription flow.
 - `voicelayerd` serves the daemon-side one-shot capture path at `/v1/dictation/capture`, which advances session state from `listening` to `transcribing` to `completed` or `failed`, setting `DictationFailureKind` on the unhappy paths.
 - `voicelayerd` also serves live dictation sessions at `/v1/sessions/dictation` (start) and `/v1/sessions/dictation/stop`. `StartDictationRequest.segmentation` selects between `{"mode": "one_shot"}`, `{"mode": "fixed", "segment_secs": N, "overlap_secs": 0}`, and `{"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}`. In `fixed` mode the recorder rolls every `N` seconds, each chunk is transcribed in the background, and per-segment events (`dictation.segment_recorded`, `dictation.segment_transcribed`) stream on `/v1/events/stream` alongside the lifecycle events. In `vad_gated` mode the recorder rolls at `probe_secs` cadence, each probe is classified by silero-vad (via the worker's `segment_probe` RPC), pending speech probes flush on silence or at `max_segment_secs`, and per-probe / per-unit events (`dictation.probe_analyzed`, `dictation.speech_unit_flushed`, `dictation.speech_unit_transcribed`) stream alongside the lifecycle events. VAD-gated mode requires `VOICELAYER_WHISPER_VAD_ENABLED=true` and a silero-vad ONNX model path.
-- `vl dictation start/stop` uses the daemon UDS client, so the CLI exercises the same control plane hotkey and UI integrations use.
+- `vl dictation start/stop` uses the daemon UDS client, so the CLI exercises the same control plane hotkey and UI integrations use. `--mode {one-shot,fixed,vad-gated}` selects the segmentation strategy; `fixed` requires `--segment-secs`, `vad-gated` requires `--probe-secs` and `--max-segment-secs` (with an optional `--silence-gap-probes`, default 1). Omitting `--mode` keeps the pre-Phase-3 one-shot behavior.
 - `vl dictation foreground-ptt` provides a terminal-local fallback for push-to-talk. It enables raw mode and keyboard enhancement flags; if the terminal reports release events it behaves like hold-to-record, otherwise it falls back to press-to-start / press-again-to-stop.
 - The foreground-ptt alternate-screen panel preserves the full last transcript for scrolling review and supports `j/k`, arrow keys, and `PageUp/PageDown` for navigation. Press `c` to copy the last completed transcript to the clipboard on demand.
 - Press `r` to restore the saved clipboard text backup after any clipboard overwrite performed by the panel.

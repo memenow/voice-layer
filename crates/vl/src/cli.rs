@@ -7,8 +7,8 @@ use serde::Serialize;
 use voicelayer_core::{
     ComposeRequest, CompositionArchetype, DictationCaptureRequest, HealthResponse, InjectRequest,
     InjectTarget, InjectionPlan, LanguageProfile, LanguageStrategy, RecorderBackend,
-    RewriteRequest, RewriteStyle, SegmentationMode, SessionMode, StartDictationRequest,
-    StopDictationRequest, TranscribeRequest, TranslateRequest, TriggerKind,
+    RewriteRequest, RewriteStyle, SessionMode, StartDictationRequest, StopDictationRequest,
+    TranscribeRequest, TranslateRequest, TriggerKind,
 };
 use voicelayerd::{
     DaemonConfig, RecorderDiagnostics, WorkerHealthResult, capture_dictation_once,
@@ -17,8 +17,8 @@ use voicelayerd::{
 };
 
 use crate::config::{
-    CliPttKey, CliRecorderBackend, StopAction, VlConfig, load_vl_config, set_config_value,
-    vl_config_path, write_vl_config,
+    CliPttKey, CliRecorderBackend, CliSegmentationMode, StopAction, VlConfig,
+    build_segmentation_mode, load_vl_config, set_config_value, vl_config_path, write_vl_config,
 };
 use crate::foreground_ptt::run_foreground_ptt;
 use crate::preview::{ready_receipt, worker_error_receipt};
@@ -129,6 +129,35 @@ enum DictationCommand {
         translate_to_english: bool,
         #[arg(long, default_value_t = false)]
         keep_audio: bool,
+        /// Segmentation strategy. `one-shot` runs a single recorder for the
+        /// whole session (default); `fixed` rolls the recorder every
+        /// `--segment-secs` seconds; `vad-gated` rolls at `--probe-secs`
+        /// cadence and flushes on silence (requires the worker's silero-vad
+        /// to be configured).
+        #[arg(long, value_enum, default_value_t = CliSegmentationMode::OneShot)]
+        mode: CliSegmentationMode,
+        /// Fixed-mode: duration of each segment in whole seconds. Required
+        /// when `--mode fixed`; ignored otherwise.
+        #[arg(long, required_if_eq("mode", "fixed"))]
+        segment_secs: Option<u32>,
+        /// Fixed-mode: reserved for future overlap-based stitching; the
+        /// current implementation records each segment back-to-back.
+        #[arg(long, default_value_t = 0)]
+        overlap_secs: u32,
+        /// VAD-gated: duration of each classification probe in whole
+        /// seconds. Required when `--mode vad-gated`.
+        #[arg(long, required_if_eq("mode", "vad-gated"))]
+        probe_secs: Option<u32>,
+        /// VAD-gated: upper bound on a buffered speech unit before a
+        /// forced flush, in whole seconds. Required when
+        /// `--mode vad-gated`.
+        #[arg(long, required_if_eq("mode", "vad-gated"))]
+        max_segment_secs: Option<u32>,
+        /// VAD-gated: number of consecutive silent probes that must
+        /// arrive after speech before the pending buffer flushes.
+        /// Defaults to 1 (flush on the first silent probe after speech).
+        #[arg(long, default_value_t = 1)]
+        silence_gap_probes: u32,
     },
     Stop {
         session_id: uuid::Uuid,
@@ -484,7 +513,21 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 backend,
                 translate_to_english,
                 keep_audio,
+                mode,
+                segment_secs,
+                overlap_secs,
+                probe_secs,
+                max_segment_secs,
+                silence_gap_probes,
             } => {
+                let segmentation = build_segmentation_mode(
+                    mode,
+                    segment_secs,
+                    overlap_secs,
+                    probe_secs,
+                    max_segment_secs,
+                    silence_gap_probes,
+                );
                 let request = StartDictationRequest {
                     trigger: TriggerKind::Cli,
                     language_profile: language.map(|language| LanguageProfile {
@@ -495,7 +538,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     recorder_backend: Some(backend.into()),
                     translate_to_english,
                     keep_audio,
-                    segmentation: SegmentationMode::default(),
+                    segmentation,
                 };
                 let session: voicelayer_core::CaptureSession =
                     uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request).await?;

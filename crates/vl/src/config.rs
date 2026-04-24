@@ -64,6 +64,51 @@ pub(crate) enum StopAction {
     Save,
 }
 
+/// Surfaces `SegmentationMode` on the CLI via `clap::ValueEnum` so the
+/// `vl dictation start` command can pick a mode without the user having
+/// to hand-craft JSON. Each variant maps to the matching
+/// `voicelayer_core::SegmentationMode` variant at request-build time;
+/// the numeric knobs stay on the command itself (see `cli.rs`) so `--help`
+/// can document each one independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+pub(crate) enum CliSegmentationMode {
+    OneShot,
+    Fixed,
+    VadGated,
+}
+
+/// Build a `voicelayer_core::SegmentationMode` from the flattened CLI
+/// knobs. Clap's `required_if_eq` guarantees that the mode-specific
+/// numeric knobs are populated before this runs, so the `.expect(..)`
+/// panics only fire when the clap wiring itself is broken — they never
+/// fire on valid user input. The error-panic policy is the same as the
+/// equivalent panics for `RecorderBackend::from` above: unreachable
+/// under clap's contract.
+pub(crate) fn build_segmentation_mode(
+    mode: CliSegmentationMode,
+    segment_secs: Option<u32>,
+    overlap_secs: u32,
+    probe_secs: Option<u32>,
+    max_segment_secs: Option<u32>,
+    silence_gap_probes: u32,
+) -> voicelayer_core::SegmentationMode {
+    match mode {
+        CliSegmentationMode::OneShot => voicelayer_core::SegmentationMode::OneShot,
+        CliSegmentationMode::Fixed => voicelayer_core::SegmentationMode::Fixed {
+            segment_secs: segment_secs
+                .expect("clap required_if_eq(mode, fixed) must populate segment_secs"),
+            overlap_secs,
+        },
+        CliSegmentationMode::VadGated => voicelayer_core::SegmentationMode::VadGated {
+            probe_secs: probe_secs
+                .expect("clap required_if_eq(mode, vad-gated) must populate probe_secs"),
+            max_segment_secs: max_segment_secs
+                .expect("clap required_if_eq(mode, vad-gated) must populate max_segment_secs"),
+            silence_gap_probes,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ForegroundPttConfig {
     pub(crate) language: Option<String>,
@@ -242,9 +287,12 @@ fn parse_bool(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliPttKey, CliRecorderBackend, StopAction, VlConfig, set_config_value};
+    use super::{
+        CliPttKey, CliRecorderBackend, CliSegmentationMode, StopAction, VlConfig,
+        build_segmentation_mode, set_config_value,
+    };
     use crossterm::event::KeyCode;
-    use voicelayer_core::RecorderBackend;
+    use voicelayer_core::{RecorderBackend, SegmentationMode};
 
     #[test]
     fn cli_backend_maps_to_domain_backend() {
@@ -258,6 +306,67 @@ mod tests {
     fn ptt_key_maps_to_terminal_key_code() {
         assert_eq!(CliPttKey::Space.as_key_code(), KeyCode::Char(' '));
         assert_eq!(CliPttKey::F9.as_key_code(), KeyCode::F(9));
+    }
+
+    #[test]
+    fn build_segmentation_mode_one_shot_ignores_numeric_knobs() {
+        let mode = build_segmentation_mode(
+            CliSegmentationMode::OneShot,
+            Some(8),
+            0,
+            Some(2),
+            Some(30),
+            1,
+        );
+        assert_eq!(mode, SegmentationMode::OneShot);
+    }
+
+    #[test]
+    fn build_segmentation_mode_fixed_populates_from_required_knob() {
+        let mode = build_segmentation_mode(CliSegmentationMode::Fixed, Some(8), 2, None, None, 1);
+        assert_eq!(
+            mode,
+            SegmentationMode::Fixed {
+                segment_secs: 8,
+                overlap_secs: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn build_segmentation_mode_vad_gated_populates_from_required_knobs() {
+        let mode =
+            build_segmentation_mode(CliSegmentationMode::VadGated, None, 0, Some(2), Some(30), 2);
+        assert_eq!(
+            mode,
+            SegmentationMode::VadGated {
+                probe_secs: 2,
+                max_segment_secs: 30,
+                silence_gap_probes: 2,
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "segment_secs")]
+    fn build_segmentation_mode_fixed_panics_when_segment_secs_missing() {
+        // Defensive sanity check: clap should never let this happen in
+        // production, but if the `required_if_eq` attribute is ever
+        // stripped this pin ensures we fail loudly instead of silently
+        // downgrading to a zero-duration segment.
+        let _ = build_segmentation_mode(CliSegmentationMode::Fixed, None, 0, None, None, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "probe_secs")]
+    fn build_segmentation_mode_vad_gated_panics_when_probe_secs_missing() {
+        let _ = build_segmentation_mode(CliSegmentationMode::VadGated, None, 0, None, Some(30), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_segment_secs")]
+    fn build_segmentation_mode_vad_gated_panics_when_max_segment_secs_missing() {
+        let _ = build_segmentation_mode(CliSegmentationMode::VadGated, None, 0, Some(2), None, 1);
     }
 
     #[test]
