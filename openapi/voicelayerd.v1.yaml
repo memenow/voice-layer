@@ -200,7 +200,13 @@ components:
           $ref: "#/components/schemas/WorkerHealthSummary"
     WorkerHealthSummary:
       type: object
-      required: [status, command]
+      required:
+        - status
+        - command
+        - asr_configured
+        - llm_configured
+        - llm_reachable
+        - global_shortcuts_portal_available
       properties:
         status:
           type: string
@@ -221,6 +227,24 @@ components:
           type:
             - string
             - "null"
+        whisper_mode:
+          description: |
+            Which whisper path the Python worker would dispatch to on the next
+            `transcribe` call. Production values are `server` (persistent
+            whisper-server over HTTP), `cli` (one-shot whisper-cli subprocess),
+            and `unconfigured`. Absent when an older worker is serving and did
+            not emit this field.
+          type:
+            - string
+            - "null"
+        whisper_server_url:
+          description: |
+            Base URL of the configured whisper-server endpoint (e.g.
+            `http://127.0.0.1:8188`). Absent when whisper-server is not
+            configured or when the worker predates this field.
+          type:
+            - string
+            - "null"
         llm_configured:
           type: boolean
         llm_model:
@@ -234,6 +258,30 @@ components:
         llm_reachable:
           type: boolean
         llm_error:
+          type:
+            - string
+            - "null"
+        global_shortcuts_portal_available:
+          description: |
+            True when the current desktop session exposes the
+            `org.freedesktop.portal.GlobalShortcuts` interface. Drives whether
+            `vl hotkeys portal-status` treats portal-based push-to-talk as
+            viable on this session.
+          type: boolean
+        global_shortcuts_portal_version:
+          description: |
+            Interface version returned by the portal during the availability
+            probe. Absent when the portal is unreachable or did not report a
+            version.
+          type:
+            - integer
+            - "null"
+          format: int64
+          minimum: 0
+        global_shortcuts_portal_error:
+          description: |
+            Reason the portal probe failed, when
+            `global_shortcuts_portal_available` is `false`. Absent on success.
           type:
             - string
             - "null"
