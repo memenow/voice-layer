@@ -149,14 +149,58 @@ or `numpy` fails at runtime, the worker annotates the transcribe response with t
 falls back to transcribing the raw WAV — no request is lost. Silero-vad v4 (`h` + `c` state) and
 v5 (`state` tensor) ONNX exports are both supported; the sample rate must be 16000 Hz or 8000 Hz.
 
+### VAD-gated Live Dictation (Phase 3D-B)
+
+The pre-pass above runs *after* whisper has already received a fixed-duration WAV. The
+**VAD-gated** segmentation mode goes further: the recorder rolls at a short `probe_secs` cadence,
+each probe is classified by silero-vad through the worker's `segment_probe` JSON-RPC method, and
+the orchestrator only flushes a buffered speech unit to `transcribe` when it sees `silence_gap_probes`
+consecutive silent probes (default `1`) or when the buffered duration would exceed
+`max_segment_secs`. Speaker pauses, not the wall-clock, bound each transcription input.
+
+```bash
+export VOICELAYER_WHISPER_VAD_ENABLED=true
+export VOICELAYER_WHISPER_VAD_MODEL_PATH=/abs/path/to/silero_vad.onnx
+# Same VAD tunables as the pre-pass apply.
+
+cargo run -p vl -- daemon run --project-root "$(pwd)"           # in one shell
+cargo run -p vl -- dictation start \
+  --mode vad-gated --probe-secs 2 --max-segment-secs 30 \
+  --language auto                                               # in another
+# (speak, pausing naturally between phrases)
+cargo run -p vl -- dictation stop <session-id-from-start>
+```
+
+While a VAD-gated session is live the daemon streams these per-probe / per-unit events on
+`GET /v1/events/stream` alongside the existing lifecycle events:
+
+- `dictation.vad_gated_started` — emitted once when the orchestrator begins.
+- `dictation.probe_analyzed` — once per physical probe with the speech/silence verdict and
+  `speech_ratio`.
+- `dictation.speech_unit_flushed` — once per flushed pending buffer (silence-triggered or
+  max-duration-triggered).
+- `dictation.speech_unit_transcribed` — once per flushed unit's background transcribe task.
+- `dictation.completed` / `dictation.failed` — same shape as fixed mode; `text` is the
+  concatenated transcripts of every flushed speech unit.
+
+If the `segment_probe` RPC itself errors (silero-vad crash, ONNX import failure, etc.) the
+orchestrator falls back to a pessimistic "speech" verdict per probe so live dictation never
+silently drops audio. The synthetic verdict carries a note explaining the failure, and the
+operator can inspect it in the SSE stream.
+
+When VAD is **not** configured (`VOICELAYER_WHISPER_VAD_ENABLED` unset or
+`VOICELAYER_WHISPER_VAD_MODEL_PATH` missing), the daemon still accepts `--mode vad-gated`
+requests but every probe falls back to "speech", which degrades the mode to fixed-cadence
+segmentation. Configure VAD properly before relying on the gating to bound transcribe inputs.
+
 ## Current Scope
 
 The current ASR integration covers file transcription, short-recording transcription, Phase 3B
 fixed-duration segmented live dictation (recorder rolled every *N* seconds with background
-transcription), and the optional silero-vad pre-pass above. It does not yet cover:
+transcription), the optional silero-vad pre-pass, and Phase 3D-B VAD-gated segmentation
+(probe-cadence recording with silence-triggered flush). It does not yet cover:
 
 - always-on live microphone capture
-- dynamic VAD-driven segmentation boundaries at the recorder layer
 - partial transcripts streamed mid-utterance
 - background ASR daemonization
 
