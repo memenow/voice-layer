@@ -43,10 +43,11 @@ VOICELAYER_WHISPER_ARGS=
 ### Persistent `whisper-server` (preferred for Phase 3 segmented workflows)
 
 Launching `whisper-cli` once per transcription pays the full model-init cost every call
-(measured at ~0.84s on CPU, see Phase 3 Pre-flight below). A long-lived `whisper-server` process
-keeps the model mmapped and drops per-request latency by roughly the cold-start cost. The worker
-auto-selects the server whenever the configured endpoint is reachable and falls back to
-`whisper-cli` otherwise.
+(measured at ~0.84 s on CPU, see Phase 3 Pre-flight below). A long-lived `whisper-server` process
+keeps the model mmapped and drops per-request latency by roughly the cold-start cost — the
+Warm-server baseline subsection below documents the reproduction command and the
+maintainer-reported saving. The worker auto-selects the server whenever the configured endpoint
+is reachable and falls back to `whisper-cli` otherwise.
 
 ```bash
 VOICELAYER_WHISPER_SERVER_HOST=127.0.0.1
@@ -210,3 +211,35 @@ Phase 3B. The figure includes `docker exec` overhead (~10–30 ms); host `whispe
 is at most that much faster and still far above the threshold. Operators with a different
 hardware/model combination should re-run the script and update this section when the value
 changes meaningfully.
+
+### Warm-server baseline
+
+The cold-start row above is only half the Phase 3 decision. The other half — how much per-call
+wall-clock the persistent server actually saves once the ggml context stays warm across
+requests — is measured against an already-running `whisper-server`. Start one with the Docker
+command earlier in this guide, or let the worker auto-start it via
+`VOICELAYER_WHISPER_SERVER_AUTO_START=true`, then:
+
+```bash
+COLD_START_SECONDS=0.8446 \
+  HOST=127.0.0.1 PORT=8188 \
+  RUNS=10 WARMUP_RUNS=2 \
+  scripts/benchmark-whisper-warm-server.sh
+```
+
+The script sends `WARMUP_RUNS` untimed `POST /inference` requests so per-connection caches
+settle, times the next `RUNS`, and reports mean/min/max. When `COLD_START_SECONDS` is passed
+(use the mean printed by the cold-start script above), the output also includes the absolute and
+relative saving per transcribe call. There is no proceed/stop gate here because the tradeoff is
+configuration-specific: even a small warm-path saving compounds inside segmented dictation (one
+transcribe per segment), while one-shot transcription amortises the cold-start cost across a
+single call.
+
+On the maintainer's reference workstation (Ubuntu 24, CPU-only, `ggml-base.en.bin`,
+`ghcr.io/ggml-org/whisper.cpp:main` server container on port 8188) real voice captures measured
+~0.65 s/call via the warm server and ~0.98 s/call via one-shot `whisper-cli-docker`, for a
+~0.26 s daemon-mediated saving per transcribe call. The saving is what drives VoiceLayer
+preferring the server path whenever an endpoint is configured: segmented live dictation runs
+one transcribe per segment, so a ~260 ms per-call delta flows straight into user-visible
+end-to-end latency. Operators with different hardware or model sizes will see different deltas;
+rerun the script to confirm before relying on the ratio.
