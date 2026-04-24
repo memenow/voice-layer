@@ -429,4 +429,46 @@ mod tests {
         let decoded: DictationFailureKind = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
     }
+
+    // Drift guard for the /v1/health response shape. If a pub field is added
+    // to WorkerHealthSummary, document it under the WorkerHealthSummary
+    // component in openapi/voicelayerd.v1.yaml and add its name here so the
+    // contract stays in sync with the wire format daemons actually emit.
+    #[test]
+    fn openapi_worker_health_summary_documents_every_field() {
+        let openapi_path = format!(
+            "{}/../../openapi/voicelayerd.v1.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let contents =
+            std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
+        let fields = [
+            "status",
+            "command",
+            "asr_configured",
+            "asr_binary",
+            "asr_model_path",
+            "asr_error",
+            "whisper_mode",
+            "whisper_server_url",
+            "llm_configured",
+            "llm_model",
+            "llm_endpoint",
+            "llm_reachable",
+            "llm_error",
+            "global_shortcuts_portal_available",
+            "global_shortcuts_portal_version",
+            "global_shortcuts_portal_error",
+            "message",
+        ];
+        for field in fields {
+            let needle = format!("        {field}:");
+            assert!(
+                contents.contains(&needle),
+                "openapi WorkerHealthSummary schema is missing `{field}` \
+                 (looked for line `{needle}`). \
+                 Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
+            );
+        }
+    }
 }
