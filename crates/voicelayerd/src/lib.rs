@@ -1731,7 +1731,7 @@ mod http_api_tests {
     use voicelayer_core::{
         CaptureSession, DictationCaptureResult, DictationFailureKind, HealthResponse,
         RecorderBackend, SegmentationMode, SessionState, StartDictationRequest,
-        StopDictationRequest, TriggerKind,
+        StopDictationRequest, TriggerKind, WorkerHealthSummary,
     };
 
     use super::test_support::{fake_successful_spawner, mock_worker_command};
@@ -1823,6 +1823,77 @@ mod http_api_tests {
         );
         assert_eq!(body.worker.whisper_mode.as_deref(), Some("mock"));
         assert!(body.worker.asr_configured);
+    }
+
+    // Wire-level companion to the compile-time drift guard
+    // `openapi_worker_health_summary_documents_every_field` in
+    // `voicelayer-core::domain`. The drift guard proves every Rust field is
+    // declared in the openapi contract; this test proves every Rust field
+    // actually reaches the HTTP body of `GET /v1/health`. Decoding as
+    // `serde_json::Value` (instead of the typed `HealthResponse`) is
+    // deliberate — serde would silently fill a missing `Option<_>` with
+    // `None`, hiding a regression where a field is dropped on the wire.
+    // Key presence is the contract: values vary by host (no portal / no
+    // llm on CI), so we assert shape, not content.
+    #[tokio::test]
+    async fn health_endpoint_serializes_every_worker_summary_field() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        // Mirror the drift guard's sentinel construction verbatim so a
+        // future contributor who adds a pub field to `WorkerHealthSummary`
+        // breaks both tests together. Every `Option<_>` is `Some(...)` so
+        // the expected key set includes nullable fields too.
+        let sentinel = WorkerHealthSummary {
+            status: String::new(),
+            command: String::new(),
+            asr_configured: false,
+            asr_binary: Some(String::new()),
+            asr_model_path: Some(String::new()),
+            asr_error: Some(String::new()),
+            whisper_mode: Some(String::new()),
+            whisper_server_url: Some(String::new()),
+            llm_configured: false,
+            llm_model: Some(String::new()),
+            llm_endpoint: Some(String::new()),
+            llm_reachable: false,
+            llm_error: Some(String::new()),
+            global_shortcuts_portal_available: false,
+            global_shortcuts_portal_version: Some(0),
+            global_shortcuts_portal_error: Some(String::new()),
+            message: Some(String::new()),
+        };
+        let sentinel_value = serde_json::to_value(&sentinel)
+            .expect("WorkerHealthSummary serializes to JSON without error");
+        let expected_keys: Vec<String> = sentinel_value
+            .as_object()
+            .expect("WorkerHealthSummary serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let (status, body): (StatusCode, serde_json::Value) = get_json(router, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let worker_body = body
+            .get("worker")
+            .expect("response body should contain a `worker` object");
+        let worker_object = worker_body
+            .as_object()
+            .expect("`worker` field should serialize as a JSON object");
+
+        for field in &expected_keys {
+            assert!(
+                worker_object.contains_key(field),
+                "GET /v1/health is missing `worker.{field}` on the wire; \
+                 expected keys derived from WorkerHealthSummary: {expected_keys:?}",
+            );
+        }
     }
 
     #[tokio::test]
