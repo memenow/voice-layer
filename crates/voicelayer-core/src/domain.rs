@@ -476,7 +476,13 @@ pub fn now_epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DictationFailureKind, WorkerHealthSummary};
+    use super::{
+        CaptureSession, CompositionReceipt, DictationCaptureResult, DictationFailureKind,
+        HealthResponse, InjectTarget, InjectionPlan, LanguageProfile, PreviewArtifact,
+        PreviewStatus, SessionMode, SessionState, TranscriptionResult, TriggerKind,
+        WorkerHealthSummary,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn dictation_failure_kind_serializes_to_snake_case_variants() {
@@ -502,20 +508,40 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    // Drift guard for the /v1/health response shape. Adding a pub field to
-    // WorkerHealthSummary breaks the sentinel construction below at compile
-    // time, so the next contributor must either document the field in
-    // openapi/voicelayerd.v1.yaml or explicitly opt out by zeroing the
-    // sentinel field; the serialized keys drive the openapi assertion.
+    // Drift guard template for `components.schemas.<Name>` blocks in
+    // openapi/voicelayerd.v1.yaml. Adding a `pub` field to a guarded
+    // struct breaks the matching sentinel at compile time, so a future
+    // contributor must either document the field in the openapi schema
+    // or explicitly opt out by extending the sentinel.
     //
-    // Known blind spot: this pattern assumes no WorkerHealthSummary field
-    // uses `#[serde(skip_serializing_if = "Option::is_none")]`. If that
-    // attribute is added, `to_value(sentinel_with_None).as_object().keys()`
-    // will drop the key and the guard silently stops covering it. Either
-    // seed the sentinel field with `Some(...)` or remove the attribute to
-    // keep coverage intact.
-    #[test]
-    fn openapi_worker_health_summary_documents_every_field() {
+    // Sentinel convention: every Option field is `None` (so it
+    // serialises to JSON `null`, which the required-list check uses to
+    // identify Rust-side optionality without type reflection); every
+    // non-Option field is the type's natural zero/default value.
+    //
+    // Known blind spot: a future field annotated with
+    // `#[serde(skip_serializing_if = "Option::is_none")]` would drop
+    // out of `to_value(sentinel).as_object().keys()` and the guard
+    // would silently stop covering it. Seed such a field with
+    // `Some(...)` in the sentinel, or remove the attribute, to keep
+    // coverage intact.
+
+    /// Compare every field in `sentinel` (as serialised by serde_json)
+    /// against the openapi component schema named `schema_name`. Asserts
+    /// two contracts:
+    ///
+    /// 1. **Property presence** — every serialised field appears as a
+    ///    property under the schema component (via the literal
+    ///    `        <field>:` line — eight-space indent matches every
+    ///    schema component's top-level property indent).
+    /// 2. **Required-list cross-check** — every non-Option field
+    ///    (serialised as a non-null value) appears under `required:`,
+    ///    and every Option field (serialised as `null`) does not.
+    ///
+    /// Supports both YAML required-list forms in the source file:
+    /// block (`      required:\n        - foo`) and inline
+    /// (`      required: [foo, bar]`).
+    fn assert_openapi_documents_every_field<T: serde::Serialize>(schema_name: &str, sentinel: &T) {
         let openapi_path = format!(
             "{}/../../openapi/voicelayerd.v1.yaml",
             env!("CARGO_MANIFEST_DIR"),
@@ -523,17 +549,63 @@ mod tests {
         let contents =
             std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
 
-        // Restrict the substring search to the WorkerHealthSummary component
-        // slice. Generic property names such as `status`, `command`, and
-        // `message` also appear under other schemas at the same indent, so an
-        // unscoped match would silently pass even after a genuine deletion
-        // inside WorkerHealthSummary. Walking line-by-line lets us terminate
-        // at the next top-level schema heading (exactly 4-space indent)
-        // instead of the first 6/8-space sub-property.
+        let section = isolate_schema_section(&contents, schema_name);
+        assert!(
+            !section.is_empty(),
+            "schema component {schema_name} not found in openapi file",
+        );
+
+        let value = serde_json::to_value(sentinel)
+            .unwrap_or_else(|err| panic!("{schema_name} sentinel must serialise: {err}"));
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} sentinel must serialise to a JSON object"));
+
+        // 1. Property presence.
+        for field in object.keys() {
+            let needle = format!("        {field}:");
+            assert!(
+                section.contains(&needle),
+                "openapi {schema_name} schema is missing `{field}` \
+                 (looked for `{needle}` inside the component). \
+                 Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
+            );
+        }
+
+        // 2. Required-list cross-check.
+        let required_set = parse_required_set(&section);
+        for (field, field_value) in object {
+            let is_option = field_value.is_null();
+            let listed = required_set.contains(field.as_str());
+            match (is_option, listed) {
+                (false, false) => panic!(
+                    "openapi {schema_name} required list is missing `{field}`; \
+                     the Rust field is non-Option so it always serialises — the schema \
+                     must list it under required.",
+                ),
+                (true, true) => panic!(
+                    "openapi {schema_name} required list contains `{field}`, but \
+                     the Rust field is Option<_> and may legitimately be absent. Drop it \
+                     from required (or change the Rust side to a non-Option type).",
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// Walk the openapi YAML line-by-line and return the slice that
+    /// belongs to `components.schemas.<schema_name>`. Generic property
+    /// names (`status`, `command`, `message`) also appear under other
+    /// schemas, so an unscoped substring search would silently pass
+    /// after a genuine deletion. The walker terminates at the next
+    /// exactly-4-space heading line (the indent that distinguishes a
+    /// new component from a sub-property at 6/8/10 spaces).
+    fn isolate_schema_section(contents: &str, schema_name: &str) -> String {
+        let heading = format!("    {schema_name}:");
         let mut section = String::new();
         let mut collecting = false;
         for line in contents.lines() {
-            if line == "    WorkerHealthSummary:" {
+            if line == heading {
                 collecting = true;
             } else if collecting
                 && line.starts_with("    ")
@@ -547,16 +619,55 @@ mod tests {
                 section.push('\n');
             }
         }
-        assert!(
-            !section.is_empty(),
-            "WorkerHealthSummary component not found in openapi file",
-        );
+        section
+    }
 
-        // Derive field names from the Rust struct so the guard self-updates
-        // with renames. Adding a pub field forces a compile error here until
-        // the sentinel is extended, and serde's default snake_case naming
-        // matches the openapi property names verbatim.
-        let sentinel = WorkerHealthSummary {
+    /// Parse the schema's `required:` list out of the isolated section,
+    /// supporting both block and inline forms. Block form wins when
+    /// both forms appear (which should never happen in a well-formed
+    /// schema). An empty set is returned when no required list is
+    /// declared — callers treat that as "no fields are required".
+    fn parse_required_set(section: &str) -> std::collections::BTreeSet<String> {
+        let mut block: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut in_block = false;
+        for line in section.lines() {
+            if line == "      required:" {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if let Some(name) = line.strip_prefix("        - ") {
+                    block.insert(name.trim().to_owned());
+                } else {
+                    in_block = false;
+                }
+            }
+        }
+        if !block.is_empty() {
+            return block;
+        }
+
+        // Inline form: scan for `required: [a, b, c]` at the schema's
+        // own indent level (six spaces) so nested oneOf branches don't
+        // bleed into the outer schema's required list.
+        let mut inline: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in section.lines() {
+            if let Some(rest) = line.strip_prefix("      required: [") {
+                let rest = rest.trim_end_matches(']');
+                for entry in rest.split(',') {
+                    let name = entry.trim();
+                    if !name.is_empty() {
+                        inline.insert(name.to_owned());
+                    }
+                }
+                break;
+            }
+        }
+        inline
+    }
+
+    fn worker_health_summary_sentinel() -> WorkerHealthSummary {
+        WorkerHealthSummary {
             status: String::new(),
             command: String::new(),
             asr_configured: false,
@@ -574,62 +685,102 @@ mod tests {
             global_shortcuts_portal_version: None,
             global_shortcuts_portal_error: None,
             message: None,
-        };
-        let value = serde_json::to_value(&sentinel)
-            .expect("WorkerHealthSummary serializes to JSON without error");
-        let object = value
-            .as_object()
-            .expect("WorkerHealthSummary serializes to a JSON object");
-
-        for field in object.keys() {
-            let needle = format!("        {field}:");
-            assert!(
-                section.contains(&needle),
-                "openapi WorkerHealthSummary schema is missing `{field}` \
-                 (looked for `{needle}` inside the component). \
-                 Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
-            );
         }
+    }
 
-        // Cross-check the `required` list: every non-Option Rust field must
-        // appear under required, and every Option field must not. `None`
-        // serialises as JSON `null`, so the serialized value's nullness
-        // identifies Rust-side optionality without any type reflection. If
-        // required shifts to inline form (`required: [a, b]`) the scan below
-        // breaks — the header assertion calls that out loudly.
-        let required_header = section
-            .lines()
-            .find(|line| line.trim_start().starts_with("required:"))
-            .expect("WorkerHealthSummary declares a required list");
-        assert_eq!(
-            required_header, "      required:",
-            "required list must stay in YAML block form so the scan can parse it \
-             (found {required_header:?})",
+    fn capture_session_sentinel() -> CaptureSession {
+        CaptureSession {
+            session_id: Uuid::nil(),
+            mode: SessionMode::Dictation,
+            state: SessionState::Idle,
+            trigger: TriggerKind::Cli,
+            language_profile: LanguageProfile::default(),
+            created_at_millis: 0,
+        }
+    }
+
+    fn preview_artifact_sentinel() -> PreviewArtifact {
+        PreviewArtifact {
+            artifact_id: Uuid::nil(),
+            status: PreviewStatus::Ready,
+            title: String::new(),
+            generated_text: None,
+            notes: Vec::new(),
+        }
+    }
+
+    fn transcription_result_sentinel() -> TranscriptionResult {
+        TranscriptionResult {
+            text: String::new(),
+            detected_language: None,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn openapi_worker_health_summary_documents_every_field() {
+        assert_openapi_documents_every_field(
+            "WorkerHealthSummary",
+            &worker_health_summary_sentinel(),
         );
-        let required_set: std::collections::BTreeSet<&str> = section
-            .lines()
-            .skip_while(|line| *line != "      required:")
-            .skip(1)
-            .map_while(|line| line.strip_prefix("        - "))
-            .map(str::trim)
-            .collect();
+    }
 
-        for (field, field_value) in object {
-            let is_option = field_value.is_null();
-            let listed = required_set.contains(field.as_str());
-            match (is_option, listed) {
-                (false, false) => panic!(
-                    "openapi WorkerHealthSummary required list is missing `{field}`; \
-                     the Rust field is non-Option so it always serialises — the schema \
-                     must list it under required."
-                ),
-                (true, true) => panic!(
-                    "openapi WorkerHealthSummary required list contains `{field}`, but \
-                     the Rust field is Option<_> and may legitimately be absent. Drop it \
-                     from required (or change the Rust side to a non-Option type)."
-                ),
-                _ => {}
-            }
-        }
+    #[test]
+    fn openapi_health_response_documents_every_field() {
+        let sentinel = HealthResponse {
+            status: String::new(),
+            socket_path: String::new(),
+            version: String::new(),
+            worker: worker_health_summary_sentinel(),
+        };
+        assert_openapi_documents_every_field("HealthResponse", &sentinel);
+    }
+
+    #[test]
+    fn openapi_capture_session_documents_every_field() {
+        assert_openapi_documents_every_field("CaptureSession", &capture_session_sentinel());
+    }
+
+    #[test]
+    fn openapi_preview_artifact_documents_every_field() {
+        assert_openapi_documents_every_field("PreviewArtifact", &preview_artifact_sentinel());
+    }
+
+    #[test]
+    fn openapi_composition_receipt_documents_every_field() {
+        let sentinel = CompositionReceipt {
+            job_id: Uuid::nil(),
+            preview: preview_artifact_sentinel(),
+        };
+        assert_openapi_documents_every_field("CompositionReceipt", &sentinel);
+    }
+
+    #[test]
+    fn openapi_injection_plan_documents_every_field() {
+        let sentinel = InjectionPlan {
+            target: InjectTarget::GuiAccessible,
+            payload: String::new(),
+            auto_submit: false,
+        };
+        assert_openapi_documents_every_field("InjectionPlan", &sentinel);
+    }
+
+    #[test]
+    fn openapi_transcription_result_documents_every_field() {
+        assert_openapi_documents_every_field(
+            "TranscriptionResult",
+            &transcription_result_sentinel(),
+        );
+    }
+
+    #[test]
+    fn openapi_dictation_capture_result_documents_every_field() {
+        let sentinel = DictationCaptureResult {
+            session: capture_session_sentinel(),
+            transcription: transcription_result_sentinel(),
+            audio_file: None,
+            failure_kind: None,
+        };
+        assert_openapi_documents_every_field("DictationCaptureResult", &sentinel);
     }
 }
