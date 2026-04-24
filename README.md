@@ -24,44 +24,57 @@ VoiceLayer is not designed as:
 - `crates/voicelayer-core`: shared domain types and injection planning
 - `crates/voicelayerd`: Unix-socket daemon and `/v1` control API
 - `crates/vl`: CLI/TUI entry point and operator tooling
+- `crates/vl-desktop`: interactive GUI shell that talks to the daemon over the same socket
 - `python/voicelayer_orchestrator`: JSON-RPC worker protocol and provider orchestration entry point
+- `systemd/`: user-service templates for the daemon and the optional persistent `whisper-server`
+- `scripts/install.sh`: one-shot installer that builds release binaries and seeds `~/.local/bin/`, `~/.config/systemd/user/`, and `~/.config/voicelayer/`
 - `docs/`: architecture, host strategy, and operations documentation
 - `openapi/`: local API contract
 
 ## Current Status
 
-This repository currently provides the foundation layer:
+Shipped today:
 
-- Rust workspace scaffolding
-- Local daemon API skeleton over a Unix domain socket
-- CLI commands for daemon startup, environment inspection, provider discovery, and terminal-safe paste rendering
-- CLI commands for daemon startup, environment inspection, provider discovery, terminal-safe paste rendering, and file-based ASR transcription
-- A daemon-side dictation capture path that records a short clip, advances session state, and returns a transcript
-- A live dictation session lifecycle in the daemon with explicit start/stop semantics
-- Python worker protocol scaffolding for future ASR, LLM, and TTS providers
-- A live Rust-to-Python stdio JSON-RPC bridge using the `uv`-managed project environment
-- A first real LLM integration path for OpenAI-compatible local endpoints such as `llama.cpp server`
-- A first real ASR integration path for `whisper.cpp` file transcription
-- Architecture and API documentation for the initial product shape
+- Rust workspace with `voicelayer-core`, `voicelayerd`, `vl`, and `vl-desktop`
+- `/v1` control API over a Unix domain socket with Server-Sent Events at `/v1/events/stream`
+- One-shot and fixed-duration segmented live dictation (`POST /v1/sessions/dictation` with `segmentation.mode = one_shot | fixed`), with per-segment `segment_recorded` / `segment_transcribed` events and a concatenated transcript on stop
+- `vl dictation foreground-ptt` alternate-screen panel with hold-to-record, transcript scrolling, clipboard restore, and tmux / WezTerm / Kitty targets
+- `vl-desktop` GUI overlay that shares the same socket, session state, and event stream as the CLI
+- Real ASR via `whisper.cpp`: one-shot `whisper-cli` plus an optional persistent `whisper-server` endpoint (with autostart) for warm-model reuse
+- Optional silero-vad pre-pass inside the Python worker that trims non-speech before whisper
+- Real LLM integration via OpenAI-compatible chat completions, with optional `llama-server` autostart for local endpoints
+- Live Rust↔Python stdio JSON-RPC bridge through the `uv`-managed project environment
+- systemd user units for `voicelayerd` and the optional `whisper-server`, plus `scripts/install.sh`
+- `vl doctor` surfaces recorder diagnostics, whisper mode (`cli` / `server` / `unconfigured`), LLM reachability, portal support, and systemd unit state
 
-Audio capture, model execution, GNOME accessibility integration, and terminal-specific adapters are documented and bounded, but not yet fully implemented in this scaffold.
+Not yet implemented (documented and scoped):
+
+- GNOME portal hotkey binding beyond availability probing
+- AT-SPI writable target discovery
+- Always-on background microphone and mid-utterance partial transcripts
+- VAD-driven segmentation boundaries at the recorder layer (fixed-duration segmentation is shipped; adaptive VAD-driven segmentation is a later stage)
+- `.deb` packaging
 
 ## Development
 
 ### Requirements
 
-- Rust 1.86+
+- Rust 1.88+
 - Python 3.12+
 - `uv` 0.11+
 - Ubuntu with PipeWire
 
-### Useful Commands
+### Verification Chain
+
+The authoritative commands every change must pass before merge (also mirrored in `CLAUDE.md`):
 
 ```bash
 cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 uv sync --group dev
-uv run python -m unittest discover -s tests/python
+uv run ruff check python tests/python
+uv run ruff format --check python tests/python
 uv run pytest -q tests/python
 ```
 
@@ -105,15 +118,19 @@ cargo run -p vl -- providers
 
 ### Configure a Local LLM Endpoint
 
-See [docs/guides/local-llm-provider.md](/home/billduke/Documents/memenow/voice-layer/docs/guides/local-llm-provider.md) for the `llama.cpp server` path and environment variables.
+See [docs/guides/local-llm-provider.md](docs/guides/local-llm-provider.md) for the `llama.cpp server` path and environment variables.
 
 ### Configure a Local ASR Provider
 
-See [docs/guides/local-asr-provider.md](/home/billduke/Documents/memenow/voice-layer/docs/guides/local-asr-provider.md) for the `whisper.cpp` file transcription path and environment variables.
+See [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md) for the `whisper.cpp` file transcription path, the optional persistent `whisper-server` deployment, and the optional silero-vad pre-pass.
 
 ### Launch the Desktop Shell
 
-See [docs/guides/desktop.md](/home/billduke/Documents/memenow/voice-layer/docs/guides/desktop.md) for `vl-desktop` usage and the two client-side environment variables (`VOICELAYER_VL_BIN`, `VOICELAYER_LOG`).
+See [docs/guides/desktop.md](docs/guides/desktop.md) for `vl-desktop` usage and the two client-side environment variables (`VOICELAYER_VL_BIN`, `VOICELAYER_LOG`).
+
+### Install as a systemd User Service
+
+See [docs/guides/systemd.md](docs/guides/systemd.md) for `scripts/install.sh`, the `voicelayerd` unit, and the optional dedicated `voicelayer-whisper-server` unit (with a Docker drop-in).
 
 ### Render a Bracketed Paste Payload
 
@@ -133,22 +150,27 @@ cargo run -p vl -- transcribe-file /path/to/sample.wav --language auto
 cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto
 ```
 
-The CLI currently prefers `pw-record` with `timeout --signal=INT` and falls back to `arecord`.
-Internally this now reuses the same daemon-side dictation capture flow that the future UI and hotkey layer will call.
+The CLI prefers `pw-record` with `timeout --signal=INT` and falls back to `arecord`.
+Internally this reuses the same daemon-side dictation capture flow the UI and hotkey layer call.
 
-The daemon now also exposes a live dictation session flow:
+The daemon exposes a live dictation session flow:
 
 - `POST /v1/sessions/dictation` starts recording
 - `POST /v1/sessions/dictation/stop` stops recording and returns the transcript
 
-The `vl` CLI now exercises that control plane directly:
+The request body's `segmentation` field selects between one-shot and fixed-duration segmented capture:
+
+- `{"mode": "one_shot"}` (default) records a single WAV from start to stop and transcribes it once.
+- `{"mode": "fixed", "segment_secs": N}` rolls the recorder every `N` seconds; each finalized chunk is transcribed in the background and the per-segment events surface on `/v1/events/stream` (`dictation.segment_recorded`, `dictation.segment_transcribed`) while stop returns the concatenated transcript.
+
+The `vl` CLI exercises that control plane directly:
 
 ```bash
 cargo run -p vl -- dictation start --backend pipewire --language auto
 cargo run -p vl -- dictation stop <session-id>
 ```
 
-`foreground-ptt` now uses an alternate-screen status panel instead of streaming JSON on each transition.
+`foreground-ptt` uses an alternate-screen status panel instead of streaming JSON on each transition.
 The panel shows:
 
 - current dictation status
@@ -159,7 +181,7 @@ The panel shows:
 - last error
 - recent events
 
-Panel controls now include:
+Panel controls:
 
 - `j` / `k` or Up / Down to scroll the full transcript view
 - `PageUp` / `PageDown` for larger transcript jumps
@@ -178,7 +200,7 @@ cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto -
 
 This writes the finished transcript to the system clipboard before any optional terminal-target injection.
 
-You can now change the default stop behavior without leaving the panel:
+You can change the default stop behavior without leaving the panel:
 
 ```bash
 cargo run -p vl -- dictation foreground-ptt \
