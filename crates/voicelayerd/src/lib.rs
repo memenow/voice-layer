@@ -346,6 +346,7 @@ async fn create_dictation_session(
                         events,
                         sessions,
                         stop_rx,
+                        start_recording_process,
                     )
                     .await;
                     let _ = result_tx.send(outcome);
@@ -835,15 +836,22 @@ async fn run_segmented_dictation_session(
     events: broadcast::Sender<EventEnvelope>,
     sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
     mut stop_rx: oneshot::Receiver<()>,
+    recorder_spawner: segmented_recording::RecorderSpawner,
 ) -> DictationCaptureResult {
     let session_id = session.session_id;
     let segment_dir = temp_audio_path().with_extension("").join("segments");
 
-    let mut recorder = match segmented_recording::SegmentedRecording::start(
+    // The production `recorder_spawner` is `start_recording_process`, which
+    // internally calls `resolve_recorder_backend` — so passing `Auto` here
+    // still resolves to pipewire/alsa at the point of subprocess spawn.
+    // Test spawners receive the same `recorder_backend` but ignore it, which
+    // is why the resolve step lives inside the spawner and not here.
+    let mut recorder = match segmented_recording::SegmentedRecording::start_with_spawner(
         &segment_dir,
         recorder_backend,
         segment_secs,
         overlap_secs,
+        recorder_spawner,
     ) {
         Ok(recorder) => recorder,
         Err(error) => {
@@ -1332,5 +1340,330 @@ mod tests {
         assert_eq!(state, SessionState::Failed);
         assert_eq!(kind, Some(DictationFailureKind::RecordingFailed));
         assert_eq!(detail.as_deref(), Some("pw-record crashed"));
+    }
+}
+
+#[cfg(test)]
+mod segmented_orchestration_tests {
+    //! Integration tests for `run_segmented_dictation_session`.
+    //!
+    //! These tests drive the orchestrator directly (not through the HTTP
+    //! layer) so they can inject a fake recorder spawner and a mock
+    //! JSON-RPC worker. Together those two doubles cover every moving
+    //! piece of the segmented dictation flow — ticker, JoinSet, stop
+    //! signal, event emission, and result stitching — without requiring
+    //! a real audio backend (pw-record / arecord) or whisper on the
+    //! host. The fake recorder follows the same
+    //! `sh -c 'sleep 0.2'` pattern as `segmented_recording.rs` (the
+    //! child exits naturally within the 5s stop-path timeout so no real
+    //! SIGINT handling is needed); the mock worker is a Python stub at
+    //! `tests/fixtures/mock_worker.py` configured via a per-test JSON
+    //! file so concurrent tests never share state.
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use tokio::{
+        process::Command,
+        sync::{RwLock, broadcast, oneshot},
+        time::{sleep, timeout},
+    };
+    use voicelayer_core::{
+        CaptureSession, DictationFailureKind, EventEnvelope, LanguageProfile, RecorderBackend,
+        SessionMode, SessionState, TriggerKind,
+    };
+
+    use super::{
+        WorkerCommand,
+        recording::{ActiveRecording, RecordingError},
+        run_segmented_dictation_session,
+    };
+
+    /// Mirrors the fake spawner in `segmented_recording.rs::tests`. It
+    /// writes a few bytes into the target WAV path so
+    /// `stop_recording_process`'s non-empty-file check passes, then
+    /// spawns a short `sh -c 'sleep 0.2'` child that exits naturally
+    /// within the stop-path timeout. The backend argument is ignored —
+    /// tests pass any variant of `RecorderBackend`.
+    fn fake_successful_spawner(
+        path: &Path,
+        backend: RecorderBackend,
+    ) -> Result<ActiveRecording, RecordingError> {
+        std::fs::write(path, b"fake-audio-bytes")?;
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2")
+            .spawn()
+            .expect("spawn fake recorder child");
+        Ok(ActiveRecording {
+            backend,
+            audio_file: path.to_path_buf(),
+            child,
+        })
+    }
+
+    /// Write `config` to a JSON file inside `dir` and return a
+    /// `WorkerCommand` that spawns `mock_worker.py` against it. Using
+    /// a per-test config file instead of an environment variable keeps
+    /// the tests safe under parallel `cargo test` execution.
+    fn mock_worker_command(dir: &Path, config: serde_json::Value) -> WorkerCommand {
+        let config_path = dir.join("mock_worker_config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("encode config"),
+        )
+        .expect("write mock worker config");
+
+        let mock_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("mock_worker.py");
+        assert!(
+            mock_script.is_file(),
+            "mock worker script must exist at {}",
+            mock_script.display(),
+        );
+
+        WorkerCommand {
+            executable: "python3".to_owned(),
+            args: vec![
+                mock_script.display().to_string(),
+                config_path.display().to_string(),
+            ],
+            project_root: dir.to_path_buf(),
+        }
+    }
+
+    fn fresh_dictation_session() -> CaptureSession {
+        CaptureSession::new(
+            SessionMode::Dictation,
+            TriggerKind::Cli,
+            LanguageProfile::default(),
+        )
+    }
+
+    /// Drain every event currently sitting in `rx` into a `Vec`. Used
+    /// after the orchestrator task has joined so nothing new can be
+    /// pushed while we collect.
+    fn drain_events(rx: &mut broadcast::Receiver<EventEnvelope>) -> Vec<EventEnvelope> {
+        let mut collected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            collected.push(event);
+        }
+        collected
+    }
+
+    fn event_types(events: &[EventEnvelope]) -> Vec<&str> {
+        events.iter().map(|e| e.event_type.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn segmented_orchestrator_stops_immediately_and_stitches_tail_segment() {
+        // segment_secs is large enough that the ticker never fires
+        // before we signal stop; the orchestrator should still reap the
+        // in-flight segment through the stop path, transcribe it once,
+        // and emit the full event sequence.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " hello"},
+                "fail_stems": [],
+            }),
+        );
+        let session = fresh_dictation_session();
+        let session_id = session.session_id;
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_segmented_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            0,
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        // Give the task a moment to spawn the first segment child so
+        // stop reaps a real in-flight recording instead of running
+        // before initialization. 50ms is comfortable on both dev and
+        // CI hardware; the fake recorder child lives 200ms so this
+        // window never overshoots.
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let events = drain_events(&mut events_rx);
+        let types = event_types(&events);
+
+        assert!(
+            types.contains(&"dictation.segment_recorded"),
+            "segment_recorded event missing; actual types: {types:?}",
+        );
+        assert!(
+            types.contains(&"dictation.segment_transcribed"),
+            "segment_transcribed event missing; actual types: {types:?}",
+        );
+        assert_eq!(
+            types.last().copied(),
+            Some("dictation.completed"),
+            "the last event must be completed; actual types: {types:?}",
+        );
+
+        assert_eq!(
+            result.session.session_id, session_id,
+            "the same session must come back",
+        );
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert_eq!(result.transcription.text, "hello");
+        assert_eq!(
+            result.transcription.detected_language.as_deref(),
+            Some("en")
+        );
+        assert_eq!(result.failure_kind, None);
+        assert_eq!(
+            result.audio_file, None,
+            "keep_audio=false must remove the segment_dir from the result",
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_orchestrator_reports_asr_failed_when_worker_errors_on_every_segment() {
+        // Mock worker fails on the tail segment's stem. The orchestrator
+        // should still complete (no recorder failure) but classify the
+        // session as ASR-failed, since the transcription channel saw an
+        // error and the recording channel did not.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": ["segment-00000"],
+            }),
+        );
+        let session = fresh_dictation_session();
+        let session_id = session.session_id;
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_segmented_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            0,
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let events = drain_events(&mut events_rx);
+        let types = event_types(&events);
+        assert_eq!(
+            types.last().copied(),
+            Some("dictation.failed"),
+            "an ASR failure must end with dictation.failed; actual types: {types:?}",
+        );
+
+        assert_eq!(result.session.session_id, session_id);
+        assert_eq!(result.session.state, SessionState::Failed);
+        assert_eq!(result.failure_kind, Some(DictationFailureKind::AsrFailed));
+        assert!(
+            result.transcription.text.is_empty(),
+            "a failing worker must not produce transcript text; got {:?}",
+            result.transcription.text,
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_orchestrator_preserves_segment_dir_when_keep_audio_is_set() {
+        // keep_audio=true must publish the segment directory path in
+        // the result rather than deleting the segment WAVs. This is
+        // the handoff contract with the operator who passed
+        // `--keep-audio` expecting to find the captured audio on disk.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " kept"},
+                "fail_stems": [],
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, _events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_segmented_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            0,
+            true,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let segment_dir = result
+            .audio_file
+            .as_deref()
+            .expect("keep_audio=true must publish the segment dir");
+        let segment_dir = Path::new(segment_dir);
+        assert!(
+            segment_dir.is_dir(),
+            "segment_dir {} must still exist when keep_audio=true",
+            segment_dir.display(),
+        );
+        let wav_path = segment_dir.join("segment-00000.wav");
+        assert!(
+            wav_path.is_file(),
+            "the tail segment wav {} must be preserved",
+            wav_path.display(),
+        );
+
+        // Clean up by hand so the tempdir drop doesn't race with the
+        // session-directory contents the fake spawner wrote.
+        let _ = std::fs::remove_dir_all(segment_dir);
     }
 }
