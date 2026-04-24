@@ -97,6 +97,13 @@ struct AppState {
     active_dictations: Arc<Mutex<HashMap<String, ActiveDictation>>>,
     events: broadcast::Sender<EventEnvelope>,
     config: DaemonConfig,
+    // Spawns the recorder subprocess for a single segment (or one-shot
+    // capture). Production wires this to `start_recording_process`,
+    // which shells out to `pw-record` / `arecord`. HTTP-level tests
+    // substitute a fake that writes a canned WAV and spawns a short-
+    // lived child, so they can exercise handler wiring without a real
+    // audio backend.
+    recorder_spawner: segmented_recording::RecorderSpawner,
 }
 
 #[derive(Debug)]
@@ -151,15 +158,35 @@ pub async fn run_daemon(config: DaemonConfig) -> std::io::Result<()> {
     }
 
     let listener = UnixListener::bind(&config.socket_path)?;
+    let state = build_app_state(config.clone(), start_recording_process);
+    let app = build_app_router(state);
+
+    info!(socket_path = %config.socket_path.display(), "starting VoiceLayer daemon");
+    axum::serve(listener, app).await
+}
+
+/// Construct the shared `AppState` with an explicit recorder spawner.
+/// Production passes `start_recording_process`; tests inject a fake
+/// that skips the real audio backend.
+fn build_app_state(
+    config: DaemonConfig,
+    recorder_spawner: segmented_recording::RecorderSpawner,
+) -> Arc<AppState> {
     let (events, _) = broadcast::channel(128);
-    let state = Arc::new(AppState {
+    Arc::new(AppState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         active_dictations: Arc::new(Mutex::new(HashMap::new())),
         events,
-        config: config.clone(),
-    });
+        config,
+        recorder_spawner,
+    })
+}
 
-    let app = Router::new()
+/// Build the axum router for the `/v1` control API. Shared by
+/// `run_daemon` (which binds it to a Unix listener) and the HTTP-level
+/// tests (which drive it in-process through `tower::ServiceExt`).
+fn build_app_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/v1/health", get(get_health))
         .route("/v1/providers", get(list_providers))
         .route("/v1/events/stream", get(stream_events))
@@ -171,10 +198,7 @@ pub async fn run_daemon(config: DaemonConfig) -> std::io::Result<()> {
         .route("/v1/transcriptions", post(create_transcription))
         .route("/v1/dictation/capture", post(capture_dictation))
         .route("/v1/inject", post(plan_injection))
-        .with_state(state);
-
-    info!(socket_path = %config.socket_path.display(), "starting VoiceLayer daemon");
-    axum::serve(listener, app).await
+        .with_state(state)
 }
 
 async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -292,11 +316,12 @@ async fn create_dictation_session(
         request.language_profile.clone().unwrap_or_default(),
     );
 
+    let recorder_spawner = state.recorder_spawner;
     let session = match request.segmentation {
         SegmentationMode::OneShot => {
             let session = transition_session_state(base_session, SessionState::Listening);
             let audio_file = temp_audio_path();
-            match start_recording_process(&audio_file, recorder_backend) {
+            match recorder_spawner(&audio_file, recorder_backend) {
                 Ok(recording) => {
                     state.active_dictations.lock().await.insert(
                         session.session_id.to_string(),
@@ -346,7 +371,7 @@ async fn create_dictation_session(
                         events,
                         sessions,
                         stop_rx,
-                        start_recording_process,
+                        recorder_spawner,
                     )
                     .await;
                     let _ = result_tx.send(outcome);
@@ -1344,43 +1369,25 @@ mod tests {
 }
 
 #[cfg(test)]
-mod segmented_orchestration_tests {
-    //! Integration tests for `run_segmented_dictation_session`.
+mod test_support {
+    //! Shared fixtures for the lib.rs integration-style tests.
     //!
-    //! These tests drive the orchestrator directly (not through the HTTP
-    //! layer) so they can inject a fake recorder spawner and a mock
-    //! JSON-RPC worker. Together those two doubles cover every moving
-    //! piece of the segmented dictation flow — ticker, JoinSet, stop
-    //! signal, event emission, and result stitching — without requiring
-    //! a real audio backend (pw-record / arecord) or whisper on the
-    //! host. The fake recorder follows the same
-    //! `sh -c 'sleep 0.2'` pattern as `segmented_recording.rs` (the
-    //! child exits naturally within the 5s stop-path timeout so no real
-    //! SIGINT handling is needed); the mock worker is a Python stub at
-    //! `tests/fixtures/mock_worker.py` configured via a per-test JSON
-    //! file so concurrent tests never share state.
-    use std::{
-        collections::HashMap,
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
-    };
+    //! The `segmented_orchestration_tests` and `http_api_tests` modules
+    //! below both need (a) a recorder spawner that sidesteps the real
+    //! audio backend and (b) a `WorkerCommand` that points at the
+    //! mock-worker Python stub. Factoring these out here keeps each
+    //! test file focused on its assertions and keeps the two fixtures
+    //! in one place — so a future change to the fake spawner or the
+    //! mock-worker contract touches a single location.
+    use std::path::{Path, PathBuf};
 
-    use tokio::{
-        process::Command,
-        sync::{RwLock, broadcast, oneshot},
-        time::{sleep, timeout},
-    };
+    use tokio::process::Command;
     use voicelayer_core::{
-        CaptureSession, DictationFailureKind, EventEnvelope, LanguageProfile, RecorderBackend,
-        SessionMode, SessionState, TriggerKind,
+        CaptureSession, LanguageProfile, RecorderBackend, SessionMode, TriggerKind,
     };
 
-    use super::{
-        WorkerCommand,
-        recording::{ActiveRecording, RecordingError},
-        run_segmented_dictation_session,
-    };
+    use super::WorkerCommand;
+    use super::recording::{ActiveRecording, RecordingError};
 
     /// Mirrors the fake spawner in `segmented_recording.rs::tests`. It
     /// writes a few bytes into the target WAV path so
@@ -1388,7 +1395,7 @@ mod segmented_orchestration_tests {
     /// spawns a short `sh -c 'sleep 0.2'` child that exits naturally
     /// within the stop-path timeout. The backend argument is ignored —
     /// tests pass any variant of `RecorderBackend`.
-    fn fake_successful_spawner(
+    pub(super) fn fake_successful_spawner(
         path: &Path,
         backend: RecorderBackend,
     ) -> Result<ActiveRecording, RecordingError> {
@@ -1409,7 +1416,7 @@ mod segmented_orchestration_tests {
     /// `WorkerCommand` that spawns `mock_worker.py` against it. Using
     /// a per-test config file instead of an environment variable keeps
     /// the tests safe under parallel `cargo test` execution.
-    fn mock_worker_command(dir: &Path, config: serde_json::Value) -> WorkerCommand {
+    pub(super) fn mock_worker_command(dir: &Path, config: serde_json::Value) -> WorkerCommand {
         let config_path = dir.join("mock_worker_config.json");
         std::fs::write(
             &config_path,
@@ -1437,13 +1444,43 @@ mod segmented_orchestration_tests {
         }
     }
 
-    fn fresh_dictation_session() -> CaptureSession {
+    pub(super) fn fresh_dictation_session() -> CaptureSession {
         CaptureSession::new(
             SessionMode::Dictation,
             TriggerKind::Cli,
             LanguageProfile::default(),
         )
     }
+}
+
+#[cfg(test)]
+mod segmented_orchestration_tests {
+    //! Integration tests for `run_segmented_dictation_session`.
+    //!
+    //! These tests drive the orchestrator directly (not through the HTTP
+    //! layer) so they can inject a fake recorder spawner and a mock
+    //! JSON-RPC worker. Together those two doubles cover every moving
+    //! piece of the segmented dictation flow — ticker, JoinSet, stop
+    //! signal, event emission, and result stitching — without requiring
+    //! a real audio backend (pw-record / arecord) or whisper on the
+    //! host. The fake recorder follows the same
+    //! `sh -c 'sleep 0.2'` pattern as `segmented_recording.rs` (the
+    //! child exits naturally within the 5s stop-path timeout so no real
+    //! SIGINT handling is needed); the mock worker is a Python stub at
+    //! `tests/fixtures/mock_worker.py` configured via a per-test JSON
+    //! file so concurrent tests never share state.
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
+    use tokio::{
+        sync::{RwLock, broadcast, oneshot},
+        time::{sleep, timeout},
+    };
+    use voicelayer_core::{DictationFailureKind, EventEnvelope, RecorderBackend, SessionState};
+
+    use super::run_segmented_dictation_session;
+    use super::test_support::{
+        fake_successful_spawner, fresh_dictation_session, mock_worker_command,
+    };
 
     /// Drain every event currently sitting in `rx` into a `Vec`. Used
     /// after the orchestrator task has joined so nothing new can be
@@ -1665,5 +1702,315 @@ mod segmented_orchestration_tests {
         // Clean up by hand so the tempdir drop doesn't race with the
         // session-directory contents the fake spawner wrote.
         let _ = std::fs::remove_dir_all(segment_dir);
+    }
+}
+
+#[cfg(test)]
+mod http_api_tests {
+    //! Integration tests for the `/v1` axum router.
+    //!
+    //! These drive the same handler stack `run_daemon` mounts onto the
+    //! Unix listener, but bypass the socket layer via
+    //! `tower::ServiceExt::oneshot`. The goal is to pin the
+    //! handler-level wiring — request deserialization, session
+    //! lifecycle through `active_dictations`, and response shape —
+    //! without re-testing the orchestration loop that
+    //! `segmented_orchestration_tests` already covers. Pieces that
+    //! need a recorder subprocess or a worker RPC reuse the shared
+    //! fakes from `test_support`.
+    use std::time::Duration;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tokio::time::sleep;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+    use voicelayer_core::{
+        CaptureSession, DictationCaptureResult, DictationFailureKind, HealthResponse,
+        RecorderBackend, SegmentationMode, SessionState, StartDictationRequest,
+        StopDictationRequest, TriggerKind,
+    };
+
+    use super::test_support::{fake_successful_spawner, mock_worker_command};
+    use super::worker::WorkerCommand;
+    use super::{DaemonConfig, build_app_router, build_app_state};
+
+    fn test_config(worker_command: WorkerCommand) -> DaemonConfig {
+        DaemonConfig {
+            socket_path: std::path::PathBuf::from("/unused-in-tests.sock"),
+            project_root: worker_command.project_root.clone(),
+            worker_command,
+            version: "test".to_owned(),
+        }
+    }
+
+    async fn post_json<R>(
+        router: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, R)
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).expect("encode body")))
+                    .expect("request build"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let parsed =
+            serde_json::from_slice(&bytes).expect("response json should deserialize as expected");
+        (status, parsed)
+    }
+
+    async fn get_json<R>(router: axum::Router, uri: &str) -> (StatusCode, R)
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request build"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let parsed =
+            serde_json::from_slice(&bytes).expect("response json should deserialize as expected");
+        (status, parsed)
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_propagates_mock_worker_summary() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let (status, body): (StatusCode, HealthResponse) = get_json(router, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.version, "test");
+        assert_eq!(
+            body.worker.asr_binary.as_deref(),
+            Some("/usr/bin/mock-whisper")
+        );
+        assert_eq!(body.worker.whisper_mode.as_deref(), Some("mock"));
+        assert!(body.worker.asr_configured);
+    }
+
+    #[tokio::test]
+    async fn providers_endpoint_includes_host_adapter_catalog() {
+        // The providers endpoint merges `default_host_adapter_catalog`
+        // with whatever the worker reports. Mock worker reports an
+        // empty list; the response must still include the three host
+        // adapters the daemon ships with.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let (status, body): (StatusCode, serde_json::Value) =
+            get_json(router, "/v1/providers").await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<&str> = body["providers"]
+            .as_array()
+            .expect("providers is a JSON array")
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"atspi_accessible_text"),
+            "response must include host adapter atspi_accessible_text; got {ids:?}",
+        );
+        assert!(
+            ids.contains(&"global_shortcuts_portal"),
+            "response must include host adapter global_shortcuts_portal; got {ids:?}",
+        );
+        assert!(
+            ids.contains(&"terminal_bracketed_paste"),
+            "response must include host adapter terminal_bracketed_paste; got {ids:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_dictation_http_roundtrip_returns_stitched_transcription() {
+        // The goal here is the wiring between the two handlers, not
+        // the orchestrator body (which `segmented_orchestration_tests`
+        // already covers). Start a session, let the orchestrator
+        // initialize the first segment, stop it, then verify the
+        // response shape: the session id round-trips, the final state
+        // is Completed, the stitched text matches what the mock worker
+        // returned, and no failure_kind is set.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " via http"},
+                "fail_stems": [],
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::Fixed {
+                segment_secs: 60,
+                overlap_secs: 0,
+            },
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session.state, SessionState::Listening);
+        let session_id = session.session_id;
+
+        // Let the tokio::spawn'd orchestrator reach `start_with_spawner`
+        // and register the in-flight segment before we signal stop.
+        // The fake recorder child lives 200ms so this window is safely
+        // bounded.
+        sleep(Duration::from_millis(50)).await;
+
+        let stop_req = StopDictationRequest { session_id };
+        let (status, result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&stop_req).expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.session.session_id, session_id);
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert_eq!(result.transcription.text, "via http");
+        assert_eq!(result.failure_kind, None);
+    }
+
+    #[tokio::test]
+    async fn segmented_dictation_start_with_zero_segment_secs_short_circuits_to_failed() {
+        // segment_secs=0 is rejected by the handler before the
+        // orchestrator is ever spawned. The response session should
+        // come back already in Failed state, and the follow-up stop
+        // call must classify the absent active dictation as a
+        // recording failure (not an ASR one).
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::Fixed {
+                segment_secs: 0,
+                overlap_secs: 0,
+            },
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            session.state,
+            SessionState::Failed,
+            "segment_secs=0 must land the session in Failed before any task spawns",
+        );
+
+        let (status, result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest {
+                session_id: session.session_id,
+            })
+            .expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            result.failure_kind,
+            Some(DictationFailureKind::RecordingFailed),
+            "a never-started session has nothing to stop and must surface as a recording failure",
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_dictation_with_unknown_session_id_returns_recording_failed() {
+        // Defensive contract: posting a stop for a session the daemon
+        // never saw must return a deterministic failure payload
+        // instead of 5xx-ing or hanging.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let unknown_id = Uuid::new_v4();
+        let (status, result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest {
+                session_id: unknown_id,
+            })
+            .expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.session.state, SessionState::Failed);
+        assert_eq!(
+            result.failure_kind,
+            Some(DictationFailureKind::RecordingFailed),
+        );
+        assert!(
+            result.transcription.text.is_empty(),
+            "no transcription text should appear on a stop-without-start",
+        );
     }
 }
