@@ -18,6 +18,7 @@ from voicelayer_orchestrator.providers import (
     provider_runtime_dir,
     supported_providers,
 )
+from voicelayer_orchestrator.providers.audio_stitch import stitch_wav_segments
 from voicelayer_orchestrator.providers.llama_autostart import ensure_llm_endpoint
 from voicelayer_orchestrator.providers.llm_openai_compatible import (
     build_compose_payload,
@@ -249,6 +250,37 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
         try:
             result = probe_audio_file(audio_file, vad_config)
+        except ProviderInvocationError as exc:
+            return make_error(
+                identifier,
+                PROVIDER_REQUEST_FAILED_CODE,
+                str(exc),
+                {"method": method},
+            )
+        return make_result(identifier, result)
+
+    if method == "stitch_wav_segments":
+        audio_files = (params or {}).get("audio_files")
+        out_file = (params or {}).get("out_file")
+        if (
+            not isinstance(audio_files, list)
+            or len(audio_files) == 0
+            or not all(isinstance(entry, str) and entry for entry in audio_files)
+            or not isinstance(out_file, str)
+            or not out_file
+        ):
+            return make_error(
+                identifier,
+                INVALID_REQUEST_CODE,
+                (
+                    "stitch_wav_segments requires params.audio_files "
+                    "(non-empty array of non-empty strings) and params.out_file (non-empty string)."
+                ),
+                {"method": method},
+            )
+
+        try:
+            result = stitch_wav_segments(audio_files, out_file)
         except ProviderInvocationError as exc:
             return make_error(
                 identifier,

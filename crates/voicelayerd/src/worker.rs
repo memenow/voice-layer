@@ -27,10 +27,13 @@ const DEFAULT_INFERENCE_TIMEOUT_SECS: u64 = 600;
 
 fn worker_call_timeout(method: &str) -> Duration {
     let seconds = match method {
-        // `segment_probe` runs silero-vad on a short (1-2 s) probe clip
-        // — always fast even on CPU — so it shares the probe budget with
+        // `segment_probe` runs silero-vad on a short (1-2 s) probe clip,
+        // and `stitch_wav_segments` is stdlib `wave` I/O over a handful
+        // of short files — both are fast and share the probe budget with
         // health/list_providers rather than the inference budget.
-        "health" | "list_providers" | "segment_probe" => DEFAULT_PROBE_TIMEOUT_SECS,
+        "health" | "list_providers" | "segment_probe" | "stitch_wav_segments" => {
+            DEFAULT_PROBE_TIMEOUT_SECS
+        }
         _ => std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -123,6 +126,16 @@ impl WorkerCommand {
         request: &voicelayer_core::SegmentProbeRequest,
     ) -> Result<voicelayer_core::SegmentProbeResult, WorkerCallError> {
         self.call("segment_probe", Some(request)).await
+    }
+
+    /// Concatenate N probe WAV files into a single output WAV. Shares the
+    /// probe timeout — stdlib `wave` I/O over a few short clips is fast
+    /// and does not warrant the inference budget.
+    pub async fn stitch_wav_segments(
+        &self,
+        request: &voicelayer_core::StitchWavSegmentsRequest,
+    ) -> Result<voicelayer_core::StitchWavSegmentsResult, WorkerCallError> {
+        self.call("stitch_wav_segments", Some(request)).await
     }
 
     async fn call<P, R>(&self, method: &str, params: Option<P>) -> Result<R, WorkerCallError>
@@ -305,6 +318,10 @@ mod tests {
         );
         assert_eq!(
             worker_call_timeout("segment_probe").as_secs(),
+            DEFAULT_PROBE_TIMEOUT_SECS,
+        );
+        assert_eq!(
+            worker_call_timeout("stitch_wav_segments").as_secs(),
             DEFAULT_PROBE_TIMEOUT_SECS,
         );
     }

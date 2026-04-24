@@ -52,6 +52,18 @@ key is absent. The payload shape mirrors
 method instead of a result, which lets tests exercise the
 ``worker_error_receipt`` branch of each handler.
 
+``segment_probe`` looks up ``params.audio_file``'s stem in
+``segment_probe_map`` and returns the configured verdict shape
+``{"has_speech": bool, "speech_ratio": float, "regions": [...], "notes": [...]}``.
+An unmapped stem falls back to ``segment_probe_default``; listing a
+stem in ``segment_probe_fail_stems`` forces a JSON-RPC error.
+
+``stitch_wav_segments`` creates the requested ``out_file`` as an empty
+file so the downstream ``transcribe`` call in the same test can look
+up its stem via ``transcribe_map``, and echoes a synthetic payload
+``{"audio_file": out_file, "segment_count": N, "duration_secs": <stub>}``.
+``stitch_should_fail=true`` swaps the result for a JSON-RPC error.
+
 ``health`` and ``list_providers`` return static payloads. Tests do not
 exercise them today, but keeping them here makes the script a drop-in
 replacement for any future probe.
@@ -133,6 +145,73 @@ def _list_providers_response(request_id: object) -> dict:
     }
 
 
+def _segment_probe_response(request_id: object, params: dict, config: dict) -> dict:
+    audio_file = str(params.get("audio_file", ""))
+    stem = pathlib.Path(audio_file).stem
+
+    fail_stems = set(config.get("segment_probe_fail_stems", []))
+    if stem in fail_stems:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32005,
+                "message": f"mock segment_probe failing for stem {stem}",
+            },
+        }
+
+    default = config.get(
+        "segment_probe_default",
+        {"has_speech": True, "speech_ratio": 1.0, "regions": [], "notes": []},
+    )
+    verdict = config.get("segment_probe_map", {}).get(stem, default)
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "has_speech": bool(verdict.get("has_speech", True)),
+            "speech_ratio": float(verdict.get("speech_ratio", 1.0)),
+            "regions": list(verdict.get("regions", [])),
+            "notes": list(verdict.get("notes", [])),
+        },
+    }
+
+
+def _stitch_wav_segments_response(request_id: object, params: dict, config: dict) -> dict:
+    if config.get("stitch_should_fail"):
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32005,
+                "message": "mock stitch_wav_segments forced failure",
+            },
+        }
+
+    out_file = str(params.get("out_file", ""))
+    audio_files = list(params.get("audio_files", []))
+    # The real helper writes a concatenated WAV. The mock just makes the
+    # path exist so the downstream transcribe call finds something; tests
+    # that care about stitched text key their transcribe_map by the
+    # output path's stem.
+    out_path = pathlib.Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.touch()
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "audio_file": out_file,
+            "segment_count": len(audio_files),
+            # Deterministic stub: 1.5 s per probe. Tests that care about
+            # the exact duration should override this through a dedicated
+            # knob if the need arises; for now only segment_count is
+            # validated on the Rust side.
+            "duration_secs": float(len(audio_files)) * 1.5,
+        },
+    }
+
+
 def _preview_response(
     request_id: object,
     method: str,
@@ -180,6 +259,10 @@ def main() -> int:
 
     if method == "transcribe":
         response = _transcribe_response(request_id, params, config)
+    elif method == "segment_probe":
+        response = _segment_probe_response(request_id, params, config)
+    elif method == "stitch_wav_segments":
+        response = _stitch_wav_segments_response(request_id, params, config)
     elif method == "compose":
         response = _preview_response(
             request_id,

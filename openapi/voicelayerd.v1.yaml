@@ -353,7 +353,12 @@ components:
         session. When omitted the daemon uses `one_shot`, which keeps the
         pre-Phase-3 behavior (a single recording across the whole session).
         `fixed` rotates the recorder every `segment_secs` seconds so each
-        chunk can be transcribed while the next segment captures.
+        chunk can be transcribed while the next segment captures. `vad_gated`
+        rotates at the shorter `probe_secs` cadence and runs a silero-vad
+        classification on every probe; speech probes accumulate into a
+        pending buffer that flushes to transcribe on the first run of
+        `silence_gap_probes` silent probes or when the buffered duration
+        reaches `max_segment_secs` (whichever comes first).
       oneOf:
         - type: object
           required: [mode]
@@ -378,6 +383,37 @@ components:
               description: |
                 Reserved for later stitching; the Phase 3B MVP accepts the
                 value but does not yet overlap consecutive segments.
+        - type: object
+          required: [mode, probe_secs, max_segment_secs]
+          properties:
+            mode:
+              type: string
+              enum: [vad_gated]
+            probe_secs:
+              type: integer
+              minimum: 1
+              description: |
+                Duration of each classification probe in whole seconds. Short
+                values (1-2 s) keep flush latency close to the speaker's
+                natural pauses; the orchestrator still pays one
+                `segment_probe` RPC per probe, so very small values trade
+                responsiveness for RPC overhead.
+            max_segment_secs:
+              type: integer
+              minimum: 1
+              description: |
+                Upper bound on the buffered speech span before a forced
+                flush, in whole seconds. Prevents an unbroken utterance from
+                accumulating indefinitely when the speaker never pauses.
+            silence_gap_probes:
+              type: integer
+              minimum: 0
+              default: 1
+              description: |
+                Number of consecutive silent probes required to flush the
+                pending speech buffer. `1` (the default) flushes on the
+                first silent probe after speech; higher values tolerate
+                brief breathing gaps inside a single speech unit.
     StopDictationRequest:
       type: object
       required: [session_id]
