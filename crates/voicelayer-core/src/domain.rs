@@ -435,6 +435,13 @@ mod tests {
     // time, so the next contributor must either document the field in
     // openapi/voicelayerd.v1.yaml or explicitly opt out by zeroing the
     // sentinel field; the serialized keys drive the openapi assertion.
+    //
+    // Known blind spot: this pattern assumes no WorkerHealthSummary field
+    // uses `#[serde(skip_serializing_if = "Option::is_none")]`. If that
+    // attribute is added, `to_value(sentinel_with_None).as_object().keys()`
+    // will drop the key and the guard silently stops covering it. Either
+    // seed the sentinel field with `Some(...)` or remove the attribute to
+    // keep coverage intact.
     #[test]
     fn openapi_worker_health_summary_documents_every_field() {
         let openapi_path = format!(
