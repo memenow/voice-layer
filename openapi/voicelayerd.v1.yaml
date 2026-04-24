@@ -276,7 +276,7 @@ components:
           type:
             - integer
             - "null"
-          format: int32
+          format: int64
           minimum: 0
         global_shortcuts_portal_error:
           description: |

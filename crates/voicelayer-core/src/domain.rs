@@ -404,7 +404,7 @@ pub fn now_epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::DictationFailureKind;
+    use super::{DictationFailureKind, WorkerHealthSummary};
 
     #[test]
     fn dictation_failure_kind_serializes_to_snake_case_variants() {
@@ -430,10 +430,11 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    // Drift guard for the /v1/health response shape. If a pub field is added
-    // to WorkerHealthSummary, document it under the WorkerHealthSummary
-    // component in openapi/voicelayerd.v1.yaml and add its name here so the
-    // contract stays in sync with the wire format daemons actually emit.
+    // Drift guard for the /v1/health response shape. Adding a pub field to
+    // WorkerHealthSummary breaks the sentinel construction below at compile
+    // time, so the next contributor must either document the field in
+    // openapi/voicelayerd.v1.yaml or explicitly opt out by zeroing the
+    // sentinel field; the serialized keys drive the openapi assertion.
     #[test]
     fn openapi_worker_health_summary_documents_every_field() {
         let openapi_path = format!(
@@ -442,31 +443,71 @@ mod tests {
         );
         let contents =
             std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
-        let fields = [
-            "status",
-            "command",
-            "asr_configured",
-            "asr_binary",
-            "asr_model_path",
-            "asr_error",
-            "whisper_mode",
-            "whisper_server_url",
-            "llm_configured",
-            "llm_model",
-            "llm_endpoint",
-            "llm_reachable",
-            "llm_error",
-            "global_shortcuts_portal_available",
-            "global_shortcuts_portal_version",
-            "global_shortcuts_portal_error",
-            "message",
-        ];
-        for field in fields {
+
+        // Restrict the substring search to the WorkerHealthSummary component
+        // slice. Generic property names such as `status`, `command`, and
+        // `message` also appear under other schemas at the same indent, so an
+        // unscoped match would silently pass even after a genuine deletion
+        // inside WorkerHealthSummary. Walking line-by-line lets us terminate
+        // at the next top-level schema heading (exactly 4-space indent)
+        // instead of the first 6/8-space sub-property.
+        let mut section = String::new();
+        let mut collecting = false;
+        for line in contents.lines() {
+            if line == "    WorkerHealthSummary:" {
+                collecting = true;
+            } else if collecting
+                && line.starts_with("    ")
+                && !line.starts_with("     ")
+                && !line.trim().is_empty()
+            {
+                break;
+            }
+            if collecting {
+                section.push_str(line);
+                section.push('\n');
+            }
+        }
+        assert!(
+            !section.is_empty(),
+            "WorkerHealthSummary component not found in openapi file",
+        );
+
+        // Derive field names from the Rust struct so the guard self-updates
+        // with renames. Adding a pub field forces a compile error here until
+        // the sentinel is extended, and serde's default snake_case naming
+        // matches the openapi property names verbatim.
+        let sentinel = WorkerHealthSummary {
+            status: String::new(),
+            command: String::new(),
+            asr_configured: false,
+            asr_binary: None,
+            asr_model_path: None,
+            asr_error: None,
+            whisper_mode: None,
+            whisper_server_url: None,
+            llm_configured: false,
+            llm_model: None,
+            llm_endpoint: None,
+            llm_reachable: false,
+            llm_error: None,
+            global_shortcuts_portal_available: false,
+            global_shortcuts_portal_version: None,
+            global_shortcuts_portal_error: None,
+            message: None,
+        };
+        let value = serde_json::to_value(&sentinel)
+            .expect("WorkerHealthSummary serializes to JSON without error");
+        let object = value
+            .as_object()
+            .expect("WorkerHealthSummary serializes to a JSON object");
+
+        for field in object.keys() {
             let needle = format!("        {field}:");
             assert!(
-                contents.contains(&needle),
+                section.contains(&needle),
                 "openapi WorkerHealthSummary schema is missing `{field}` \
-                 (looked for line `{needle}`). \
+                 (looked for `{needle}` inside the component). \
                  Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
             );
         }
