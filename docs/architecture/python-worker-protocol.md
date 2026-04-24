@@ -19,6 +19,7 @@ The Python worker boundary exists so provider-specific logic can move faster wit
 - `rewrite`
 - `translate`
 - `transcribe`
+- `segment_probe`
 
 ## Current Behavior
 
@@ -42,6 +43,15 @@ The worker implements every required method with real providers:
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.
+- `segment_probe` runs a silero-vad pass on a single WAV file (typically a
+  1–2 s probe) and returns `{has_speech, speech_ratio, regions, notes}`
+  where `regions` is a list of `{start_secs, end_secs}` speech spans.
+  Intended as the classification primitive for VAD-gated segmentation:
+  the daemon orchestrator feeds each physical probe through this method
+  and uses the response to decide whether to keep accumulating or to
+  flush the pending buffer to `transcribe`. Returns `-32004` when VAD is
+  not configured and `-32005` when silero-vad itself fails. See
+  `providers/vad_segmenter.py::probe_audio_file`.
 
 The Rust daemon and CLI invoke every method through a live stdio bridge. `health` and
 `list_providers` are exercised end-to-end in Rust integration tests; transcription, chat

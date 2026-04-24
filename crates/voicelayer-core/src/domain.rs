@@ -327,6 +327,39 @@ pub struct InjectionPlan {
     pub auto_submit: bool,
 }
 
+/// Closed speech region inside a single audio file, in seconds from the
+/// file start. Emitted by the Python worker's `segment_probe` RPC after a
+/// silero-vad pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeechRegion {
+    pub start_secs: f32,
+    pub end_secs: f32,
+}
+
+/// Request body for the Python worker's `segment_probe` JSON-RPC method.
+///
+/// `audio_file` is an absolute path to a WAV file the worker will read
+/// synchronously. Callers supply probe-sized captures (typically 1-2 s) —
+/// the worker does not itself cap the input length.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentProbeRequest {
+    pub audio_file: String,
+}
+
+/// Result of a `segment_probe` RPC. `speech_ratio` is the fraction of the
+/// input's duration that silero-vad classified as speech, in `[0.0, 1.0]`.
+/// `has_speech` is `true` iff the regions list is non-empty. `notes`
+/// carries provider-side diagnostics (e.g. a fallback explanation); it is
+/// empty on the happy path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SegmentProbeResult {
+    pub has_speech: bool,
+    pub speech_ratio: f32,
+    pub regions: Vec<SpeechRegion>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse {
     pub status: String,

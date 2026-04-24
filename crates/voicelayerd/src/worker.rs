@@ -27,7 +27,10 @@ const DEFAULT_INFERENCE_TIMEOUT_SECS: u64 = 600;
 
 fn worker_call_timeout(method: &str) -> Duration {
     let seconds = match method {
-        "health" | "list_providers" => DEFAULT_PROBE_TIMEOUT_SECS,
+        // `segment_probe` runs silero-vad on a short (1-2 s) probe clip
+        // — always fast even on CPU — so it shares the probe budget with
+        // health/list_providers rather than the inference budget.
+        "health" | "list_providers" | "segment_probe" => DEFAULT_PROBE_TIMEOUT_SECS,
         _ => std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -109,6 +112,17 @@ impl WorkerCommand {
         request: &voicelayer_core::TranscribeRequest,
     ) -> Result<TranscriptionResult, WorkerCallError> {
         self.call("transcribe", Some(request)).await
+    }
+
+    /// Run a silero-vad pass on a short WAV file to classify it as speech
+    /// or silence. Intended for the VAD-gated segmentation orchestrator;
+    /// uses the probe timeout budget because each call is a fast in-proc
+    /// ONNX inference over a 1-2 s clip.
+    pub async fn segment_probe(
+        &self,
+        request: &voicelayer_core::SegmentProbeRequest,
+    ) -> Result<voicelayer_core::SegmentProbeResult, WorkerCallError> {
+        self.call("segment_probe", Some(request)).await
     }
 
     async fn call<P, R>(&self, method: &str, params: Option<P>) -> Result<R, WorkerCallError>
@@ -267,7 +281,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCommand,
+        DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCallError, WorkerCommand,
         worker_call_timeout,
     };
 
@@ -287,6 +301,10 @@ mod tests {
         );
         assert_eq!(
             worker_call_timeout("list_providers").as_secs(),
+            DEFAULT_PROBE_TIMEOUT_SECS,
+        );
+        assert_eq!(
+            worker_call_timeout("segment_probe").as_secs(),
             DEFAULT_PROBE_TIMEOUT_SECS,
         );
     }
@@ -347,5 +365,54 @@ mod tests {
                 .iter()
                 .any(|provider| provider.id == "whisper_cpp")
         );
+    }
+
+    #[tokio::test]
+    async fn segment_probe_returns_provider_unavailable_when_vad_not_configured() {
+        // End-to-end pin for the new JSON-RPC method: with no VAD env
+        // configured, the Python worker's `load_whisper_vad_config`
+        // returns None and the dispatch surfaces PROVIDER_UNAVAILABLE
+        // (-32004).
+        //
+        // The test assumes the ambient environment does not set
+        // `VOICELAYER_WHISPER_VAD_ENABLED` — if the developer exported
+        // it for an integration run, skip the assertion rather than
+        // fight it. We intentionally do not mutate env under a mutex
+        // here: holding a sync mutex across the subprocess `.await`
+        // trips clippy's `await_holding_lock`, and any release-then-
+        // spawn pattern races with other env-touching tests anyway.
+        if std::env::var("VOICELAYER_WHISPER_VAD_ENABLED").is_ok() {
+            eprintln!(
+                "skipping segment_probe unavailable-error pin because \
+                 VOICELAYER_WHISPER_VAD_ENABLED is set in the ambient env",
+            );
+            return;
+        }
+
+        let project_root = std::env::current_dir().expect("current_dir should be available");
+        let worker = WorkerCommand::discover(project_root);
+
+        let request = voicelayer_core::SegmentProbeRequest {
+            audio_file: "/tmp/voicelayer-probe-does-not-matter.wav".to_owned(),
+        };
+        let error = worker
+            .segment_probe(&request)
+            .await
+            .expect_err("segment_probe without VAD config must error");
+
+        match error {
+            WorkerCallError::Rpc(rpc) => {
+                assert_eq!(
+                    rpc.code, -32004,
+                    "unconfigured VAD must surface PROVIDER_UNAVAILABLE; got {rpc:?}",
+                );
+                assert!(
+                    rpc.message.contains("VOICELAYER_WHISPER_VAD_ENABLED"),
+                    "error must hint at the required env var; got {}",
+                    rpc.message,
+                );
+            }
+            other => panic!("expected Rpc error from unconfigured VAD; got {other:?}"),
+        }
     }
 }

@@ -21,6 +21,7 @@ from voicelayer_orchestrator.config import (  # noqa: E402
 from voicelayer_orchestrator.providers.vad_segmenter import (  # noqa: E402
     _frames_to_regions,
     _window_size_for,
+    probe_audio_file,
 )
 
 
@@ -316,6 +317,253 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("VAD pre-pass failed", notes[0])
         self.assertIn("onnxruntime missing", notes[0])
+
+
+class _FakeSamples:
+    """Duck-typed stand-in for a numpy array so ``probe_audio_file`` can run
+    without the optional ``vad`` extra installed. The helper only touches
+    ``.size`` and ``.shape[0]``.
+    """
+
+    def __init__(self, n: int) -> None:
+        self.size = n
+        self.shape = (n,)
+
+
+class ProbeAudioFileTest(unittest.TestCase):
+    """Direct tests for ``probe_audio_file`` covering its transformation
+    layer: missing files raise, silent inputs short-circuit, region seconds
+    derive from frame indices, and ``speech_ratio`` falls in ``[0.0, 1.0]``.
+
+    Mocks the numpy-dependent I/O layer (`_load_wav_as_float32_mono`,
+    `_load_vad_session`, `_speech_probabilities`) so these tests run
+    without the ``vad`` extra, matching the pattern in
+    :class:`VadWorkerIntegrationTest` above.
+    """
+
+    FRAME_SEC = 0.032  # 512 samples at 16 kHz, matches _window_size_for(16000)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-probe-helper-"))
+
+    def test_raises_when_audio_file_missing(self) -> None:
+        from voicelayer_orchestrator.providers import ProviderInvocationError
+
+        missing = self.tmp_dir / "does-not-exist.wav"
+        with self.assertRaises(ProviderInvocationError) as ctx:
+            probe_audio_file(str(missing), _vad_config())
+        self.assertIn(str(missing), str(ctx.exception))
+
+    def test_returns_empty_result_when_sample_loader_yields_zero_samples(self) -> None:
+        # Simulate a 0-frame WAV: loader returns an empty samples array, so
+        # the helper short-circuits before any VAD inference runs.
+        from voicelayer_orchestrator.providers import vad_segmenter
+
+        audio = self.tmp_dir / "empty.wav"
+        audio.touch()
+
+        with patch.object(
+            vad_segmenter,
+            "_load_wav_as_float32_mono",
+            return_value=(_FakeSamples(0), 16000),
+        ) as loader:
+            result = probe_audio_file(str(audio), _vad_config())
+
+        loader.assert_called_once()
+        self.assertFalse(result["has_speech"])
+        self.assertEqual(result["speech_ratio"], 0.0)
+        self.assertEqual(result["regions"], [])
+        self.assertEqual(result["notes"], [])
+
+    def test_forwards_speech_regions_and_clamps_ratio(self) -> None:
+        # 16 kHz / 512 = 31.25 → 31 frames over 1.0 s.
+        # A speech block covering frames 0..14 produces one region that
+        # maps to seconds 0.0 .. 15 * FRAME_SEC.
+        from voicelayer_orchestrator.providers import vad_segmenter
+
+        audio = self.tmp_dir / "fake.wav"
+        audio.touch()
+        sample_rate = 16000
+        samples = _FakeSamples(sample_rate)  # 1.0 s at 16 kHz
+        speech_frames = [0.9] * 15 + [0.1] * 16
+
+        with (
+            patch.object(
+                vad_segmenter,
+                "_load_wav_as_float32_mono",
+                return_value=(samples, sample_rate),
+            ),
+            patch.object(vad_segmenter, "_load_vad_session", return_value=object()),
+            patch.object(vad_segmenter, "_speech_probabilities", return_value=speech_frames),
+        ):
+            config = _vad_config(
+                threshold=0.5,
+                min_speech_ms=100,
+                min_silence_ms=50,
+                speech_pad_ms=0,
+                sample_rate=sample_rate,
+            )
+            result = probe_audio_file(str(audio), config)
+
+        self.assertTrue(result["has_speech"])
+        self.assertEqual(len(result["regions"]), 1)
+        region = result["regions"][0]
+        self.assertAlmostEqual(region["start_secs"], 0.0, places=5)
+        self.assertAlmostEqual(region["end_secs"], 15 * self.FRAME_SEC, places=5)
+        # Ratio = region length / audio duration; always in [0, 1].
+        self.assertGreaterEqual(result["speech_ratio"], 0.0)
+        self.assertLessEqual(result["speech_ratio"], 1.0)
+
+    def test_clamps_ratio_when_padding_would_overshoot_duration(self) -> None:
+        # `_frames_to_regions` can emit regions whose padded end extends
+        # past the audio duration (padding is applied in frame units and
+        # not clamped to the file length). The helper must cap
+        # ``speech_ratio`` at 1.0 so callers never see a ratio > 1.
+        from voicelayer_orchestrator.providers import vad_segmenter
+
+        audio = self.tmp_dir / "fake.wav"
+        audio.touch()
+        sample_rate = 16000
+        samples = _FakeSamples(sample_rate // 4)  # 0.25 s
+
+        # Fake `_frames_to_regions` to return a single region that
+        # obviously exceeds the clip duration (end index > frame count).
+        with (
+            patch.object(
+                vad_segmenter,
+                "_load_wav_as_float32_mono",
+                return_value=(samples, sample_rate),
+            ),
+            patch.object(vad_segmenter, "_load_vad_session", return_value=object()),
+            patch.object(vad_segmenter, "_speech_probabilities", return_value=[0.9] * 8),
+            patch.object(
+                vad_segmenter,
+                "_frames_to_regions",
+                return_value=[(0, 100)],  # 100 * 32 ms = 3.2 s, audio is 0.25 s
+            ),
+        ):
+            result = probe_audio_file(str(audio), _vad_config(sample_rate=sample_rate))
+
+        self.assertTrue(result["has_speech"])
+        self.assertEqual(result["speech_ratio"], 1.0)
+
+
+class SegmentProbeDispatchTest(unittest.TestCase):
+    """Dispatch-level tests for the JSON-RPC ``segment_probe`` method.
+
+    The method is a thin wrapper around
+    :func:`vad_segmenter.probe_audio_file`; these tests pin the wire-level
+    error classification (provider-unavailable, invalid-request,
+    request-failed) and that the happy path forwards the helper's result
+    verbatim.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from voicelayer_orchestrator import worker
+
+        self.worker = worker
+        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-segment-probe-"))
+
+    def test_returns_provider_unavailable_when_vad_not_configured(self) -> None:
+        with patch.object(self.worker, "load_whisper_vad_config", return_value=None):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "segment_probe",
+                    "params": {"audio_file": "/tmp/anything.wav"},
+                }
+            )
+
+        assert response is not None
+        self.assertIn("error", response)
+        self.assertEqual(response["error"]["code"], self.worker.PROVIDER_UNAVAILABLE_CODE)
+        self.assertIn("VOICELAYER_WHISPER_VAD_ENABLED", response["error"]["message"])
+
+    def test_returns_invalid_request_when_audio_file_missing(self) -> None:
+        with patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "segment_probe",
+                    "params": {},
+                }
+            )
+
+        assert response is not None
+        self.assertEqual(response["error"]["code"], self.worker.INVALID_REQUEST_CODE)
+        self.assertIn("audio_file", response["error"]["message"])
+
+    def test_returns_invalid_request_when_audio_file_is_not_string(self) -> None:
+        with patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "segment_probe",
+                    "params": {"audio_file": 42},
+                }
+            )
+
+        assert response is not None
+        self.assertEqual(response["error"]["code"], self.worker.INVALID_REQUEST_CODE)
+
+    def test_returns_provider_request_failed_when_probe_raises(self) -> None:
+        from voicelayer_orchestrator.providers import ProviderInvocationError
+
+        with (
+            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
+            patch.object(
+                self.worker,
+                "probe_audio_file",
+                side_effect=ProviderInvocationError("probe input does not exist: /tmp/x.wav"),
+            ),
+        ):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "segment_probe",
+                    "params": {"audio_file": "/tmp/x.wav"},
+                }
+            )
+
+        assert response is not None
+        self.assertEqual(response["error"]["code"], self.worker.PROVIDER_REQUEST_FAILED_CODE)
+        self.assertIn("probe input does not exist", response["error"]["message"])
+
+    def test_forwards_probe_audio_file_result_verbatim(self) -> None:
+        probe_payload = {
+            "has_speech": True,
+            "speech_ratio": 0.63,
+            "regions": [
+                {"start_secs": 0.25, "end_secs": 0.75},
+                {"start_secs": 1.10, "end_secs": 1.40},
+            ],
+            "notes": [],
+        }
+        with (
+            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
+            patch.object(self.worker, "probe_audio_file", return_value=probe_payload) as probe,
+        ):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "segment_probe",
+                    "params": {"audio_file": "/tmp/probe.wav"},
+                }
+            )
+
+        assert response is not None
+        self.assertNotIn("error", response)
+        self.assertEqual(response["result"], probe_payload)
+        probe.assert_called_once()
+        call_args = probe.call_args
+        self.assertEqual(call_args.args[0], "/tmp/probe.wav")
 
 
 @unittest.skipUnless(

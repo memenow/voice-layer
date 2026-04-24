@@ -308,6 +308,63 @@ def apply_vad_prepass(
     return str(trimmed), regions
 
 
+def probe_audio_file(
+    audio_file: str,
+    config: WhisperVadConfig,
+) -> dict[str, Any]:
+    """Run silero-vad on ``audio_file`` and return a structured probe result.
+
+    Intended for the ``segment_probe`` JSON-RPC method that backs VAD-gated
+    segmentation: callers feed short (1-2 s) WAV clips and decide whether
+    to keep accumulating probes or flush the pending buffer to transcribe.
+
+    The return shape is the literal wire payload — the worker forwards it
+    verbatim as the RPC result:
+
+    - ``has_speech``: ``True`` iff at least one speech region was detected.
+    - ``speech_ratio``: fraction of the clip classified as speech, clamped
+      to ``[0.0, 1.0]``.
+    - ``regions``: list of ``{start_secs, end_secs}`` objects (seconds
+      from the clip start), already padded by ``config.speech_pad_ms``.
+    - ``notes``: empty on the happy path; reserved for future diagnostics
+      so the wire contract can carry non-fatal context without widening.
+
+    Raises :class:`ProviderInvocationError` when the input file is missing
+    or ONNX/numpy cannot be imported.
+    """
+
+    wav_path = Path(audio_file)
+    if not wav_path.is_file():
+        raise ProviderInvocationError(f"probe input does not exist: {audio_file}")
+
+    samples, _ = _load_wav_as_float32_mono(wav_path, config.sample_rate)
+    if samples.size == 0:
+        return {
+            "has_speech": False,
+            "speech_ratio": 0.0,
+            "regions": [],
+            "notes": [],
+        }
+
+    duration_secs = float(samples.shape[0]) / float(config.sample_rate)
+    session = _load_vad_session(config.model_path)
+    probs = _speech_probabilities(session, samples, config.sample_rate)
+    frame_sec = _window_size_for(config.sample_rate) / float(config.sample_rate)
+    frame_regions = _frames_to_regions(probs, config, frame_sec)
+    regions = [(lo * frame_sec, hi * frame_sec) for lo, hi in frame_regions]
+    total_speech = sum(end - start for start, end in regions)
+    # Guard against rounding-induced ratios above 1 (padding + hysteresis can
+    # produce a region that slightly exceeds duration_secs).
+    speech_ratio = 0.0 if duration_secs <= 0 else min(1.0, total_speech / duration_secs)
+
+    return {
+        "has_speech": len(regions) > 0,
+        "speech_ratio": speech_ratio,
+        "regions": [{"start_secs": float(start), "end_secs": float(end)} for start, end in regions],
+        "notes": [],
+    }
+
+
 def reset_session_cache() -> None:
     """Drop cached ONNX sessions (used in tests)."""
 
