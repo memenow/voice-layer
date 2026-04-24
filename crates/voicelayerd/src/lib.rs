@@ -2012,5 +2012,15 @@ mod http_api_tests {
             result.transcription.text.is_empty(),
             "no transcription text should appear on a stop-without-start",
         );
+        // Current behavior: when the requested session_id is unknown,
+        // `stop_live_dictation_with_state` fabricates a fresh default
+        // `CaptureSession` rather than echoing the caller's id. Pin that
+        // so a future change (either direction — echo the requested id
+        // or keep minting a new one) forces an explicit decision instead
+        // of silently flipping the response shape.
+        assert_ne!(
+            result.session.session_id, unknown_id,
+            "response session_id currently does not echo the request; update this assertion if the contract changes",
+        );
     }
 }
