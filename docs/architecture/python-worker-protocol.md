@@ -20,6 +20,7 @@ The Python worker boundary exists so provider-specific logic can move faster wit
 - `translate`
 - `transcribe`
 - `segment_probe`
+- `stitch_wav_segments`
 
 ## Current Behavior
 
@@ -52,6 +53,13 @@ The worker implements every required method with real providers:
   flush the pending buffer to `transcribe`. Returns `-32004` when VAD is
   not configured and `-32005` when silero-vad itself fails. See
   `providers/vad_segmenter.py::probe_audio_file`.
+- `stitch_wav_segments` concatenates a list of WAV files into a single
+  output WAV and returns `{audio_file, segment_count, duration_secs}`.
+  Used by the VAD-gated orchestrator to merge the pending speech probes
+  before handing the unit to `transcribe`. All inputs must share sample
+  rate, sample width, and channel count; mismatches raise `-32005`.
+  Invalid requests (empty `audio_files`, non-string entries, missing
+  `out_file`) return `-32600`. See `providers/audio_stitch.py`.
 
 The Rust daemon and CLI invoke every method through a live stdio bridge. `health` and
 `list_providers` are exercised end-to-end in Rust integration tests; transcription, chat
@@ -93,8 +101,12 @@ Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
 - `whisper_server.py` — HTTP client, readiness probe, optional autostart, and `/inference`
   multipart encoder for the persistent `whisper-server` path.
 - `vad_segmenter.py` — optional silero-vad pre-pass (v4 or v5 ONNX) that trims non-speech out of
-  the input WAV before transcription. Lazy-imports `numpy` and `onnxruntime` so the `vad` extra
-  stays optional.
+  the input WAV before transcription, plus `probe_audio_file` for the `segment_probe` RPC that
+  backs VAD-gated segmentation. Lazy-imports `numpy` and `onnxruntime` so the `vad` extra stays
+  optional.
+- `audio_stitch.py` — stdlib `wave`-based WAV concatenator backing the `stitch_wav_segments`
+  RPC. Rejects format mismatches between inputs so the orchestrator never silently produces a
+  malformed output WAV.
 
 Shared utilities live in `providers/__init__.py` (`ProviderInvocationError`,
 `provider_runtime_dir`, `supported_providers`). Environment-backed dataclasses and loaders live

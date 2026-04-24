@@ -30,9 +30,9 @@ use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
     DictationCaptureResult, DictationFailureKind, EventEnvelope, HealthResponse, InjectRequest,
     InjectionPlan, PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest,
-    SegmentationMode, SessionMode, SessionState, StartDictationRequest, StopDictationRequest,
-    TranscribeRequest, TranscriptionResult, TranslateRequest, WorkerHealthSummary,
-    default_host_adapter_catalog,
+    SegmentProbeRequest, SegmentProbeResult, SegmentationMode, SessionMode, SessionState,
+    StartDictationRequest, StitchWavSegmentsRequest, StopDictationRequest, TranscribeRequest,
+    TranscriptionResult, TranslateRequest, WorkerHealthSummary, default_host_adapter_catalog,
 };
 
 pub mod hotkeys;
@@ -133,6 +133,17 @@ struct SegmentRecord {
     audio_path: PathBuf,
     transcript: Option<String>,
     detected_language: Option<String>,
+}
+
+/// A single physical probe captured by the VAD-gated orchestrator.
+/// Retained after classification so probe audio files can be dedup'd
+/// across the live-loop and `recorder.stop()` paths and cleaned up on
+/// session end. Verdicts themselves flow through
+/// `dictation.probe_analyzed` events — no need to store them again here.
+#[derive(Debug)]
+struct ProbeRecord {
+    id: usize,
+    audio_path: PathBuf,
 }
 
 struct SegmentTranscribeOutcome {
@@ -381,6 +392,64 @@ async fn create_dictation_session(
                     Some(session_id),
                     format!(
                         "Segmented dictation started with segment_secs={segment_secs}, overlap_secs={overlap_secs}."
+                    ),
+                ));
+                session
+            }
+        }
+        SegmentationMode::VadGated {
+            probe_secs,
+            max_segment_secs,
+            silence_gap_probes,
+        } => {
+            // Reject obviously degenerate configs at dispatch so the
+            // session transitions cleanly to Failed without tying up the
+            // recorder. `probe_secs == 0` would deadlock the ticker;
+            // `max_segment_secs == 0` would force-flush every probe as a
+            // degenerate 1-probe unit and defeat the point of gating.
+            if probe_secs == 0 || max_segment_secs == 0 {
+                transition_session_state(base_session, SessionState::Failed)
+            } else {
+                let session = transition_session_state(base_session, SessionState::Listening);
+                let session_id = session.session_id;
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let (result_tx, result_rx) = oneshot::channel();
+                state.active_dictations.lock().await.insert(
+                    session_id.to_string(),
+                    ActiveDictation::Segmented(SegmentedActive { stop_tx, result_rx }),
+                );
+
+                let worker_command = state.config.worker_command.clone();
+                let events = state.events.clone();
+                let sessions = Arc::clone(&state.sessions);
+                let language = detected_language.clone();
+                let session_for_task = session.clone();
+                tokio::spawn(async move {
+                    let outcome = run_vad_gated_dictation_session(
+                        session_for_task,
+                        recorder_backend,
+                        probe_secs,
+                        max_segment_secs,
+                        silence_gap_probes,
+                        keep_audio,
+                        translate_to_english,
+                        language,
+                        worker_command,
+                        events,
+                        sessions,
+                        stop_rx,
+                        recorder_spawner,
+                    )
+                    .await;
+                    let _ = result_tx.send(outcome);
+                });
+                let _ = state.events.send(EventEnvelope::new(
+                    "dictation.vad_gated_started",
+                    Some(session_id),
+                    format!(
+                        "VAD-gated dictation started with probe_secs={probe_secs}, \
+                         max_segment_secs={max_segment_secs}, \
+                         silence_gap_probes={silence_gap_probes}."
                     ),
                 ));
                 session
@@ -1072,6 +1141,307 @@ async fn run_segmented_dictation_session(
     }
 }
 
+/// Orchestrate a VAD-gated dictation session: the recorder rolls short
+/// probes at `probe_secs` cadence; each finalized probe is classified by
+/// the Python worker's `segment_probe` RPC; speech probes accumulate into
+/// a pending buffer; the buffer flushes to `transcribe` on either a
+/// silence run of `silence_gap_probes` probes or when the buffer's
+/// duration would exceed `max_segment_secs`. Every flushed speech unit is
+/// transcribed in the background so stop latency stays close to the stop
+/// request's arrival.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_vad_gated_dictation_session(
+    mut session: CaptureSession,
+    recorder_backend: RecorderBackend,
+    probe_secs: u32,
+    max_segment_secs: u32,
+    silence_gap_probes: u32,
+    keep_audio: bool,
+    translate_to_english: bool,
+    language: Option<String>,
+    worker_command: worker::WorkerCommand,
+    events: broadcast::Sender<EventEnvelope>,
+    sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
+    mut stop_rx: oneshot::Receiver<()>,
+    recorder_spawner: segmented_recording::RecorderSpawner,
+) -> DictationCaptureResult {
+    let session_id = session.session_id;
+    let probe_dir = temp_audio_path().with_extension("").join("probes");
+
+    let mut recorder = match segmented_recording::SegmentedRecording::start_with_spawner(
+        &probe_dir,
+        recorder_backend,
+        probe_secs,
+        0,
+        recorder_spawner,
+    ) {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            session = transition_session_state(session, SessionState::Failed);
+            update_session_map(&sessions, session.clone()).await;
+            let _ = events.send(EventEnvelope::new(
+                "dictation.failed",
+                Some(session_id),
+                format!("VAD-gated recorder failed to start: {error}"),
+            ));
+            return DictationCaptureResult {
+                session,
+                transcription: TranscriptionResult {
+                    text: String::new(),
+                    detected_language: None,
+                    notes: vec![format!("Recording detail: {error}")],
+                },
+                audio_file: None,
+                failure_kind: Some(DictationFailureKind::RecordingFailed),
+            };
+        }
+    };
+
+    let mut probes: Vec<ProbeRecord> = Vec::new();
+    let mut pending_paths: Vec<PathBuf> = Vec::new();
+    let mut pending_ids: Vec<usize> = Vec::new();
+    let mut silent_streak: u32 = 0;
+    let mut next_unit_id: usize = 0;
+    let mut units: Vec<SegmentRecord> = Vec::new();
+    let mut transcribe_tasks: JoinSet<SegmentTranscribeOutcome> = JoinSet::new();
+
+    let mut ticker = interval(Duration::from_secs(u64::from(probe_secs)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick fires immediately; skip it so the first rotation
+    // happens after `probe_secs` of actual recording.
+    ticker.tick().await;
+
+    let mut recording_failure: Option<String> = None;
+    let mut transcription_failure: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                break;
+            }
+            _ = ticker.tick() => {
+                match recorder.finalize_current().await {
+                    Ok(Some((id, path))) => {
+                        let verdict = classify_probe(&worker_command, &path).await;
+                        emit_probe_analyzed(&events, session_id, id, &path, &verdict);
+                        probes.push(ProbeRecord {
+                            id,
+                            audio_path: path.clone(),
+                        });
+
+                        if verdict.has_speech {
+                            pending_paths.push(path);
+                            pending_ids.push(id);
+                            silent_streak = 0;
+                            let pending_secs = (pending_paths.len() as u32)
+                                .saturating_mul(probe_secs);
+                            if pending_secs >= max_segment_secs {
+                                if let Err(detail) = flush_pending_speech_probes(
+                                    &mut pending_paths,
+                                    &mut pending_ids,
+                                    &mut next_unit_id,
+                                    &mut units,
+                                    &mut transcribe_tasks,
+                                    &probe_dir,
+                                    &worker_command,
+                                    &events,
+                                    session_id,
+                                    &language,
+                                    translate_to_english,
+                                )
+                                .await
+                                {
+                                    transcription_failure.get_or_insert(detail);
+                                }
+                            }
+                        } else if !pending_paths.is_empty() {
+                            silent_streak = silent_streak.saturating_add(1);
+                            if silent_streak >= silence_gap_probes {
+                                if let Err(detail) = flush_pending_speech_probes(
+                                    &mut pending_paths,
+                                    &mut pending_ids,
+                                    &mut next_unit_id,
+                                    &mut units,
+                                    &mut transcribe_tasks,
+                                    &probe_dir,
+                                    &worker_command,
+                                    &events,
+                                    session_id,
+                                    &language,
+                                    translate_to_english,
+                                )
+                                .await
+                                {
+                                    transcription_failure.get_or_insert(detail);
+                                }
+                                silent_streak = 0;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        recording_failure = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Drain probes produced by the recorder's graceful stop.
+    let finalized_paths = match recorder.stop().await {
+        Ok(paths) => paths,
+        Err(error) => {
+            if recording_failure.is_none() {
+                recording_failure = Some(error.to_string());
+            }
+            Vec::new()
+        }
+    };
+
+    let known_ids: HashSet<usize> = probes.iter().map(|probe| probe.id).collect();
+    for (id, path) in finalized_paths {
+        if known_ids.contains(&id) {
+            continue;
+        }
+        let verdict = classify_probe(&worker_command, &path).await;
+        emit_probe_analyzed(&events, session_id, id, &path, &verdict);
+        probes.push(ProbeRecord {
+            id,
+            audio_path: path.clone(),
+        });
+        if verdict.has_speech {
+            pending_paths.push(path);
+            pending_ids.push(id);
+        }
+    }
+
+    // Final flush: any pending speech that stop arrived mid-utterance.
+    if !pending_paths.is_empty() {
+        if let Err(detail) = flush_pending_speech_probes(
+            &mut pending_paths,
+            &mut pending_ids,
+            &mut next_unit_id,
+            &mut units,
+            &mut transcribe_tasks,
+            &probe_dir,
+            &worker_command,
+            &events,
+            session_id,
+            &language,
+            translate_to_english,
+        )
+        .await
+        {
+            transcription_failure.get_or_insert(detail);
+        }
+    }
+
+    session = transition_session_state(session, SessionState::Transcribing);
+    update_session_map(&sessions, session.clone()).await;
+
+    while let Some(outcome) = transcribe_tasks.join_next().await {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => continue,
+        };
+        let unit = units.iter_mut().find(|unit| unit.id == outcome.segment_id);
+        match outcome.result {
+            Ok(result) => {
+                if let Some(unit) = unit {
+                    unit.transcript = Some(result.text.clone());
+                    unit.detected_language = result.detected_language.clone();
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                if transcription_failure.is_none() {
+                    transcription_failure = Some(detail);
+                }
+                if let Some(unit) = unit {
+                    unit.transcript = Some(String::new());
+                }
+            }
+        }
+    }
+
+    units.sort_by_key(|unit| unit.id);
+    let (combined_text, detected_language) = stitch_segment_transcripts(&units);
+
+    // `keep_audio=true` keeps every probe and every stitched unit so the
+    // operator can inspect them; otherwise clean up both sets before
+    // removing the probe directory.
+    let audio_file_summary = if keep_audio {
+        Some(probe_dir.display().to_string())
+    } else {
+        for probe in &probes {
+            let _ = std::fs::remove_file(&probe.audio_path);
+        }
+        for unit in &units {
+            // Only stitched units live at a path that isn't one of the
+            // physical probes; single-probe units share storage with the
+            // probe file and were already cleaned up above.
+            if !probes
+                .iter()
+                .any(|probe| probe.audio_path == unit.audio_path)
+            {
+                let _ = std::fs::remove_file(&unit.audio_path);
+            }
+        }
+        let _ = std::fs::remove_dir(&probe_dir);
+        None
+    };
+
+    let (final_state, failure_kind, failure_detail) =
+        classify_segmented_outcome(recording_failure, transcription_failure);
+    session = transition_session_state(session, final_state);
+    update_session_map(&sessions, session.clone()).await;
+
+    let event_type = if final_state == SessionState::Completed {
+        "dictation.completed"
+    } else {
+        "dictation.failed"
+    };
+    let event_message = if final_state == SessionState::Completed {
+        format!(
+            "VAD-gated dictation completed with {} speech unit(s) from {} probe(s).",
+            units.len(),
+            probes.len(),
+        )
+    } else {
+        format!(
+            "VAD-gated dictation failed: {}",
+            failure_detail.as_deref().unwrap_or("unspecified failure"),
+        )
+    };
+    let _ = events.send(EventEnvelope::new(
+        event_type,
+        Some(session_id),
+        event_message,
+    ));
+
+    let mut notes = vec![format!(
+        "{} speech unit(s) stitched from {} probe(s)",
+        units.len(),
+        probes.len(),
+    )];
+    if let Some(detail) = failure_detail {
+        notes.push(detail);
+    }
+
+    DictationCaptureResult {
+        session,
+        transcription: TranscriptionResult {
+            text: combined_text,
+            detected_language,
+            notes,
+        },
+        audio_file: audio_file_summary,
+        failure_kind,
+    }
+}
+
 fn emit_segment_recorded(
     events: &broadcast::Sender<EventEnvelope>,
     session_id: Uuid,
@@ -1168,6 +1538,180 @@ fn spawn_segment_transcribe(
             message,
         ));
         SegmentTranscribeOutcome { segment_id, result }
+    });
+}
+
+fn emit_probe_analyzed(
+    events: &broadcast::Sender<EventEnvelope>,
+    session_id: Uuid,
+    probe_id: usize,
+    path: &Path,
+    verdict: &SegmentProbeResult,
+) {
+    let classification = if verdict.has_speech {
+        "speech"
+    } else {
+        "silence"
+    };
+    let _ = events.send(EventEnvelope::new(
+        "dictation.probe_analyzed",
+        Some(session_id),
+        format!(
+            "Probe {probe_id} at {} classified as {classification} (ratio={:.2}).",
+            path.display(),
+            verdict.speech_ratio,
+        ),
+    ));
+}
+
+/// Call the Python worker's `segment_probe` RPC. When the RPC itself
+/// fails (VAD unconfigured, ONNX crash, etc.), fall back to a synthetic
+/// "speech" verdict so the live dictation never silently drops audio
+/// that might be speech. The synthetic note surfaces the reason so
+/// operators can see why gating stopped behaving.
+async fn classify_probe(worker_command: &worker::WorkerCommand, path: &Path) -> SegmentProbeResult {
+    let request = SegmentProbeRequest {
+        audio_file: path.display().to_string(),
+    };
+    match worker_command.segment_probe(&request).await {
+        Ok(result) => result,
+        Err(error) => SegmentProbeResult {
+            has_speech: true,
+            speech_ratio: 1.0,
+            regions: Vec::new(),
+            notes: vec![format!("segment_probe failed, treating as speech: {error}",)],
+        },
+    }
+}
+
+/// Stitch the accumulated speech probes into a single WAV (via the
+/// Python worker's `stitch_wav_segments` RPC, skipped when only one
+/// probe is pending), record the resulting speech unit, and spawn a
+/// background transcription task. Clears `pending_paths` and
+/// `pending_ids` on success and on stitch failure so the orchestrator
+/// never re-emits a flushed probe.
+#[allow(clippy::too_many_arguments)]
+async fn flush_pending_speech_probes(
+    pending_paths: &mut Vec<PathBuf>,
+    pending_ids: &mut Vec<usize>,
+    next_unit_id: &mut usize,
+    units: &mut Vec<SegmentRecord>,
+    transcribe_tasks: &mut JoinSet<SegmentTranscribeOutcome>,
+    probe_dir: &Path,
+    worker_command: &worker::WorkerCommand,
+    events: &broadcast::Sender<EventEnvelope>,
+    session_id: Uuid,
+    language: &Option<String>,
+    translate_to_english: bool,
+) -> Result<(), String> {
+    if pending_paths.is_empty() {
+        return Ok(());
+    }
+
+    let unit_id = *next_unit_id;
+    *next_unit_id += 1;
+
+    let probe_count = pending_paths.len();
+    let unit_path = if probe_count == 1 {
+        pending_paths[0].clone()
+    } else {
+        let out_file = probe_dir.join(format!("unit-{unit_id:05}.wav"));
+        let request = StitchWavSegmentsRequest {
+            audio_files: pending_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            out_file: out_file.display().to_string(),
+        };
+        match worker_command.stitch_wav_segments(&request).await {
+            Ok(result) => PathBuf::from(result.audio_file),
+            Err(error) => {
+                let detail = format!("speech unit {unit_id} stitch failed: {error}");
+                let _ = events.send(EventEnvelope::new(
+                    "dictation.speech_unit_failed",
+                    Some(session_id),
+                    detail.clone(),
+                ));
+                pending_paths.clear();
+                pending_ids.clear();
+                return Err(detail);
+            }
+        }
+    };
+
+    pending_paths.clear();
+    pending_ids.clear();
+
+    units.push(SegmentRecord {
+        id: unit_id,
+        audio_path: unit_path.clone(),
+        transcript: None,
+        detected_language: None,
+    });
+
+    let _ = events.send(EventEnvelope::new(
+        "dictation.speech_unit_flushed",
+        Some(session_id),
+        format!(
+            "Speech unit {unit_id} flushed ({probe_count} probe{}).",
+            if probe_count == 1 { "" } else { "s" },
+        ),
+    ));
+
+    spawn_speech_unit_transcribe(
+        transcribe_tasks,
+        worker_command.clone(),
+        events.clone(),
+        session_id,
+        unit_id,
+        unit_path,
+        language.clone(),
+        translate_to_english,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_speech_unit_transcribe(
+    transcribe_tasks: &mut JoinSet<SegmentTranscribeOutcome>,
+    worker_command: worker::WorkerCommand,
+    events: broadcast::Sender<EventEnvelope>,
+    session_id: Uuid,
+    unit_id: usize,
+    audio_path: PathBuf,
+    language: Option<String>,
+    translate_to_english: bool,
+) {
+    transcribe_tasks.spawn(async move {
+        let request = TranscribeRequest {
+            audio_file: audio_path.display().to_string(),
+            language,
+            translate_to_english,
+        };
+        let result = worker_command.transcribe(&request).await;
+        let message = match &result {
+            Ok(result) => {
+                if result.text.trim().is_empty() {
+                    format!("Speech unit {unit_id} transcribed with empty text.")
+                } else {
+                    format!(
+                        "Speech unit {unit_id} transcribed ({} chars).",
+                        result.text.len(),
+                    )
+                }
+            }
+            Err(error) => format!("Speech unit {unit_id} transcription failed: {error}"),
+        };
+        let _ = events.send(EventEnvelope::new(
+            "dictation.speech_unit_transcribed",
+            Some(session_id),
+            message,
+        ));
+        SegmentTranscribeOutcome {
+            segment_id: unit_id,
+            result,
+        }
     });
 }
 
@@ -1478,6 +2022,7 @@ mod segmented_orchestration_tests {
     use voicelayer_core::{DictationFailureKind, EventEnvelope, RecorderBackend, SessionState};
 
     use super::run_segmented_dictation_session;
+    use super::run_vad_gated_dictation_session;
     use super::test_support::{
         fake_successful_spawner, fresh_dictation_session, mock_worker_command,
     };
@@ -1702,6 +2247,224 @@ mod segmented_orchestration_tests {
         // Clean up by hand so the tempdir drop doesn't race with the
         // session-directory contents the fake spawner wrote.
         let _ = std::fs::remove_dir_all(segment_dir);
+    }
+
+    #[tokio::test]
+    async fn vad_gated_orchestrator_stops_immediately_and_flushes_tail_probe_as_speech() {
+        // Mirrors the segmented stop-immediately test but for VAD-gated
+        // mode. `probe_secs` is large enough that the tick loop never
+        // fires; the stop path runs `recorder.stop()` which returns the
+        // in-flight probe (`segment-00000`), and the orchestrator
+        // classifies + flushes it as a one-probe speech unit.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " tail probe text"},
+                "segment_probe_default": {
+                    "has_speech": true,
+                    "speech_ratio": 0.9,
+                    "regions": [],
+                    "notes": [],
+                },
+            }),
+        );
+        let session = fresh_dictation_session();
+        let session_id = session.session_id;
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,  // probe_secs — ticker never fires before stop
+            120, // max_segment_secs
+            1,   // silence_gap_probes
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let events = drain_events(&mut events_rx);
+        let types = event_types(&events);
+
+        assert!(
+            types.contains(&"dictation.probe_analyzed"),
+            "probe_analyzed event missing; actual types: {types:?}",
+        );
+        assert!(
+            types.contains(&"dictation.speech_unit_flushed"),
+            "speech_unit_flushed event missing; actual types: {types:?}",
+        );
+        assert!(
+            types.contains(&"dictation.speech_unit_transcribed"),
+            "speech_unit_transcribed event missing; actual types: {types:?}",
+        );
+        assert_eq!(
+            types.last().copied(),
+            Some("dictation.completed"),
+            "the last event must be completed; actual types: {types:?}",
+        );
+
+        assert_eq!(result.session.session_id, session_id);
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert_eq!(result.transcription.text, "tail probe text");
+        assert_eq!(
+            result.transcription.detected_language.as_deref(),
+            Some("en")
+        );
+        assert!(result.failure_kind.is_none());
+    }
+
+    #[tokio::test]
+    async fn vad_gated_orchestrator_treats_silent_tail_probe_as_no_flush() {
+        // The same shape as above but the tail probe is classified as
+        // silence. Nothing enters the pending buffer, no speech unit is
+        // flushed, and the session still completes with an empty
+        // transcript (zero flushed units is a legitimate outcome, not a
+        // failure).
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " never read"},
+                "segment_probe_default": {
+                    "has_speech": false,
+                    "speech_ratio": 0.0,
+                    "regions": [],
+                    "notes": [],
+                },
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            120,
+            1,
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let events = drain_events(&mut events_rx);
+        let types = event_types(&events);
+
+        assert!(
+            types.contains(&"dictation.probe_analyzed"),
+            "probe_analyzed event missing; actual types: {types:?}",
+        );
+        assert!(
+            !types.contains(&"dictation.speech_unit_flushed"),
+            "silent probe must not trigger a flush; actual types: {types:?}",
+        );
+        assert!(
+            !types.contains(&"dictation.speech_unit_transcribed"),
+            "no flush means no transcribe event; actual types: {types:?}",
+        );
+        assert_eq!(
+            types.last().copied(),
+            Some("dictation.completed"),
+            "silence-only dictation still completes cleanly; actual types: {types:?}",
+        );
+
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert_eq!(result.transcription.text, "");
+        assert!(result.transcription.detected_language.is_none());
+        assert!(result.failure_kind.is_none());
+    }
+
+    #[tokio::test]
+    async fn vad_gated_orchestrator_reports_asr_failed_when_transcribe_fails() {
+        // Pessimistic fallback: classify the probe as speech, then force
+        // the transcribe worker call to fail. The orchestrator must
+        // record `AsrFailed` and surface the failure detail without
+        // hanging.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "fail_stems": ["segment-00000"],
+                "segment_probe_default": {
+                    "has_speech": true,
+                    "speech_ratio": 1.0,
+                    "regions": [],
+                    "notes": [],
+                },
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, _events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            120,
+            1,
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        assert_eq!(result.session.state, SessionState::Failed);
+        assert_eq!(result.failure_kind, Some(DictationFailureKind::AsrFailed));
+        assert!(
+            result
+                .transcription
+                .notes
+                .iter()
+                .any(|note| note.contains("segment-00000") || note.contains("mock worker")),
+            "failure detail must mention the failing stem; got {:?}",
+            result.transcription.notes,
+        );
     }
 }
 
@@ -2049,6 +2812,119 @@ mod http_api_tests {
             result.failure_kind,
             Some(DictationFailureKind::RecordingFailed),
             "a never-started session has nothing to stop and must surface as a recording failure",
+        );
+    }
+
+    #[tokio::test]
+    async fn vad_gated_dictation_http_roundtrip_returns_speech_unit_transcription() {
+        // Mirrors `segmented_dictation_http_roundtrip_returns_stitched_transcription`
+        // but for the VAD-gated mode: start a session with `probe_secs`
+        // large enough that the tick loop never fires, let the
+        // orchestrator boot the first probe, stop it, and verify the
+        // tail probe is classified as speech, flushed as a single
+        // speech unit, and transcribed through to the HTTP response.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " vad gated http"},
+                "segment_probe_default": {
+                    "has_speech": true,
+                    "speech_ratio": 0.85,
+                    "regions": [],
+                    "notes": [],
+                },
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::VadGated {
+                probe_secs: 60,
+                max_segment_secs: 120,
+                silence_gap_probes: 1,
+            },
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session.state, SessionState::Listening);
+        let session_id = session.session_id;
+
+        sleep(Duration::from_millis(50)).await;
+
+        let (status, result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest { session_id }).expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.session.session_id, session_id);
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert_eq!(result.transcription.text, "vad gated http");
+        assert_eq!(result.failure_kind, None);
+    }
+
+    #[tokio::test]
+    async fn vad_gated_dictation_start_with_zero_probe_secs_short_circuits_to_failed() {
+        // `probe_secs == 0` is rejected at dispatch: the ticker would
+        // spin forever. The session returns already in Failed state and
+        // the follow-up stop classifies the missing active dictation as
+        // a recording failure — mirroring the `segment_secs == 0` pin
+        // for Fixed mode.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::VadGated {
+                probe_secs: 0,
+                max_segment_secs: 60,
+                silence_gap_probes: 1,
+            },
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session.state, SessionState::Failed);
+
+        let (status, result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest {
+                session_id: session.session_id,
+            })
+            .expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            result.failure_kind,
+            Some(DictationFailureKind::RecordingFailed),
         );
     }
 

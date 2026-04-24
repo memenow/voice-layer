@@ -158,6 +158,24 @@ pub enum SegmentationMode {
         #[serde(default)]
         overlap_secs: u32,
     },
+    /// VAD-gated segmentation. The recorder rolls every `probe_secs`
+    /// seconds; each probe is classified by the Python worker's
+    /// `segment_probe` RPC. The orchestrator accumulates speech probes
+    /// into a pending buffer and flushes them as one logical speech unit
+    /// on the first run of `silence_gap_probes` silent probes or when the
+    /// buffered duration reaches `max_segment_secs` (whichever comes
+    /// first). Flushed units are transcribed in the background, exactly
+    /// as in `Fixed` mode.
+    VadGated {
+        probe_secs: u32,
+        max_segment_secs: u32,
+        #[serde(default = "default_silence_gap_probes")]
+        silence_gap_probes: u32,
+    },
+}
+
+fn default_silence_gap_probes() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -358,6 +376,27 @@ pub struct SegmentProbeResult {
     pub regions: Vec<SpeechRegion>,
     #[serde(default)]
     pub notes: Vec<String>,
+}
+
+/// Request body for the Python worker's `stitch_wav_segments` RPC.
+/// Concatenates N probe WAV files written by the same recorder (same
+/// sample rate, bit depth, channel count) into a single output WAV. The
+/// daemon orchestrator uses it to assemble a VAD-gated speech unit from
+/// pending probes before handing the merged path to `transcribe`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StitchWavSegmentsRequest {
+    pub audio_files: Vec<String>,
+    pub out_file: String,
+}
+
+/// Result of a `stitch_wav_segments` RPC. Echoes the output path (so
+/// callers need not remember it) along with the count of inputs merged
+/// and the resulting duration for logging/diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StitchWavSegmentsResult {
+    pub audio_file: String,
+    pub segment_count: usize,
+    pub duration_secs: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
