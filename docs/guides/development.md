@@ -4,19 +4,30 @@
 
 - `crates/voicelayer-core`: shared domain and contracts
 - `crates/voicelayerd`: daemon and local HTTP API over a Unix domain socket
-- `crates/vl`: operator CLI and future TUI entry point
-- `python/voicelayer_orchestrator`: worker protocol and provider runtime
+- `crates/vl`: operator CLI and TUI entry point
+- `crates/vl-desktop`: interactive GUI shell that shares the daemon socket
+- `python/voicelayer_orchestrator`: worker protocol and provider runtime (`providers/` holds one file per provider surface — whisper-cli, whisper-server, silero-vad, llama autostart, OpenAI-compatible LLM)
 - `openapi/`: local API contract
-- `systemd/`: user service templates
+- `systemd/`: user service templates for the daemon and the optional persistent `whisper-server`
+- `scripts/`: installer, whisper-server wrapper, and cold-start benchmark helpers
 
-## Local Commands
+## Verification Chain
+
+The authoritative list every change must pass before merge (also mirrored in `README.md` and `CLAUDE.md`):
 
 ```bash
 cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 uv sync --group dev
-uv run python -m unittest discover -s tests/python
+uv run ruff check python tests/python
+uv run ruff format --check python tests/python
 uv run pytest -q tests/python
+```
+
+## Useful Runtime Commands
+
+```bash
 cargo run -p vl -- providers
 cargo run -p vl -- preview compose "Write a concise technical summary."
 cargo run -p vl -- transcribe-file /path/to/sample.wav --language auto
@@ -25,6 +36,7 @@ cargo run -p vl -- dictation start --backend pipewire --language auto
 cargo run -p vl -- dictation stop <session-id>
 cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto
 cargo run -p vl -- hotkeys portal-status
+cargo run -p vl-desktop
 ```
 
 ## Daemon Socket
@@ -46,22 +58,21 @@ For source-based development, start the daemon from the repository root or pass:
 cargo run -p vl -- daemon run --project-root "$(pwd)"
 ```
 
-If you want a real composition provider instead of the current `needs_provider` fallback, configure `VOICELAYER_LLM_ENDPOINT` and `VOICELAYER_LLM_MODEL` as described in `docs/guides/local-llm-provider.md`.
+For real composition / rewrite / translation, configure `VOICELAYER_LLM_ENDPOINT` and `VOICELAYER_LLM_MODEL` as described in `docs/guides/local-llm-provider.md`. When the endpoint is unset or unreachable, the worker returns a `provider-unavailable` JSON-RPC error instead of fabricating output.
 If you also set `VOICELAYER_LLM_AUTO_START=true`, VoiceLayer can auto-launch `llama-server` for a local endpoint.
-For file-based ASR, configure `VOICELAYER_WHISPER_BIN` and `VOICELAYER_WHISPER_MODEL_PATH` as described in `docs/guides/local-asr-provider.md`.
+For file-based ASR, configure `VOICELAYER_WHISPER_BIN` and `VOICELAYER_WHISPER_MODEL_PATH` as described in `docs/guides/local-asr-provider.md`. For warm-model reuse across transcribe calls, point at a persistent `VOICELAYER_WHISPER_SERVER_*` endpoint (see the same guide).
 
 ## Operational Notes
 
-- The current scaffold exposes a stable local API shape before provider wiring is complete.
-- Generation and transcription requests already cross the Rust/Python process boundary. `compose`, `rewrite`, and `translate` can now call a configured OpenAI-compatible endpoint; they still return provider-unavailable until that endpoint is configured.
-- `transcribe` can now invoke `whisper-cli` for local file transcription when `VOICELAYER_WHISPER_MODEL_PATH` is configured.
-- `vl record-transcribe` records a short WAV clip with `pw-record` or `arecord`, then passes the file into the same `whisper-cli` transcription path.
-- `voicelayerd` now exposes a daemon-side dictation capture path at `/v1/dictation/capture`, which advances session state from `listening` to `transcribing` to `completed` or `failed`.
-- `voicelayerd` also exposes a live dictation session flow at `/v1/sessions/dictation` and `/v1/sessions/dictation/stop` for future push-to-talk integrations.
-- `vl dictation start/stop` now uses the daemon UDS client instead of calling capture helpers directly, so the CLI exercises the same control plane that future hotkey/UI integrations will use.
+- The daemon exposes a `/v1` API over a Unix domain socket with Server-Sent Events at `/v1/events/stream`. Every handler is covered by in-process integration tests under `crates/voicelayerd/src/lib.rs`'s `#[cfg(test)]` modules (`http_api_tests`, `sse_stream_tests`, `segmented_orchestration_tests`).
+- `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion endpoint through the Python worker's `providers/llm_openai_compatible.py`. When no endpoint is configured they surface JSON-RPC `-32004` (provider unavailable); when the endpoint fails they surface `-32005` (provider request failed).
+- `transcribe` prefers a persistent `whisper-server` endpoint (see `providers/whisper_server.py`) and falls back to one-shot `whisper-cli` (`providers/whisper_cli.py`). When `VOICELAYER_WHISPER_VAD_ENABLED=true` with a valid silero-vad ONNX model, a pre-pass in `providers/vad_segmenter.py` trims non-speech before whisper — failure downgrades to the raw WAV without losing the request.
+- `vl record-transcribe` records a short WAV clip with `pw-record` or `arecord`, then reuses the daemon's one-shot capture path into the same transcription flow.
+- `voicelayerd` serves the daemon-side one-shot capture path at `/v1/dictation/capture`, which advances session state from `listening` to `transcribing` to `completed` or `failed`, setting `DictationFailureKind` on the unhappy paths.
+- `voicelayerd` also serves live dictation sessions at `/v1/sessions/dictation` (start) and `/v1/sessions/dictation/stop`. `StartDictationRequest.segmentation` selects between `{"mode": "one_shot"}` and `{"mode": "fixed", "segment_secs": N, "overlap_secs": 0}`. In the segmented mode the recorder rolls every `N` seconds, each chunk is transcribed in the background, and per-segment events (`dictation.segment_recorded`, `dictation.segment_transcribed`) stream on `/v1/events/stream` alongside the lifecycle events.
+- `vl dictation start/stop` uses the daemon UDS client, so the CLI exercises the same control plane hotkey and UI integrations use.
 - `vl dictation foreground-ptt` provides a terminal-local fallback for push-to-talk. It enables raw mode and keyboard enhancement flags; if the terminal reports release events it behaves like hold-to-record, otherwise it falls back to press-to-start / press-again-to-stop.
-- `vl dictation foreground-ptt` now renders an alternate-screen status panel with session visibility, transcript preview, recent events, last injection result, and last error, instead of printing full JSON after every stop.
-- The alternate-screen panel now preserves the full last transcript for scrolling review and supports `j/k`, arrow keys, and `PageUp/PageDown` for navigation. Press `c` to copy the last completed transcript to the clipboard on demand.
+- The foreground-ptt alternate-screen panel preserves the full last transcript for scrolling review and supports `j/k`, arrow keys, and `PageUp/PageDown` for navigation. Press `c` to copy the last completed transcript to the clipboard on demand.
 - Press `r` to restore the saved clipboard text backup after any clipboard overwrite performed by the panel.
 - The panel also supports lightweight result actions: `i` re-applies the last injection, `s` saves the last transcript to a timestamped file under `$XDG_STATE_HOME/voicelayer/transcripts/` (default `~/.local/state/voicelayer/transcripts/`, override with `--save-dir`), and `d` discards the last transcript from the panel state.
 - `vl dictation foreground-ptt --copy-on-stop` adds an explicit clipboard fallback using the system clipboard after each completed dictation.
@@ -76,8 +87,8 @@ For file-based ASR, configure `VOICELAYER_WHISPER_BIN` and `VOICELAYER_WHISPER_M
 - When `--tmux-target-pane` is omitted inside tmux, `vl` auto-discovers candidate panes. One candidate is auto-selected; multiple candidates trigger an interactive selection prompt before raw mode starts.
 - `vl dictation foreground-ptt --wezterm-target-pane-id <id>` and `--kitty-match <match>` provide explicit terminal-specific injection routes for WezTerm and Kitty. These do not auto-discover targets yet.
 - `vl hotkeys portal-status` probes `org.freedesktop.portal.GlobalShortcuts` through D-Bus so you can tell early whether GNOME/portal-based push-to-talk is viable on the current session.
-- `cargo run -p vl -- doctor` now reports whether the configured LLM endpoint is reachable via `/v1/models`.
-- `cargo run -p vl -- doctor` also reports whether `whisper-cli` and the configured whisper model are available.
-- If auto-start is enabled, provider runtime files are written under `$XDG_RUNTIME_DIR/voicelayer/providers`.
-- Bracketed paste rendering is implemented now because it is deterministic and safe to validate in isolation.
+- `cargo run -p vl -- doctor` reports recorder diagnostics, whisper mode (`cli` / `server` / `unconfigured`), LLM reachability, portal availability, and systemd unit state (`installed` / `active`).
+- When whisper-server or llama-server autostart is enabled, provider runtime files are written under `$XDG_RUNTIME_DIR/voicelayer/providers`.
+- `vl-desktop` is an interactive GUI shell; see `docs/guides/desktop.md` for its two client-side env vars. It shares the same daemon socket, session store, and SSE stream as the CLI.
+- To install VoiceLayer as a systemd user service, run `scripts/install.sh` (see `docs/guides/systemd.md`). The installer builds release binaries, copies units into `~/.config/systemd/user/`, and leaves the optional `voicelayer-whisper-server` unit disabled by default.
 - Python commands must run through `uv`, not the system interpreter.
