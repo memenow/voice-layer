@@ -1251,6 +1251,37 @@ mod tests {
         codes
     }
 
+    /// Walk a Cargo.toml string and pull out every quoted path inside
+    /// the `[workspace] members = [...]` array. The parser opens at
+    /// the `members = [` line and closes at the next `]` so trailing
+    /// top-level keys (`resolver`, `[workspace.package]`, etc.) do
+    /// not leak in. Each entry is the path verbatim
+    /// (e.g. `"crates/voicelayer-core"`).
+    fn extract_cargo_workspace_members(contents: &str) -> std::collections::BTreeSet<String> {
+        let mut members = std::collections::BTreeSet::new();
+        let mut in_block = false;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("members = [") {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if trimmed == "]" {
+                    break;
+                }
+                let unquoted = trimmed
+                    .trim_start_matches('"')
+                    .trim_end_matches(',')
+                    .trim_end_matches('"');
+                if !unquoted.is_empty() {
+                    members.insert(unquoted.to_owned());
+                }
+            }
+        }
+        members
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1784,6 +1815,45 @@ components:
         let md = "See ticket `-1234` and ASCII codepoint `-65`.\n";
         let codes = extract_doc_jsonrpc_error_codes(md);
         assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn extract_cargo_workspace_members_collects_quoted_paths() {
+        let toml = concat!(
+            "[workspace]\n",
+            "members = [\n",
+            "  \"crates/voicelayer-core\",\n",
+            "  \"crates/voicelayerd\",\n",
+            "  \"crates/vl\",\n",
+            "  \"crates/vl-desktop\",\n",
+            "]\n",
+            "resolver = \"2\"\n",
+        );
+        let members = extract_cargo_workspace_members(toml);
+        assert_eq!(members.len(), 4);
+        assert!(members.contains("crates/voicelayer-core"));
+        assert!(members.contains("crates/vl-desktop"));
+    }
+
+    #[test]
+    fn extract_cargo_workspace_members_stops_at_closing_bracket() {
+        // Pin scope: a key after the array close (`resolver = "2"`)
+        // must not be consumed. A future workspace key with a quoted
+        // value would otherwise drift into the members set.
+        let toml = concat!(
+            "[workspace]\n",
+            "members = [\n",
+            "  \"crates/foo\",\n",
+            "]\n",
+            "resolver = \"2\"\n",
+            "[workspace.package]\n",
+            "version = \"0.1.0\"\n",
+        );
+        let members = extract_cargo_workspace_members(toml);
+        assert_eq!(members.len(), 1);
+        assert!(members.contains("crates/foo"));
+        assert!(!members.iter().any(|m| m.starts_with('0')));
+        assert!(!members.iter().any(|m| m.starts_with('2')));
     }
 
     /// Pins both directions of the soft-list override:
@@ -2693,6 +2763,71 @@ components:
                  but no matching `_CODE = {code}` constant exists in worker.py. \
                  Either drop the mention from the doc or add the constant on the \
                  python side.",
+            );
+        }
+    }
+
+    /// Pin every `crates/*` directory against the
+    /// `[workspace] members = [...]` list in the root `Cargo.toml`.
+    /// `cargo build --workspace` already errors if a listed member
+    /// is missing on disk, so the failure mode this guard catches is
+    /// the inverse: a new crate directory committed without a
+    /// matching members entry. Such a crate compiles standalone via
+    /// `cargo build -p ...` but is silently excluded from
+    /// `cargo test --all` and the rest of the verification chain,
+    /// drifting out of CI coverage with no signal.
+    #[test]
+    fn cargo_workspace_members_match_crates_directory_listing() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml = std::fs::read_to_string(format!("{repo_root}/Cargo.toml"))
+            .expect("read root Cargo.toml");
+        let members = extract_cargo_workspace_members(&cargo_toml);
+        assert!(
+            !members.is_empty(),
+            "Cargo.toml must declare `members = [...]`; \
+             extract_cargo_workspace_members may be misparsing",
+        );
+
+        let crates_dir = std::path::PathBuf::from(format!("{repo_root}/crates"));
+        let on_disk: std::collections::BTreeSet<String> = std::fs::read_dir(&crates_dir)
+            .expect("read crates/ directory")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_dir() {
+                    let name = entry.file_name().into_string().ok()?;
+                    // Skip hidden / build artefacts (e.g. `target`)
+                    // even though `crates/` should not contain
+                    // any. The filter keeps the test robust against
+                    // future tooling that drops dotfiles.
+                    if name.starts_with('.') || name == "target" {
+                        return None;
+                    }
+                    Some(format!("crates/{name}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !on_disk.is_empty(),
+            "expected at least one crate directory under `crates/`; \
+             the test may be running from the wrong CWD",
+        );
+
+        for path in &on_disk {
+            assert!(
+                members.contains(path),
+                "crate directory `{path}` exists on disk but is not declared in \
+                 Cargo.toml `[workspace] members = [...]`. Add the entry so \
+                 `cargo test --all` and the verification chain pick it up.",
+            );
+        }
+        for path in &members {
+            assert!(
+                on_disk.contains(path),
+                "Cargo.toml lists workspace member `{path}` but the directory \
+                 does not exist on disk. Either restore the crate or drop the \
+                 entry — `cargo build --workspace` will refuse to load otherwise.",
             );
         }
     }
