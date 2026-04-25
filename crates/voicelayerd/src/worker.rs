@@ -459,6 +459,38 @@ mod tests {
         assert!(worker.timeout_override.is_none());
     }
 
+    /// Cross-check the `WORKER_MODULE` constant against the Python
+    /// source tree. The Rust daemon spawns the worker via
+    /// `python -m voicelayer_orchestrator.worker`, so the constant
+    /// must point at a real importable module *and* that module
+    /// must run a JSON-RPC loop when invoked as `__main__`. A
+    /// regression on either side — renaming the python file, or
+    /// dropping the `if __name__ == "__main__":` guard — would
+    /// silently break worker startup with no compile-time signal.
+    /// Only `cargo test` reaches both sides.
+    #[test]
+    fn worker_module_constant_resolves_to_a_python_file_with_main_entrypoint() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let module_relative = WORKER_MODULE.replace('.', "/");
+        let module_path = format!("{repo_root}/python/{module_relative}.py");
+
+        let contents = std::fs::read_to_string(&module_path).unwrap_or_else(|err| {
+            panic!(
+                "WORKER_MODULE = `{WORKER_MODULE}` does not resolve to a real \
+                 .py file at `{module_path}`. Either rename the constant or \
+                 restore the python module. Underlying error: {err}",
+            );
+        });
+
+        assert!(
+            contents.contains("if __name__ == \"__main__\":"),
+            "python module at `{module_path}` lacks an `if __name__ == \"__main__\":` \
+             entrypoint. The daemon spawns it via `python -m {WORKER_MODULE}`; \
+             without the guard the module imports cleanly but never runs \
+             `serve()`, so the JSON-RPC handshake hangs forever.",
+        );
+    }
+
     #[tokio::test]
     async fn worker_command_can_call_health() {
         let project_root = std::env::current_dir().expect("current_dir should be available");
