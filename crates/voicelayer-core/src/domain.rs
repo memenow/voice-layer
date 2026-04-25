@@ -477,12 +477,12 @@ pub fn now_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
-        DictationCaptureResult, DictationFailureKind, HealthResponse, InjectRequest, InjectTarget,
-        InjectionPlan, LanguageProfile, PreviewArtifact, PreviewStatus, RecorderBackend,
-        RewriteRequest, RewriteStyle, SegmentationMode, SessionMode, SessionState,
-        StartDictationRequest, StopDictationRequest, TranscribeRequest, TranscriptionResult,
-        TranslateRequest, TriggerKind, WorkerHealthSummary,
+        CaptureSession, ComposeRequest, CompositionArchetype, CompositionReceipt,
+        DictationCaptureRequest, DictationCaptureResult, DictationFailureKind, HealthResponse,
+        InjectRequest, InjectTarget, InjectionPlan, LanguageProfile, LanguageStrategy,
+        PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest, RewriteStyle,
+        SegmentationMode, SessionMode, SessionState, StartDictationRequest, StopDictationRequest,
+        TranscribeRequest, TranscriptionResult, TranslateRequest, TriggerKind, WorkerHealthSummary,
     };
     use uuid::Uuid;
 
@@ -1513,6 +1513,109 @@ mod tests {
         ]
     }
 
+    /// Materialise every `SessionMode` variant. Inlined under
+    /// `CaptureSession.mode`; the exhaustiveness guard keeps the wire
+    /// labels in lockstep with the openapi schema.
+    fn enumerate_session_mode_variants() -> Vec<SessionMode> {
+        let _exhaustive: fn(SessionMode) -> &'static str = |variant| match variant {
+            SessionMode::Dictation => "dictation",
+            SessionMode::Compose => "compose",
+            SessionMode::Rewrite => "rewrite",
+            SessionMode::Translate => "translate",
+        };
+        vec![
+            SessionMode::Dictation,
+            SessionMode::Compose,
+            SessionMode::Rewrite,
+            SessionMode::Translate,
+        ]
+    }
+
+    /// Materialise every `SessionState` variant. Inlined under
+    /// `CaptureSession.state`; the longest of the inline enums and
+    /// the most exposed to drift since each new session-machine
+    /// state must be added here as well as on the openapi side.
+    fn enumerate_session_state_variants() -> Vec<SessionState> {
+        let _exhaustive: fn(SessionState) -> &'static str = |variant| match variant {
+            SessionState::Idle => "idle",
+            SessionState::Listening => "listening",
+            SessionState::Transcribing => "transcribing",
+            SessionState::Previewing => "previewing",
+            SessionState::AwaitingConfirmation => "awaiting_confirmation",
+            SessionState::Completed => "completed",
+            SessionState::Failed => "failed",
+        };
+        vec![
+            SessionState::Idle,
+            SessionState::Listening,
+            SessionState::Transcribing,
+            SessionState::Previewing,
+            SessionState::AwaitingConfirmation,
+            SessionState::Completed,
+            SessionState::Failed,
+        ]
+    }
+
+    /// Materialise every `LanguageStrategy` variant. Inlined under
+    /// `LanguageProfile.strategy`. Drives `whisper-cli`'s `--language`
+    /// flag selection on the daemon side.
+    fn enumerate_language_strategy_variants() -> Vec<LanguageStrategy> {
+        let _exhaustive: fn(LanguageStrategy) -> &'static str = |variant| match variant {
+            LanguageStrategy::AutoDetect => "auto_detect",
+            LanguageStrategy::Locked => "locked",
+            LanguageStrategy::FollowPrevious => "follow_previous",
+            LanguageStrategy::Bilingual => "bilingual",
+        };
+        vec![
+            LanguageStrategy::AutoDetect,
+            LanguageStrategy::Locked,
+            LanguageStrategy::FollowPrevious,
+            LanguageStrategy::Bilingual,
+        ]
+    }
+
+    /// Materialise every `PreviewStatus` variant. Inlined under
+    /// `PreviewArtifact.status`; gates whether the UI shows the
+    /// `needs_provider` warning.
+    fn enumerate_preview_status_variants() -> Vec<PreviewStatus> {
+        let _exhaustive: fn(PreviewStatus) -> &'static str = |variant| match variant {
+            PreviewStatus::Ready => "ready",
+            PreviewStatus::NeedsProvider => "needs_provider",
+            PreviewStatus::Rejected => "rejected",
+        };
+        vec![
+            PreviewStatus::Ready,
+            PreviewStatus::NeedsProvider,
+            PreviewStatus::Rejected,
+        ]
+    }
+
+    /// Materialise every `CompositionArchetype` variant. Inlined under
+    /// `ComposeRequest.archetype`; the prompt-template registry on the
+    /// worker side keys off these labels.
+    fn enumerate_composition_archetype_variants() -> Vec<CompositionArchetype> {
+        let _exhaustive: fn(CompositionArchetype) -> &'static str = |variant| match variant {
+            CompositionArchetype::Email => "email",
+            CompositionArchetype::CoverLetter => "cover_letter",
+            CompositionArchetype::DailyReport => "daily_report",
+            CompositionArchetype::Issue => "issue",
+            CompositionArchetype::PullRequestDescription => "pull_request_description",
+            CompositionArchetype::Prompt => "prompt",
+            CompositionArchetype::TechnicalSummary => "technical_summary",
+            CompositionArchetype::Custom => "custom",
+        };
+        vec![
+            CompositionArchetype::Email,
+            CompositionArchetype::CoverLetter,
+            CompositionArchetype::DailyReport,
+            CompositionArchetype::Issue,
+            CompositionArchetype::PullRequestDescription,
+            CompositionArchetype::Prompt,
+            CompositionArchetype::TechnicalSummary,
+            CompositionArchetype::Custom,
+        ]
+    }
+
     #[test]
     fn openapi_worker_health_summary_documents_every_field() {
         assert_openapi_documents_every_field(
@@ -1782,6 +1885,55 @@ mod tests {
             "InjectionPlan",
             "target",
             &enumerate_inject_target_variants(),
+        );
+    }
+
+    // Single-occurrence inline-enum drift guards. Each rust enum is
+    // embedded under exactly one schema's properties block; pinning
+    // them caps the property-enum drift surface for the contract.
+
+    #[test]
+    fn openapi_capture_session_mode_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "CaptureSession",
+            "mode",
+            &enumerate_session_mode_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_capture_session_state_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "CaptureSession",
+            "state",
+            &enumerate_session_state_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_language_profile_strategy_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "LanguageProfile",
+            "strategy",
+            &enumerate_language_strategy_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_preview_artifact_status_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "PreviewArtifact",
+            "status",
+            &enumerate_preview_status_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_compose_request_archetype_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "ComposeRequest",
+            "archetype",
+            &enumerate_composition_archetype_variants(),
         );
     }
 }
