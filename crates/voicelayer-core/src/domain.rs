@@ -1456,6 +1456,131 @@ mod tests {
         ids
     }
 
+    /// Walk a `Cargo.toml` body and pull out every dependency name
+    /// declared inside the `[workspace.dependencies]` section. The
+    /// scanner uses brace-depth tracking so a multi-line inline
+    /// table value (e.g. a long `features = [...]` array continued
+    /// across several lines) does not leak its sub-keys as fake
+    /// dep names. Comment lines, section headings, and continuation
+    /// rows are all rejected by the same `classify_cargo_dep_header`
+    /// helper that classifies member-crate dep entries.
+    fn extract_workspace_dependency_names(contents: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut in_block = false;
+        let mut depth: i32 = 0;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if depth == 0 && trimmed.starts_with('[') {
+                in_block = trimmed.starts_with("[workspace.dependencies]");
+                continue;
+            }
+            if in_block
+                && depth == 0
+                && let Some((name, _kind)) = classify_cargo_dep_header(trimmed)
+            {
+                names.insert(name);
+            }
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            depth = (depth + opens - closes).max(0);
+        }
+        names
+    }
+
+    /// Classify every dependency entry in a member crate's
+    /// `Cargo.toml` `[dependencies]`, `[dev-dependencies]`, and
+    /// `[build-dependencies]` blocks. Returns two disjoint sets:
+    ///
+    /// - `workspace_inherited`: declared as `<name>.workspace = true`
+    ///   (or any `.workspace = ...` form, in case future entries
+    ///   override individual fields).
+    /// - `inline_or_literal`: any other shape — bare `<name> = "1.0"`
+    ///   literal-version pin, single- or multi-line inline table
+    ///   `<name> = { version = "1.0", features = [...] }`, or path
+    ///   dep `<name> = { path = "..." }`.
+    ///
+    /// Path deps are intentionally lumped with literal pins: they
+    /// never appear in `[workspace.dependencies]`, so the test that
+    /// intersects this set with the workspace dep names will always
+    /// drop them. Bundling them keeps the helper focused on the one
+    /// distinction that matters: workspace-inherited vs. not.
+    fn classify_crate_dependency_forms(
+        contents: &str,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let mut workspace_inherited = std::collections::BTreeSet::new();
+        let mut inline_or_literal = std::collections::BTreeSet::new();
+        let mut in_dep_block = false;
+        let mut depth: i32 = 0;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if depth == 0 && trimmed.starts_with('[') {
+                in_dep_block = trimmed.starts_with("[dependencies]")
+                    || trimmed.starts_with("[dev-dependencies]")
+                    || trimmed.starts_with("[build-dependencies]");
+                continue;
+            }
+            if in_dep_block
+                && depth == 0
+                && let Some((name, kind)) = classify_cargo_dep_header(trimmed)
+            {
+                match kind {
+                    CargoDepKind::WorkspaceInherited => {
+                        workspace_inherited.insert(name);
+                    }
+                    CargoDepKind::InlineOrLiteral => {
+                        inline_or_literal.insert(name);
+                    }
+                }
+            }
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            depth = (depth + opens - closes).max(0);
+        }
+        (workspace_inherited, inline_or_literal)
+    }
+
+    enum CargoDepKind {
+        WorkspaceInherited,
+        InlineOrLiteral,
+    }
+
+    /// Parse a single dep-header candidate line and return the dep
+    /// name plus whether it uses workspace inheritance. A header line
+    /// has the shape `<name> = ...` or `<name>.workspace = ...`,
+    /// where `<name>` is `[a-zA-Z][a-zA-Z0-9_-]*`. Continuation lines,
+    /// comments, and blank lines all return `None`.
+    fn classify_cargo_dep_header(trimmed: &str) -> Option<(String, CargoDepKind)> {
+        let no_comment = trimmed.split('#').next()?.trim();
+        if no_comment.is_empty() {
+            return None;
+        }
+        let (lhs, rhs) = no_comment.split_once('=')?;
+        if rhs.trim().is_empty() {
+            return None;
+        }
+        let lhs = lhs.trim();
+        let (name, suffix) = lhs
+            .split_once('.')
+            .map_or((lhs, ""), |(n, s)| (n, s.trim()));
+        if name.is_empty()
+            || !name.starts_with(|c: char| c.is_ascii_alphabetic())
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return None;
+        }
+        let kind = if suffix == "workspace" {
+            CargoDepKind::WorkspaceInherited
+        } else {
+            CargoDepKind::InlineOrLiteral
+        };
+        Some((name.to_owned(), kind))
+    }
+
     /// Walk a Markdown doc string and pull out every backtick-quoted
     /// `voicelayer.<word>` literal. Excludes `dictation.*` SSE event
     /// names (different prefix) and any other non-shortcut content.
@@ -3573,6 +3698,194 @@ components:
              match the shorthand convention used in the python-worker \
              protocol doc.",
             broken.join("\n  - "),
+        );
+    }
+
+    #[test]
+    fn extract_workspace_dependency_names_handles_single_and_inline_table_forms() {
+        let toml = "\
+[workspace]
+members = [\"crates/foo\"]
+
+[workspace.dependencies]
+arboard = \"3.6.1\"
+axum = { version = \"0.8.6\", features = [\"http1\"] }
+# a comment line should not be captured
+serde = { version = \"1.0\", features = [\"derive\"] }
+
+[workspace.package]
+version = \"0.1.0\"
+";
+        let names = extract_workspace_dependency_names(toml);
+        assert_eq!(
+            names,
+            ["arboard", "axum", "serde"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_workspace_dependency_names_skips_continuation_rows_inside_inline_tables() {
+        // A multi-line inline table whose `features = [` array
+        // continues across rows. The sub-key name (`features`) and
+        // the indented array literals must NOT be captured as fake
+        // workspace deps.
+        let toml = "\
+[workspace.dependencies]
+ashpd = { version = \"0.13\", default-features = false, features = [
+    \"tokio\",
+    \"global_shortcuts\",
+] }
+bytes = \"1.10.1\"
+";
+        let names = extract_workspace_dependency_names(toml);
+        assert_eq!(
+            names,
+            ["ashpd", "bytes"].iter().map(|s| (*s).to_owned()).collect(),
+        );
+    }
+
+    #[test]
+    fn classify_crate_dependency_forms_separates_workspace_from_literal_entries() {
+        let toml = "\
+[package]
+name = \"foo\"
+
+[dependencies]
+arboard.workspace = true
+axum = \"0.8.6\"
+iced = { version = \"0.14\", features = [\"tokio\"] }
+voicelayer-core = { path = \"../voicelayer-core\" }
+
+[dev-dependencies]
+tempfile.workspace = true
+";
+        let (inherited, literal) = classify_crate_dependency_forms(toml);
+        assert_eq!(
+            inherited,
+            ["arboard", "tempfile"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+        assert_eq!(
+            literal,
+            ["axum", "iced", "voicelayer-core"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn classify_crate_dependency_forms_handles_multiline_inline_table_continuations() {
+        // The exact shape used by `crates/vl-desktop/Cargo.toml`
+        // for `ashpd`. The continuation rows must not be captured
+        // as separate deps, and `ashpd` itself must land in the
+        // literal-or-inline bucket because it has no
+        // `.workspace = true` form.
+        let toml = "\
+[dependencies]
+ashpd = { version = \"0.13\", default-features = false, features = [
+    \"tokio\",
+    \"global_shortcuts\",
+] }
+bytes.workspace = true
+";
+        let (inherited, literal) = classify_crate_dependency_forms(toml);
+        assert_eq!(
+            inherited,
+            ["bytes"].iter().map(|s| (*s).to_owned()).collect(),
+        );
+        assert_eq!(literal, ["ashpd"].iter().map(|s| (*s).to_owned()).collect(),);
+    }
+
+    #[test]
+    fn classify_crate_dependency_forms_ignores_non_dependency_sections() {
+        // Keys defined under `[package]` or `[features]` are not
+        // dependency entries and must never appear in either set.
+        let toml = "\
+[package]
+name = \"foo\"
+version = \"0.1.0\"
+
+[features]
+default = [\"std\"]
+std = []
+
+[dependencies]
+serde.workspace = true
+";
+        let (inherited, literal) = classify_crate_dependency_forms(toml);
+        assert_eq!(
+            inherited,
+            ["serde"].iter().map(|s| (*s).to_owned()).collect(),
+        );
+        assert!(
+            literal.is_empty(),
+            "no literal deps expected, got {literal:?}",
+        );
+    }
+
+    /// For every member crate listed in the workspace `Cargo.toml`,
+    /// any dependency whose name is centralised in
+    /// `[workspace.dependencies]` MUST be declared in the member's
+    /// `[dependencies]` / `[dev-dependencies]` / `[build-dependencies]`
+    /// as `<name>.workspace = true`. A literal version pin or inline
+    /// table on a centralised dep silently diverges from the
+    /// workspace's single source of truth — and Cargo will happily
+    /// build either form, so the bug surfaces only when the workspace
+    /// pin is bumped and one crate is left behind.
+    ///
+    /// Crate-local literal pins for deps that are NOT in
+    /// `[workspace.dependencies]` (e.g. `vl-desktop`'s `ashpd` and
+    /// `iced` blocks) are unaffected: the intersection with the
+    /// workspace dep set drops them automatically.
+    #[test]
+    fn every_workspace_centralised_dep_uses_workspace_inheritance_in_member_crates() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let workspace_toml = std::fs::read_to_string(repo_root.join("Cargo.toml"))
+            .expect("read workspace Cargo.toml");
+        let workspace_deps = extract_workspace_dependency_names(&workspace_toml);
+        assert!(
+            !workspace_deps.is_empty(),
+            "extract_workspace_dependency_names returned empty — \
+             [workspace.dependencies] block may have moved or the \
+             scanner is mis-parsing the new shape",
+        );
+        let members = extract_cargo_workspace_members(&workspace_toml);
+        assert!(
+            !members.is_empty(),
+            "extract_cargo_workspace_members returned empty — \
+             [workspace] members list may have moved",
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+        for member in &members {
+            let manifest_path = repo_root.join(member).join("Cargo.toml");
+            let contents = std::fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
+                panic!("read {}: {err}", manifest_path.display());
+            });
+            let (inherited, literal_or_inline) = classify_crate_dependency_forms(&contents);
+            for name in literal_or_inline.intersection(&workspace_deps) {
+                if inherited.contains(name) {
+                    continue;
+                }
+                violations.push(format!("{member}: `{name}` is centralised in workspace.dependencies but the crate uses a literal/inline form"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "workspace dep inheritance drift:\n  - {}\n\n\
+             Replace each offender with `<name>.workspace = true` so \
+             the version stays pinned in `Cargo.toml` only. If you \
+             genuinely need a per-crate override (different feature \
+             set, etc.), drop the dep from `[workspace.dependencies]` \
+             so the centralised pin no longer claims to govern it.",
+            violations.join("\n  - "),
         );
     }
 }
