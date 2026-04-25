@@ -47,6 +47,24 @@ paths:
             text/event-stream:
               schema:
                 type: string
+  /v1/sessions:
+    get:
+      operationId: listSessions
+      summary: List every CaptureSession the daemon currently tracks.
+      description: |
+        Returns the daemon's in-memory session map sorted by `created_at_millis`.
+        The list is intentionally unfiltered — completed and failed sessions
+        remain discoverable until the daemon is restarted, so an operator who
+        lost a `session_id` can recover it before issuing the matching stop.
+      responses:
+        "200":
+          description: Currently-tracked dictation sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CaptureSession"
   /v1/sessions/dictation:
     post:
       operationId: startLiveDictationSession

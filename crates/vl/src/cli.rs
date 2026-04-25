@@ -185,6 +185,12 @@ enum DictationCommand {
     Stop {
         session_id: uuid::Uuid,
     },
+    /// List every dictation session the daemon currently knows about.
+    /// Useful when the operator has lost a `session_id` returned by an
+    /// earlier `dictation start` call and needs to recover it before
+    /// issuing the matching `dictation stop`. The output is the JSON
+    /// array the daemon returns from `GET /v1/sessions`.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -620,6 +626,11 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            DictationCommand::List => {
+                let sessions: Vec<voicelayer_core::CaptureSession> =
+                    uds_get_json(&cli_socket_path(), "/v1/sessions").await?;
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
             }
         },
         Command::Hotkeys { command } => match command {
