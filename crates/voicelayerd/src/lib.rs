@@ -4074,3 +4074,203 @@ mod sse_stream_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod openapi_route_alignment_tests {
+    //! Cross-check that every axum route declared in
+    //! `build_app_router` has a matching `paths:` entry in
+    //! `openapi/voicelayerd.v1.yaml`, and that every openapi path has
+    //! a matching axum route. The per-schema drift guards in
+    //! `voicelayer-core::domain::tests` (#28 / #33 / #34 / #35 / #36 /
+    //! #37) cover the *response shape* contract; this module covers
+    //! the *endpoint surface* contract — a shipped-but-undocumented
+    //! route or a documented-but-unimplemented path was previously
+    //! invisible to every existing guard.
+
+    use std::collections::BTreeSet;
+
+    /// Walk a source string and pull out every `"/v1/..."` path
+    /// passed as the first argument to `.route(...)`. Stops at the
+    /// first `#[cfg(test)]` line so synthetic fixtures and helper
+    /// strings inside test modules do not pollute the production
+    /// route set. Production routes in `voicelayerd::lib.rs` all
+    /// land in `build_app_router` ahead of every test module.
+    fn collect_axum_routes(source: &str) -> BTreeSet<String> {
+        let mut routes = BTreeSet::new();
+        for line in source.lines() {
+            if line.trim() == "#[cfg(test)]" {
+                break;
+            }
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(".route(\"")
+                && let Some(end) = rest.find('"')
+            {
+                routes.insert(rest[..end].to_owned());
+            }
+        }
+        routes
+    }
+
+    /// Walk an openapi YAML and pull out every top-level path key
+    /// inside the `paths:` block. Path keys are at two-space indent
+    /// (under the `paths:` heading at column zero). The walker
+    /// tolerates trailing top-level keys (`components:`, etc.) by
+    /// closing the paths scope on any column-zero non-empty line
+    /// after the opening `paths:` heading.
+    fn collect_openapi_paths(contents: &str) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        let mut in_paths = false;
+        for line in contents.lines() {
+            if line == "paths:" {
+                in_paths = true;
+                continue;
+            }
+            if in_paths
+                && !line.is_empty()
+                && line.chars().next().is_some_and(|c| !c.is_whitespace())
+            {
+                in_paths = false;
+                continue;
+            }
+            if !in_paths {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("  /")
+                && let Some(name) = rest.strip_suffix(':')
+                && !name.contains(' ')
+                && !name.is_empty()
+            {
+                paths.insert(format!("/{name}"));
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn collect_axum_routes_extracts_chained_route_calls() {
+        let source = "\
+            Router::new()\n\
+                .route(\"/v1/health\", get(get_health))\n\
+                .route(\"/v1/sessions\", get(list_sessions))\n\
+                .route(\"/v1/sessions/dictation\", post(create_dictation_session))\n\
+                .with_state(state)\n\
+        ";
+        let routes = collect_axum_routes(source);
+        assert_eq!(routes.len(), 3);
+        assert!(routes.contains("/v1/health"));
+        assert!(routes.contains("/v1/sessions"));
+        assert!(routes.contains("/v1/sessions/dictation"));
+    }
+
+    #[test]
+    fn collect_axum_routes_stops_at_first_cfg_test_line() {
+        // Pin the production-only scope: a `.route(...)` line inside
+        // a test module must not be picked up as a production route,
+        // otherwise the synthetic fixtures in this very file would
+        // make the integration test self-referential.
+        let source = "\
+            Router::new()\n\
+                .route(\"/v1/real\", get(handler))\n\
+            #[cfg(test)]\n\
+            mod tests {\n\
+                let _ = router.route(\"/v1/synthetic\", get(handler));\n\
+            }\n\
+        ";
+        let routes = collect_axum_routes(source);
+        assert!(routes.contains("/v1/real"));
+        assert!(
+            !routes.contains("/v1/synthetic"),
+            "test-block routes must be ignored; got {routes:?}",
+        );
+    }
+
+    #[test]
+    fn collect_openapi_paths_extracts_top_level_path_keys() {
+        // Indents matter, so use literal newlines between lines and
+        // rely on the opening `\<newline>` to eat only the first
+        // source newline. Each subsequent source line preserves its
+        // leading whitespace, mirroring real openapi/voicelayerd.v1.yaml.
+        let yaml = concat!(
+            "openapi: 3.1.0\n",
+            "info:\n",
+            "  title: Local Control API\n",
+            "paths:\n",
+            "  /v1/health:\n",
+            "    get:\n",
+            "      operationId: getHealth\n",
+            "  /v1/sessions:\n",
+            "    get:\n",
+            "      operationId: listSessions\n",
+            "components:\n",
+            "  schemas:\n",
+            "    HealthResponse:\n",
+            "      type: object\n",
+        );
+        let paths = collect_openapi_paths(yaml);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("/v1/health"));
+        assert!(paths.contains("/v1/sessions"));
+    }
+
+    #[test]
+    fn collect_openapi_paths_ignores_indented_keys_outside_paths_block() {
+        // A `/v1/something:`-shaped string at deeper indent (e.g.
+        // inside a description literal block) must not be mistaken
+        // for a top-level path. Pin the scoping so nested content
+        // cannot accidentally pollute the path set.
+        let yaml = concat!(
+            "paths:\n",
+            "  /v1/real:\n",
+            "    get: {}\n",
+            "components:\n",
+            "  schemas:\n",
+            "    Foo:\n",
+            "      description: |\n",
+            "        See /v1/not-a-path: discussed in the changelog.\n",
+        );
+        let paths = collect_openapi_paths(yaml);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("/v1/real"));
+    }
+
+    #[test]
+    fn every_axum_route_has_an_openapi_path_entry_and_vice_versa() {
+        let source_path = format!("{}/src/lib.rs", env!("CARGO_MANIFEST_DIR"));
+        let openapi_path = format!(
+            "{}/../../openapi/voicelayerd.v1.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+
+        let source = std::fs::read_to_string(&source_path).expect("read voicelayerd lib.rs");
+        let openapi = std::fs::read_to_string(&openapi_path).expect("read openapi contract");
+
+        let routes = collect_axum_routes(&source);
+        let paths = collect_openapi_paths(&openapi);
+
+        assert!(
+            !routes.is_empty(),
+            "expected at least one axum route in build_app_router; \
+             collect_axum_routes may be misparsing",
+        );
+        assert!(
+            !paths.is_empty(),
+            "expected at least one path in openapi/voicelayerd.v1.yaml; \
+             collect_openapi_paths may be misparsing",
+        );
+
+        for route in &routes {
+            assert!(
+                paths.contains(route),
+                "axum route `{route}` is missing from openapi `paths:`. \
+                 Either add the path entry or drop the route.",
+            );
+        }
+        for path in &paths {
+            assert!(
+                routes.contains(path),
+                "openapi path `{path}` has no matching `.route(...)` call in \
+                 build_app_router. Either add the route or drop the path entry.",
+            );
+        }
+    }
+}
