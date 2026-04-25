@@ -2593,6 +2593,194 @@ mod segmented_orchestration_tests {
             result.transcription.notes,
         );
     }
+
+    /// Pins the `silence_gap_probes > 1` branch of the orchestrator's
+    /// flush logic. The earlier tail-probe tests use `probe_secs = 60`
+    /// so the ticker never fires, exercising only the stop-path drain;
+    /// none of them probe the multi-probe accumulation rule.
+    ///
+    /// Scenario: speech probe → silence probe → silence probe. With
+    /// `silence_gap_probes = 2` the first silent probe must not flush
+    /// (silent_streak < gap), and the second must (silent_streak == gap).
+    /// A regression that compared `==` instead of `>=` would still pass
+    /// the existing default-1 tests, so this scenario is the only
+    /// place the threshold logic is genuinely exercised.
+    #[tokio::test]
+    async fn vad_gated_orchestrator_holds_speech_until_silence_gap_threshold_met() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            // The single-probe flush takes the shortcut: unit_path is the
+            // probe path itself, so transcribe is keyed on the probe
+            // stem rather than a synthesized `unit-00000`.
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " kept until silence ran"},
+                "segment_probe_map": {
+                    "segment-00000": {
+                        "has_speech": true,
+                        "speech_ratio": 0.9,
+                        "regions": [],
+                        "notes": [],
+                    },
+                    "segment-00001": {
+                        "has_speech": false,
+                        "speech_ratio": 0.0,
+                        "regions": [],
+                        "notes": [],
+                    },
+                    "segment-00002": {
+                        "has_speech": false,
+                        "speech_ratio": 0.0,
+                        "regions": [],
+                        "notes": [],
+                    },
+                },
+                "segment_probe_default": {
+                    "has_speech": false,
+                    "speech_ratio": 0.0,
+                    "regions": [],
+                    "notes": [],
+                },
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            1,   // probe_secs
+            120, // max_segment_secs (large enough not to interfere)
+            2,   // silence_gap_probes — the contract under test
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        // Real-time wait for ~3 ticks (probe_secs=1) plus margin for
+        // the worker subprocess spawns. Tests on the existing CI
+        // runner finish within ~1m20s for similar shapes; this slice
+        // is well under that budget.
+        sleep(Duration::from_millis(3500)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(30), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let events = drain_events(&mut events_rx);
+        let types = event_types(&events);
+
+        // The first silent probe alone must not flush; the test passes
+        // only if a flush event eventually appears (after the streak
+        // crosses the threshold) and exactly one transcribed speech
+        // unit lands.
+        let flush_count = events
+            .iter()
+            .filter(|e| e.event_type == "dictation.speech_unit_flushed")
+            .count();
+        assert_eq!(
+            flush_count, 1,
+            "silence_gap=2 with one speech probe followed by silence must \
+             flush exactly once after the streak crosses the threshold; \
+             event types: {types:?}",
+        );
+
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert!(result.failure_kind.is_none());
+        assert!(
+            result.transcription.text.contains("kept until silence ran"),
+            "the buffered speech probe must transcribe through to the result; got {:?}",
+            result.transcription.text,
+        );
+    }
+
+    /// Pins the `pending_secs >= max_segment_secs` forced-flush branch.
+    /// The orchestrator must not let a continuous speech run accumulate
+    /// past `max_segment_secs` even when no silence appears — otherwise
+    /// a never-pausing speaker would block the entire session in the
+    /// pending buffer until stop.
+    ///
+    /// Scenario: speech, speech with `max_segment_secs = 2`,
+    /// `silence_gap_probes = 99` (large enough that silence cannot
+    /// trigger a flush). After the second probe, `pending_secs` reaches
+    /// 2 and the forced flush fires; the two-probe flush goes through
+    /// `stitch_wav_segments` (probe_count > 1 branch) into a synthesized
+    /// `unit-00000.wav` whose transcribe key the mock worker honours.
+    #[tokio::test]
+    async fn vad_gated_orchestrator_force_flushes_when_max_segment_secs_reached() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"unit-00000": " forced flush text"},
+                "segment_probe_default": {
+                    "has_speech": true,
+                    "speech_ratio": 1.0,
+                    "regions": [],
+                    "notes": [],
+                },
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            1,  // probe_secs
+            2,  // max_segment_secs — flushes after two speech probes
+            99, // silence_gap_probes — large enough not to trigger
+            false,
+            false,
+            None,
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        // Two probe ticks (~2 s) plus margin for subprocess spawns.
+        sleep(Duration::from_millis(2800)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let result = timeout(Duration::from_secs(30), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let events = drain_events(&mut events_rx);
+        let types = event_types(&events);
+
+        let flush_count = events
+            .iter()
+            .filter(|e| e.event_type == "dictation.speech_unit_flushed")
+            .count();
+        assert!(
+            flush_count >= 1,
+            "max_segment_secs=2 with continuous speech must force at least \
+             one flush; event types: {types:?}",
+        );
+
+        assert_eq!(result.session.state, SessionState::Completed);
+        assert!(result.failure_kind.is_none());
+        assert!(
+            result.transcription.text.contains("forced flush text"),
+            "the stitched speech unit must transcribe through to the result; got {:?}",
+            result.transcription.text,
+        );
+    }
 }
 
 #[cfg(test)]
