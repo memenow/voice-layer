@@ -1473,6 +1473,45 @@ mod tests {
         pairs
     }
 
+    /// Walk a systemd `.service` unit file and pull out the path
+    /// from every `EnvironmentFile=` line, dropping the optional
+    /// leading `-` (which marks the file as optional rather than
+    /// required). Returns paths exactly as written, so a `%h/...`
+    /// runtime placeholder is preserved for the caller to expand.
+    fn extract_systemd_environment_file_paths(source: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("EnvironmentFile=") {
+                let path = rest.strip_prefix('-').unwrap_or(rest).trim().to_owned();
+                if !path.is_empty() {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+
+    /// Pull the default value of the `ENV_DIR` shell variable from
+    /// `scripts/install.sh`. Targets the canonical bash idiom
+    /// `ENV_DIR="${VOICELAYER_INSTALL_ENV_DIR:-${HOME}/.config/voicelayer}"`,
+    /// returning the `:-`-default substring (here
+    /// `${HOME}/.config/voicelayer`). Returns `None` if the variable
+    /// is missing or written in a different shape.
+    fn extract_install_sh_default_env_dir(source: &str) -> Option<String> {
+        for line in source.lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("ENV_DIR=\"") else {
+                continue;
+            };
+            let idx = rest.find(":-")?;
+            let after = &rest[idx + ":-".len()..];
+            let end = after.find("}\"")?;
+            return Some(after[..end].to_owned());
+        }
+        None
+    }
+
     /// Walk a systemd `.service` unit file and pull out the basename
     /// of every `ExecStart=%h/.local/bin/<name>` line. systemd
     /// expands `%h` to the user's home directory at runtime; the
@@ -4668,5 +4707,102 @@ install -m 0755 \"${REPO_ROOT}/target/release/vl\" \"${BIN_DIR}/vl\"
              requires-python floor is `{pyproject_python}`. Bump the README list \
              when the python floor moves.",
         );
+    }
+
+    #[test]
+    fn extract_systemd_environment_file_paths_drops_optional_dash_prefix() {
+        let unit = "\
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/voicelayer/voicelayerd.env
+EnvironmentFile=/etc/voicelayerd.env
+ExecStart=%h/.local/bin/vl daemon run
+";
+        let paths = extract_systemd_environment_file_paths(unit);
+        assert_eq!(
+            paths,
+            vec![
+                "%h/.config/voicelayer/voicelayerd.env".to_owned(),
+                "/etc/voicelayerd.env".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn extract_install_sh_default_env_dir_picks_up_canonical_braced_default() {
+        let sh = "\
+#!/usr/bin/env bash
+BIN_DIR=\"${VOICELAYER_INSTALL_BIN_DIR:-${HOME}/.local/bin}\"
+ENV_DIR=\"${VOICELAYER_INSTALL_ENV_DIR:-${HOME}/.config/voicelayer}\"
+";
+        assert_eq!(
+            extract_install_sh_default_env_dir(sh),
+            Some("${HOME}/.config/voicelayer".to_owned()),
+        );
+    }
+
+    #[test]
+    fn extract_install_sh_default_env_dir_returns_none_when_var_absent() {
+        let sh = "BIN_DIR=\"${VOICELAYER_INSTALL_BIN_DIR:-${HOME}/.local/bin}\"\n";
+        assert!(extract_install_sh_default_env_dir(sh).is_none());
+    }
+
+    /// Every systemd unit's `EnvironmentFile=` directive must point
+    /// at the path `scripts/install.sh` seeds. The two surfaces use
+    /// different placeholder syntaxes — systemd writes `%h/...` (the
+    /// home-dir runtime variable), install.sh writes `${HOME}/...`
+    /// (the bash variable) — but they expand to the same disk path,
+    /// so the suffix after the placeholder must agree.
+    ///
+    /// The drift mode is silent and operator-facing: install.sh
+    /// happily writes `~/.config/voicelayer-orchestrator/voicelayerd.env`
+    /// while systemd keeps reading `~/.config/voicelayer/voicelayerd.env`,
+    /// the unit starts but sees no env vars, and the daemon falls
+    /// back to in-source defaults that look like a misconfigured
+    /// installation. The fix is one-line in either file but the
+    /// failure has no obvious signal.
+    #[test]
+    fn systemd_environment_file_paths_resolve_to_install_sh_env_dir_default() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let install_sh = std::fs::read_to_string(repo_root.join("scripts/install.sh"))
+            .expect("read scripts/install.sh");
+        let env_dir_default = extract_install_sh_default_env_dir(&install_sh).expect(
+            "scripts/install.sh `ENV_DIR=\"${...:-${HOME}/...}\"` default not found — \
+             the bash idiom may have moved",
+        );
+        let install_suffix = env_dir_default
+            .strip_prefix("${HOME}/")
+            .unwrap_or(&env_dir_default);
+        let install_full = format!("{install_suffix}/voicelayerd.env");
+
+        let units: &[&std::path::Path] = &[
+            std::path::Path::new("systemd/voicelayerd.service"),
+            std::path::Path::new("systemd/voicelayer-whisper-server.service"),
+        ];
+        for unit_rel in units {
+            let unit_abs = repo_root.join(unit_rel);
+            let unit_source = std::fs::read_to_string(&unit_abs)
+                .unwrap_or_else(|err| panic!("read {}: {err}", unit_abs.display()));
+            let paths = extract_systemd_environment_file_paths(&unit_source);
+            assert!(
+                !paths.is_empty(),
+                "{} declares no `EnvironmentFile=` line — the unit may be loading env via \
+                 a different mechanism (drop-in, [Service] inline `Environment=`), in \
+                 which case this drift guard needs to follow that move",
+                unit_rel.display(),
+            );
+            for path in paths {
+                let suffix = path.strip_prefix("%h/").unwrap_or(&path);
+                assert_eq!(
+                    suffix,
+                    install_full,
+                    "{}: `EnvironmentFile=` resolves to `{path}` (suffix `{suffix}`) but \
+                     `scripts/install.sh` seeds `{install_full}`. Bring the two in sync \
+                     so the unit reads the file install.sh actually writes.",
+                    unit_rel.display(),
+                );
+            }
+        }
     }
 }
