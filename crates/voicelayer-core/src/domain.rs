@@ -1282,6 +1282,28 @@ mod tests {
         members
     }
 
+    /// Pull the SPDX literal from pyproject's inline-table license
+    /// form: `license = { text = "Apache-2.0" }`. Returns `None`
+    /// when the field is absent or written in any other shape (e.g.
+    /// `license = "..."` for a bare-string form, which pyproject
+    /// also accepts but voicelayer doesn't use today).
+    fn extract_pyproject_license_text(contents: &str) -> Option<String> {
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("license = ") {
+                continue;
+            }
+            let needle = "text = \"";
+            if let Some(idx) = line.find(needle) {
+                let after = &line[idx + needle.len()..];
+                if let Some(end) = after.find('"') {
+                    return Some(after[..end].to_owned());
+                }
+            }
+        }
+        None
+    }
+
     /// Walk an `install.sh` shell script and pull out every basename
     /// it copies into `${BIN_DIR}/`. Targets the canonical line
     /// shape `install -m 0755 "..." "${BIN_DIR}/<name>"` (the form
@@ -1921,6 +1943,25 @@ components:
         assert_eq!(members.len(), 4);
         assert!(members.contains("crates/voicelayer-core"));
         assert!(members.contains("crates/vl-desktop"));
+    }
+
+    #[test]
+    fn extract_pyproject_license_text_handles_inline_table_form() {
+        let toml = concat!(
+            "[project]\n",
+            "name = \"voicelayer-orchestrator\"\n",
+            "license = { text = \"Apache-2.0\" }\n",
+        );
+        assert_eq!(
+            extract_pyproject_license_text(toml).as_deref(),
+            Some("Apache-2.0"),
+        );
+    }
+
+    #[test]
+    fn extract_pyproject_license_text_returns_none_when_field_absent() {
+        let toml = "[project]\nname = \"foo\"\n";
+        assert!(extract_pyproject_license_text(toml).is_none());
     }
 
     #[test]
@@ -2911,6 +2952,41 @@ components:
              `[tool.ruff] target-version = \"{ruff_target}\"` (expected \
              \"{expected_target}\"). Ruff would silently disable lint rules the \
              codebase already requires; bump both together.",
+        );
+    }
+
+    /// Pin pyproject's `license = { text = "..." }` against Cargo's
+    /// `license = "..."`. The LICENSE file on disk is already
+    /// cross-checked against Cargo (#63); this closes the missing
+    /// edge so all three (Cargo, pyproject, LICENSE) stay coherent.
+    /// A pyproject that drifts to a different SPDX while Cargo and
+    /// LICENSE keep Apache-2.0 would publish the Python orchestrator
+    /// against the wrong license metadata on PyPI without breaking
+    /// the Cargo side.
+    #[test]
+    fn pyproject_license_matches_cargo_license() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml =
+            std::fs::read_to_string(format!("{repo_root}/Cargo.toml")).expect("read Cargo.toml");
+        let pyproject = std::fs::read_to_string(format!("{repo_root}/pyproject.toml"))
+            .expect("read pyproject.toml");
+
+        let cargo_license = extract_toml_string_value(&cargo_toml, "license").expect(
+            "Cargo.toml must declare `license = \"...\"`; \
+             extract_toml_string_value may be misparsing",
+        );
+        let pyproject_license = extract_pyproject_license_text(&pyproject).expect(
+            "pyproject.toml must declare `license = { text = \"...\" }`; \
+             extract_pyproject_license_text may be misparsing",
+        );
+
+        assert_eq!(
+            cargo_license, pyproject_license,
+            "license drift: Cargo.toml `license = \"{cargo_license}\"` does not match \
+             pyproject.toml `license = {{ text = \"{pyproject_license}\" }}`. The \
+             Rust workspace and Python orchestrator are released as a single artefact \
+             — both metadata files must declare the same SPDX, and the LICENSE file \
+             on disk (already pinned in #63) must follow.",
         );
     }
 
