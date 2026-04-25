@@ -2881,4 +2881,84 @@ components:
             ),
         }
     }
+
+    /// Pin every per-crate `Cargo.toml` `name = "..."` against its
+    /// directory basename. Workspace `path = ...` deps are resolved
+    /// by manifest name, not directory; a typo such as
+    /// `name = "voicelayer_core"` (underscore) for a crate at
+    /// `crates/voicelayer-core/` (hyphen) would silently break
+    /// every dependent's path-based dep — `cargo build --workspace`
+    /// loads each member's manifest in isolation and only complains
+    /// about the unresolved name when a dependent tries to import.
+    #[test]
+    fn each_crate_manifest_name_matches_its_directory_basename() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml = std::fs::read_to_string(format!("{repo_root}/Cargo.toml"))
+            .expect("read root Cargo.toml");
+        let members = extract_cargo_workspace_members(&cargo_toml);
+        assert!(
+            !members.is_empty(),
+            "Cargo.toml must declare at least one member; cannot pin per-crate \
+             name without a member list to walk",
+        );
+
+        for member_path in &members {
+            let manifest_path = format!("{repo_root}/{member_path}/Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|err| panic!("read {manifest_path}: {err}"));
+            let declared_name = extract_toml_string_value(&manifest, "name").unwrap_or_else(|| {
+                panic!(
+                    "crate manifest at `{manifest_path}` must declare \
+                         `name = \"...\"` under [package]; \
+                         extract_toml_string_value may be misparsing"
+                )
+            });
+            let dir_basename = std::path::Path::new(member_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("member path has a directory component");
+            assert_eq!(
+                declared_name, dir_basename,
+                "crate at `{member_path}` declares \
+                 `name = \"{declared_name}\"` but the directory basename is \
+                 `{dir_basename}`. Workspace `path = ...` deps resolve by \
+                 manifest name; a mismatch breaks `cargo build`'s resolution \
+                 silently across dependents.",
+            );
+        }
+    }
+
+    /// Pin every per-crate `Cargo.toml` to inherit `version` from the
+    /// workspace via `version.workspace = true`. A literal
+    /// `version = "X.Y.Z"` line on a member would diverge from
+    /// `[workspace.package] version` and silently defeat the
+    /// openapi/cargo version pin (#55) — operators reading the
+    /// openapi document would see one version while a particular
+    /// crate published a different one.
+    #[test]
+    fn each_crate_manifest_inherits_workspace_version() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml = std::fs::read_to_string(format!("{repo_root}/Cargo.toml"))
+            .expect("read root Cargo.toml");
+        let members = extract_cargo_workspace_members(&cargo_toml);
+        assert!(
+            !members.is_empty(),
+            "Cargo.toml must declare at least one member; cannot pin per-crate \
+             version inheritance without a member list to walk",
+        );
+
+        for member_path in &members {
+            let manifest_path = format!("{repo_root}/{member_path}/Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|err| panic!("read {manifest_path}: {err}"));
+            assert!(
+                manifest.contains("version.workspace = true"),
+                "crate at `{member_path}` does not contain \
+                 `version.workspace = true`. Inherit the workspace version \
+                 instead of declaring a literal — a divergent version would \
+                 defeat the openapi/cargo version pin and confuse anyone \
+                 matching `vl --version` against the published crate.",
+            );
+        }
+    }
 }
