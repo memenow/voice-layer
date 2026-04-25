@@ -3289,6 +3289,75 @@ mod http_api_tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_retains_completed_session_after_stop() {
+        // Pin the contract `vl dictation list`'s docstring promises:
+        // sessions stay in the daemon's map across the listening →
+        // completed transition, so an operator can recover a
+        // `session_id` even after the dictation has already finished.
+        // `update_session_map` is `insert`-only — never `remove` — so
+        // a future change that pruned terminal-state sessions to cap
+        // memory growth would break this contract silently. This test
+        // catches that.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "default_transcribe_text": " retained",
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::OneShot,
+        };
+        let (_, started): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+
+        // Same 50 ms beat as `oneshot_dictation_http_roundtrip_*`:
+        // lets the fake recorder child exit naturally rather than
+        // racing the SIGINT timeout path.
+        sleep(Duration::from_millis(50)).await;
+
+        let (_, _): (StatusCode, DictationCaptureResult) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest {
+                session_id: started.session_id,
+            })
+            .expect("encode stop req"),
+        )
+        .await;
+
+        let (status, sessions): (StatusCode, Vec<CaptureSession>) =
+            get_json(router, "/v1/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the stopped session must still be enumerable; pruning would silently break \
+             `vl dictation list` for terminal-state recovery",
+        );
+        assert_eq!(sessions[0].session_id, started.session_id);
+        assert_eq!(
+            sessions[0].state,
+            SessionState::Completed,
+            "the listing must reflect the post-stop state, not the original Listening",
+        );
+    }
+
+    #[tokio::test]
     async fn list_sessions_includes_a_running_session_after_dictation_start() {
         // Start a one-shot live session via the public API and confirm
         // `GET /v1/sessions` surfaces it. Pinning the round-trip
