@@ -2856,6 +2856,64 @@ components:
         );
     }
 
+    /// Pin `pyproject.toml`'s `version` against the Cargo workspace
+    /// and openapi labels already cross-checked in
+    /// `openapi_info_version_matches_cargo_workspace_version`.
+    /// `vl --version` reports the Cargo value (#58); a divergent
+    /// pyproject version would publish the Python orchestrator
+    /// against a different release tag than the Rust binaries that
+    /// drive it. Operators bisecting a bug across both stacks would
+    /// see two version stamps and have no idea which package
+    /// shipped the regression.
+    #[test]
+    fn pyproject_version_matches_cargo_workspace_version() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml =
+            std::fs::read_to_string(format!("{repo_root}/Cargo.toml")).expect("read Cargo.toml");
+        let pyproject = std::fs::read_to_string(format!("{repo_root}/pyproject.toml"))
+            .expect("read pyproject.toml");
+
+        let cargo_version = extract_toml_string_value(&cargo_toml, "version")
+            .expect("Cargo.toml must declare `version = \"...\"` under [workspace.package]");
+        let pyproject_version = extract_toml_string_value(&pyproject, "version")
+            .expect("pyproject.toml must declare `version = \"...\"` under [project]");
+
+        assert_eq!(
+            cargo_version, pyproject_version,
+            "version drift: Cargo.toml `version = \"{cargo_version}\"` does not match \
+             pyproject.toml `version = \"{pyproject_version}\"`. Bump both together so \
+             `vl --version` and the Python orchestrator's release tag share a label.",
+        );
+    }
+
+    /// Pin ruff's `target-version` against pyproject's
+    /// `requires-python` floor. Ruff drives lint rules by language
+    /// version (e.g. PEP 695 generic syntax requires py312); a stale
+    /// target would silently disable rules the codebase already
+    /// relies on. The comparison normalises both to `py3XX`/`>=3.XX`
+    /// shape: the floor's `.` is collapsed and prefixed with `py`,
+    /// then matched against the literal target value.
+    #[test]
+    fn ruff_target_version_matches_pyproject_requires_python() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let pyproject = std::fs::read_to_string(format!("{repo_root}/pyproject.toml"))
+            .expect("read pyproject.toml");
+
+        let floor = extract_python_version_floor_from_pyproject(&pyproject)
+            .expect("pyproject.toml must declare `requires-python = \">=...\"`");
+        let ruff_target = extract_toml_string_value(&pyproject, "target-version")
+            .expect("pyproject.toml must declare `[tool.ruff] target-version = \"...\"`");
+
+        let expected_target = format!("py{}", floor.replace('.', ""));
+        assert_eq!(
+            ruff_target, expected_target,
+            "lint version drift: pyproject `requires-python = \">={floor}\"` but \
+             `[tool.ruff] target-version = \"{ruff_target}\"` (expected \
+             \"{expected_target}\"). Ruff would silently disable lint rules the \
+             codebase already requires; bump both together.",
+        );
+    }
+
     /// Cross-check JSON-RPC error codes between the Python worker
     /// (where they are emitted as `_CODE = -3XXXX` constants) and
     /// the worker-protocol doc (which enumerates them in an Error
