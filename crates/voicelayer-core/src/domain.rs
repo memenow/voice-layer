@@ -1194,6 +1194,63 @@ mod tests {
         None
     }
 
+    /// Walk a Python source string and collect every JSON-RPC error
+    /// code defined as a `_CODE = -3XXXX` constant. Targets the
+    /// constants in `python/voicelayer_orchestrator/worker.py`
+    /// (`PROVIDER_UNAVAILABLE_CODE`, `METHOD_NOT_FOUND_CODE`, etc.).
+    /// Filters to the JSON-RPC reserved range (`-32099` to `-32700`)
+    /// so unrelated negative numerics elsewhere in the file would
+    /// not pollute the set.
+    fn extract_python_jsonrpc_error_codes(contents: &str) -> std::collections::BTreeSet<i32> {
+        let mut codes = std::collections::BTreeSet::new();
+        for line in contents.lines() {
+            let Some(idx) = line.find("_CODE = ") else {
+                continue;
+            };
+            let after = &line[idx + "_CODE = ".len()..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            if let Ok(value) = token.parse::<i32>()
+                && (-32700..=-32000).contains(&value)
+            {
+                codes.insert(value);
+            }
+        }
+        codes
+    }
+
+    /// Walk a Markdown doc string and collect every backtick-quoted
+    /// JSON-RPC error code (`` `-3XXXX` ``). Returns the dedup'd set
+    /// of values; the doc may mention the same code in several
+    /// passages (e.g. an Error Policy enumeration plus inline usage
+    /// notes), but for the drift guard only presence matters. Same
+    /// JSON-RPC range filter as `extract_python_jsonrpc_error_codes`.
+    fn extract_doc_jsonrpc_error_codes(contents: &str) -> std::collections::BTreeSet<i32> {
+        let mut codes = std::collections::BTreeSet::new();
+        for line in contents.lines() {
+            let mut search = line;
+            while let Some(idx) = search.find("`-") {
+                let after = &search[idx + 1..]; // start at "-..."
+                let token: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
+                if let Ok(value) = token.parse::<i32>()
+                    && (-32700..=-32000).contains(&value)
+                {
+                    codes.insert(value);
+                }
+                search = &after[token.len()..];
+                if search.is_empty() {
+                    break;
+                }
+            }
+        }
+        codes
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1673,6 +1730,60 @@ components:
     fn extract_yaml_bare_string_value_returns_none_when_key_absent() {
         let yaml = "info:\n  title: nope\n";
         assert!(extract_yaml_bare_string_value(yaml, "version").is_none());
+    }
+
+    #[test]
+    fn extract_python_jsonrpc_error_codes_collects_named_constants() {
+        let py = concat!(
+            "PROVIDER_UNAVAILABLE_CODE = -32004\n",
+            "PROVIDER_REQUEST_FAILED_CODE = -32005\n",
+            "INVALID_REQUEST_CODE = -32600\n",
+            "METHOD_NOT_FOUND_CODE = -32601\n",
+            "PARSE_ERROR_CODE = -32700\n",
+        );
+        let codes = extract_python_jsonrpc_error_codes(py);
+        assert_eq!(codes.len(), 5);
+        assert!(codes.contains(&-32004));
+        assert!(codes.contains(&-32700));
+    }
+
+    #[test]
+    fn extract_python_jsonrpc_error_codes_filters_out_unrelated_negatives() {
+        // A bare `-1 = ...` style assignment must not be picked up;
+        // only values in the JSON-RPC reserved range (-32700..=-32000)
+        // are real error codes per the spec.
+        let py = concat!(
+            "RETRY_BACKOFF_CODE = -1\n",
+            "PROVIDER_UNAVAILABLE_CODE = -32004\n",
+            "ARBITRARY_OFFSET = -100000\n",
+        );
+        let codes = extract_python_jsonrpc_error_codes(py);
+        assert_eq!(codes.len(), 1);
+        assert!(codes.contains(&-32004));
+    }
+
+    #[test]
+    fn extract_doc_jsonrpc_error_codes_dedupes_across_mentions() {
+        // The same code appears multiple times — once in an Error
+        // Policy enumeration, once in an inline usage description.
+        // The set semantics dedup them.
+        let md = concat!(
+            "Returns `-32004` when the provider is not configured.\n",
+            "## Error Policy\n",
+            "- Provider unavailable: `-32004`\n",
+            "- Method not found: `-32601`\n",
+        );
+        let codes = extract_doc_jsonrpc_error_codes(md);
+        assert_eq!(codes.len(), 2);
+        assert!(codes.contains(&-32004));
+        assert!(codes.contains(&-32601));
+    }
+
+    #[test]
+    fn extract_doc_jsonrpc_error_codes_ignores_out_of_range_negatives() {
+        let md = "See ticket `-1234` and ASCII codepoint `-65`.\n";
+        let codes = extract_doc_jsonrpc_error_codes(md);
+        assert!(codes.is_empty());
     }
 
     /// Pins both directions of the soft-list override:
@@ -2530,5 +2641,59 @@ components:
              openapi/voicelayerd.v1.yaml `info.version: {openapi_version}`. Bump both \
              together so the contract document and the published crate share a label.",
         );
+    }
+
+    /// Cross-check JSON-RPC error codes between the Python worker
+    /// (where they are emitted as `_CODE = -3XXXX` constants) and
+    /// the worker-protocol doc (which enumerates them in an Error
+    /// Policy block plus inline usage notes). A drift on either
+    /// side would mislead operators reading the doc to debug a
+    /// `-32004` they receive — they would either find no entry or
+    /// find an entry for a code the worker no longer emits.
+    #[test]
+    fn jsonrpc_error_codes_in_python_match_the_protocol_doc() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+
+        let python_source = std::fs::read_to_string(format!(
+            "{repo_root}/python/voicelayer_orchestrator/worker.py"
+        ))
+        .expect("read python worker.py");
+        let doc_source = std::fs::read_to_string(format!(
+            "{repo_root}/docs/architecture/python-worker-protocol.md",
+        ))
+        .expect("read python-worker-protocol.md");
+
+        let python_codes = extract_python_jsonrpc_error_codes(&python_source);
+        let doc_codes = extract_doc_jsonrpc_error_codes(&doc_source);
+
+        assert!(
+            !python_codes.is_empty(),
+            "python worker.py must declare at least one `_CODE = -3XXXX` constant; \
+             extract_python_jsonrpc_error_codes may be misparsing",
+        );
+        assert!(
+            !doc_codes.is_empty(),
+            "python-worker-protocol.md must mention at least one `\\`-3XXXX\\`` code; \
+             extract_doc_jsonrpc_error_codes may be misparsing",
+        );
+
+        for code in &python_codes {
+            assert!(
+                doc_codes.contains(code),
+                "python worker emits `{code}` but no matching `\\`{code}\\`` mention \
+                 in docs/architecture/python-worker-protocol.md. Add a line under the \
+                 Error Policy enumeration so operators reading the doc can identify \
+                 the code they receive.",
+            );
+        }
+        for code in &doc_codes {
+            assert!(
+                python_codes.contains(code),
+                "docs/architecture/python-worker-protocol.md mentions `\\`{code}\\`` \
+                 but no matching `_CODE = {code}` constant exists in worker.py. \
+                 Either drop the mention from the doc or add the constant on the \
+                 python side.",
+            );
+        }
     }
 }
