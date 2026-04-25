@@ -316,8 +316,8 @@ mod tests {
     use std::{sync::Mutex, time::Duration};
 
     use super::{
-        DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCallError, WorkerCommand,
-        worker_call_timeout,
+        DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WORKER_MODULE, WorkerCallError,
+        WorkerCommand, worker_call_timeout,
     };
 
     /// Serializes any test that mutates process-wide env vars. Cargo runs
@@ -377,6 +377,86 @@ mod tests {
                 std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
             },
         }
+    }
+
+    /// Closes the third case in `worker_call_timeout`'s env branch:
+    /// the variable is **set** but not parseable as `u64`. The first
+    /// `.ok()` keeps the `Some("...")`, `.parse::<u64>().ok()` returns
+    /// `None`, and `unwrap_or(DEFAULT_INFERENCE_TIMEOUT_SECS)` wins —
+    /// the same default the unset case uses. The existing test only
+    /// exercises "unset" and "set to a number", so a regression that
+    /// swapped the parse for `expect` or an explicit `panic!` would
+    /// slip through.
+    #[test]
+    fn inference_timeout_falls_back_to_default_when_env_value_is_unparsable() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS").ok();
+        // SAFETY: ENV_LOCK serializes every mutation of this variable
+        // with every other env-touching test in this module.
+        unsafe {
+            std::env::set_var("VOICELAYER_WORKER_TIMEOUT_SECONDS", "not-a-number");
+        }
+        assert_eq!(
+            worker_call_timeout("transcribe").as_secs(),
+            DEFAULT_INFERENCE_TIMEOUT_SECS,
+        );
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("VOICELAYER_WORKER_TIMEOUT_SECONDS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
+            },
+        }
+    }
+
+    /// Pins the `.venv/bin/python` branch of `WorkerCommand::discover`.
+    /// Live workspace runs already hit this path through the checked-in
+    /// venv, but the field assertions catch a silent regression where
+    /// a future refactor flips to `uv run` even when a usable interpreter
+    /// is present — that would turn every JSON-RPC call into a `uv`
+    /// process-resolve with measurable cold-start cost.
+    #[test]
+    fn discover_picks_venv_python_when_present() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be creatable");
+        let bin_dir = tempdir.path().join(".venv").join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create .venv/bin");
+        let python_path = bin_dir.join("python");
+        std::fs::write(&python_path, b"").expect("touch .venv/bin/python");
+
+        let worker = WorkerCommand::discover(tempdir.path().to_path_buf());
+        assert_eq!(worker.executable, python_path.display().to_string());
+        assert_eq!(worker.args, vec!["-m".to_owned(), WORKER_MODULE.to_owned()]);
+        assert_eq!(worker.project_root, tempdir.path().to_path_buf());
+        assert!(worker.timeout_override.is_none());
+    }
+
+    /// Pins the fallback branch: a project root without a `.venv`
+    /// resolves through `uv run --project <root> python -m <module>`.
+    /// This is the clone-and-run path for contributors who haven't
+    /// created a venv yet; a regression that dropped `--project` or
+    /// reordered the args would break worker startup on fresh clones.
+    #[test]
+    fn discover_falls_back_to_uv_run_when_venv_absent() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be creatable");
+
+        let worker = WorkerCommand::discover(tempdir.path().to_path_buf());
+        assert_eq!(worker.executable, "uv");
+        assert_eq!(
+            worker.args,
+            vec![
+                "run".to_owned(),
+                "--project".to_owned(),
+                tempdir.path().display().to_string(),
+                "python".to_owned(),
+                "-m".to_owned(),
+                WORKER_MODULE.to_owned(),
+            ],
+        );
+        assert_eq!(worker.project_root, tempdir.path().to_path_buf());
+        assert!(worker.timeout_override.is_none());
     }
 
     #[tokio::test]
