@@ -1581,6 +1581,79 @@ mod tests {
         Some((name.to_owned(), kind))
     }
 
+    /// Walk `CLAUDE.md` and pull out the verification chain — the
+    /// `&&`-joined sequence of commands inside the first fenced
+    /// ```bash``` block. Strips the leading `&& ` continuation
+    /// marker and the trailing `\` line-join, so callers compare bare
+    /// command strings. The block is stable enough today that a
+    /// stronger regex isn't justified; if the chain ever moves to a
+    /// non-bash fence, this helper will simply return empty and the
+    /// dependent test will surface it as a missing-fence panic.
+    fn extract_claude_md_verification_chain(contents: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut in_block = false;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if !in_block {
+                if trimmed.starts_with("```bash") {
+                    in_block = true;
+                }
+                continue;
+            }
+            if trimmed.starts_with("```") {
+                break;
+            }
+            let cleaned = trimmed
+                .trim_end_matches('\\')
+                .trim()
+                .trim_start_matches("&& ")
+                .trim()
+                .to_owned();
+            if !cleaned.is_empty() {
+                commands.push(cleaned);
+            }
+        }
+        commands
+    }
+
+    /// Walk `.github/workflows/ci.yml` and pull the `run:` line of
+    /// every step in the `verify` job that invokes `cargo` or
+    /// `uv run`. The match is intentionally narrow — it ignores
+    /// `name:`, `uses:`, the `apt-get` install step, and any other
+    /// scaffolding — so the resulting list is exactly the
+    /// verification chain CI gates merges on. The order is preserved
+    /// from file order, mirroring the verification chain's order in
+    /// `CLAUDE.md`.
+    fn extract_ci_verify_run_commands(contents: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("run: ") else {
+                continue;
+            };
+            let cmd = rest.trim();
+            if cmd.starts_with("cargo ") || cmd.starts_with("uv run ") {
+                commands.push(cmd.to_owned());
+            }
+        }
+        commands
+    }
+
+    /// Normalise a `cargo fmt` invocation to its canonical
+    /// write-mode form. CI runs `cargo fmt --all -- --check` (read-
+    /// only, fails on diff); `CLAUDE.md` documents the local
+    /// write-mode `cargo fmt --all`. They are the same step in
+    /// effect, just with the `-- --check` flag stripped on the CI
+    /// side. Other commands pass through unchanged.
+    fn normalise_fmt_command(cmd: &str) -> String {
+        if let Some(stripped) = cmd.strip_suffix(" -- --check")
+            && stripped.starts_with("cargo fmt")
+        {
+            return stripped.to_owned();
+        }
+        cmd.to_owned()
+    }
+
     /// Pull every package name declared under
     /// `[project.optional-dependencies].<group>` in pyproject. Handles
     /// the canonical multi-line array form (`<group> = [` opens, each
@@ -4122,6 +4195,126 @@ from voicelayer_orchestrator.providers import whisper_cli
                 "expected `{expected}` in {names:?}",
             );
         }
+    }
+
+    #[test]
+    fn extract_claude_md_verification_chain_strips_continuation_and_join_markers() {
+        let md = "\
+# Heading
+
+Some prose.
+
+```bash
+cargo fmt --all \\
+  && cargo clippy -- -D warnings \\
+  && cargo test --all
+```
+
+More prose.
+";
+        let commands = extract_claude_md_verification_chain(md);
+        assert_eq!(
+            commands,
+            vec![
+                "cargo fmt --all".to_owned(),
+                "cargo clippy -- -D warnings".to_owned(),
+                "cargo test --all".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn extract_ci_verify_run_commands_filters_to_cargo_and_uv_invocations() {
+        let yaml = "\
+jobs:
+  verify:
+    steps:
+      - name: Install deps
+        run: apt-get install -y foo
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+      - name: cargo test
+        run: cargo test --all
+      - name: ruff
+        run: uv run ruff check python
+";
+        let commands = extract_ci_verify_run_commands(yaml);
+        assert_eq!(
+            commands,
+            vec![
+                "cargo test --all".to_owned(),
+                "uv run ruff check python".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn normalise_fmt_command_drops_check_suffix_only_for_cargo_fmt() {
+        assert_eq!(
+            normalise_fmt_command("cargo fmt --all -- --check"),
+            "cargo fmt --all",
+        );
+        assert_eq!(normalise_fmt_command("cargo fmt -- --check"), "cargo fmt",);
+        // Not a fmt invocation — pass through unchanged even if a
+        // similarly-shaped suffix appears.
+        assert_eq!(
+            normalise_fmt_command("cargo clippy --all -- -D warnings"),
+            "cargo clippy --all -- -D warnings",
+        );
+    }
+
+    /// `CLAUDE.md` documents the verification chain that contributors
+    /// (and Claude) must run before closing a task; `.github/workflows/ci.yml`
+    /// must run the same chain so CI mirrors local-pass discipline. A
+    /// step added to one without the other is the failure mode: a
+    /// contributor follows `CLAUDE.md`, sees green locally, but CI
+    /// either skips a check (and lets the regression in) or runs an
+    /// extra check that the doc never mentions (and blocks an honest
+    /// PR with a surprise red).
+    ///
+    /// The single allowance: `cargo fmt --all` in `CLAUDE.md`
+    /// (write-mode) maps to `cargo fmt --all -- --check` in CI
+    /// (read-only). Both run the same formatter; only CI needs to
+    /// fail rather than rewrite. `normalise_fmt_command` collapses
+    /// the two onto a single canonical form before comparison.
+    #[test]
+    fn ci_verify_chain_matches_claude_md_verification_chain() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let claude_md =
+            std::fs::read_to_string(repo_root.join("CLAUDE.md")).expect("read CLAUDE.md");
+        let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml"))
+            .expect("read .github/workflows/ci.yml");
+
+        let chain_raw = extract_claude_md_verification_chain(&claude_md);
+        assert!(
+            !chain_raw.is_empty(),
+            "CLAUDE.md verification chain not found — the first ```bash``` block \
+             may have moved or been renamed",
+        );
+        let ci_raw = extract_ci_verify_run_commands(&ci_yaml);
+        assert!(
+            !ci_raw.is_empty(),
+            "ci.yml verify steps not found — the workflow may have been refactored \
+             to call the chain through a script",
+        );
+
+        let chain: Vec<String> = chain_raw.iter().map(|s| normalise_fmt_command(s)).collect();
+        let ci: Vec<String> = ci_raw.iter().map(|s| normalise_fmt_command(s)).collect();
+
+        assert_eq!(
+            chain, ci,
+            "verification chain drift between CLAUDE.md and .github/workflows/ci.yml.\n\
+             CLAUDE.md (normalised): {chain:#?}\n\
+             ci.yml (normalised): {ci:#?}\n\n\
+             Bring the two in sync: a step in `CLAUDE.md` that CI does not \
+             gate on lets contributors close work CI would have rejected, \
+             and a CI step missing from `CLAUDE.md` blocks PRs with a check \
+             nobody is told to run. The only sanctioned divergence is \
+             `cargo fmt --all` (CLAUDE.md, write-mode) vs \
+             `cargo fmt --all -- --check` (ci.yml, read-only); \
+             `normalise_fmt_command` already collapses that pair.",
+        );
     }
 
     /// Every package declared in `[project.optional-dependencies].vad`
