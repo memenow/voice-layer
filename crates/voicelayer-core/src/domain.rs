@@ -1304,6 +1304,45 @@ mod tests {
         None
     }
 
+    /// Walk a Markdown body and pull out every backtick-quoted file
+    /// path that contains at least one `/` and ends in a recognised
+    /// source extension. Filters out runtime paths
+    /// (`~/.config/...`, `/usr/local/...`, `${HOME}/...`) by
+    /// requiring the first character to be an ASCII lowercase
+    /// letter — every repo-relative path the docs reference today
+    /// starts with one of `crates/`, `docs/`, `openapi/`, `python/`,
+    /// `providers/`, `scripts/`, `systemd/`, or `tests/`. Returns
+    /// the raw path text — callers are responsible for resolving
+    /// shorthand conventions (e.g. `providers/foo.py` →
+    /// `python/voicelayer_orchestrator/providers/foo.py`).
+    fn extract_doc_file_path_refs(contents: &str) -> std::collections::BTreeSet<String> {
+        let exts = [".rs", ".py", ".toml", ".sh", ".yaml", ".md", ".service"];
+        let mut paths = std::collections::BTreeSet::new();
+        let mut search = contents;
+        while let Some(idx) = search.find('`') {
+            let after = &search[idx + 1..];
+            let Some(close) = after.find('`') else {
+                break;
+            };
+            let inner = &after[..close];
+            search = &after[close + 1..];
+            if !inner.contains('/') {
+                continue;
+            }
+            if !exts.iter().any(|ext| inner.ends_with(ext)) {
+                continue;
+            }
+            if inner.chars().any(char::is_whitespace) {
+                continue;
+            }
+            if !inner.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                continue;
+            }
+            paths.insert(inner.to_owned());
+        }
+        paths
+    }
+
     /// Walk a Markdown body and pull out every `[text](path.md)` or
     /// `[text](path.md#fragment)` link target whose path component
     /// ends in `.md`. Skips absolute URLs (`http://`, `https://`,
@@ -2012,6 +2051,23 @@ components:
     fn extract_pyproject_license_text_returns_none_when_field_absent() {
         let toml = "[project]\nname = \"foo\"\n";
         assert!(extract_pyproject_license_text(toml).is_none());
+    }
+
+    #[test]
+    fn extract_doc_file_path_refs_filters_to_path_shaped_tokens() {
+        let md = concat!(
+            "See `crates/voicelayerd/src/lib.rs` and `providers/foo.py`.\n",
+            "Bare identifier `compose_payload` is not a path.\n",
+            "Single-segment basename `whisper-cli` has no slash.\n",
+            "Spaces inside backticks `not a path.py` should be skipped.\n",
+            "Wrong extension `path/to/data.txt` should be skipped.\n",
+            "Runtime paths `~/.config/voicelayer/config.toml`, `/usr/bin/foo.sh`, \n",
+            "`${HOME}/foo.py` must not be classified as repo refs.\n",
+        );
+        let paths = extract_doc_file_path_refs(md);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("crates/voicelayerd/src/lib.rs"));
+        assert!(paths.contains("providers/foo.py"));
     }
 
     #[test]
@@ -3457,6 +3513,65 @@ components:
             "broken markdown cross-references:\n  - {}\n\n\
              Either rename the link target back, drop the reference, \
              or add a stub doc at the target path.",
+            broken.join("\n  - "),
+        );
+    }
+
+    /// Walk every `.md` under `docs/` plus the repo-root `README.md`,
+    /// collect every backtick-quoted file path with a path
+    /// separator and a recognised source extension, and assert each
+    /// resolves to an existing file. The check tolerates the
+    /// shorthand convention used in
+    /// `docs/architecture/python-worker-protocol.md`: a path
+    /// starting with `providers/` is implicitly anchored under
+    /// `python/voicelayer_orchestrator/`. Anything else is resolved
+    /// against the repo root.
+    ///
+    /// Catches: a renamed source file (`scripts/foo.sh`) or doc
+    /// (`docs/guides/desktop.md`) whose inbound prose references
+    /// were missed during the rename — Markdown's `()` link form is
+    /// already covered by #69, but bare backtick references are
+    /// not, and contributors use those just as often.
+    #[test]
+    fn every_doc_file_path_reference_resolves_to_an_existing_file() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let mut md_files = vec![repo_root.join("README.md")];
+        collect_markdown_files(&repo_root.join("docs"), &mut md_files)
+            .expect("walk docs/ directory");
+
+        let mut broken: Vec<String> = Vec::new();
+        for md_file in &md_files {
+            let contents = match std::fs::read_to_string(md_file) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for path in extract_doc_file_path_refs(&contents) {
+                let primary = repo_root.join(&path);
+                let shorthand = repo_root
+                    .join("python")
+                    .join("voicelayer_orchestrator")
+                    .join(&path);
+                if primary.exists() || shorthand.exists() {
+                    continue;
+                }
+                broken.push(format!(
+                    "{} → `{path}`",
+                    md_file
+                        .strip_prefix(&repo_root)
+                        .unwrap_or(md_file)
+                        .display(),
+                ));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "broken doc file-path references:\n  - {}\n\n\
+             Either fix the path, drop the mention, or restore the \
+             missing file. Paths under `providers/` are also tried \
+             with the `python/voicelayer_orchestrator/` prefix to \
+             match the shorthand convention used in the python-worker \
+             protocol doc.",
             broken.join("\n  - "),
         );
     }
