@@ -201,6 +201,7 @@ fn build_app_router(state: Arc<AppState>) -> Router {
         .route("/v1/health", get(get_health))
         .route("/v1/providers", get(list_providers))
         .route("/v1/events/stream", get(stream_events))
+        .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/dictation", post(create_dictation_session))
         .route("/v1/sessions/dictation/stop", post(stop_dictation_session))
         .route("/v1/sessions/compose", post(create_composition_job))
@@ -287,6 +288,30 @@ async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 
     Json(ProviderListResponse { providers })
+}
+
+/// List every `CaptureSession` the daemon currently tracks.
+///
+/// Sessions live in `state.sessions` from `create` until they reach a
+/// terminal state (`Completed` / `Failed`); the map is not pruned on
+/// stop so a recently-finished session is still discoverable here.
+/// Operators reach this endpoint when they have lost the
+/// `session_id` returned by an earlier `POST /v1/sessions/dictation`
+/// (e.g. a CLI window scrolled off-screen) and need to recover it
+/// before issuing the matching stop call.
+///
+/// The return value is a JSON array of `CaptureSession`. There is
+/// intentionally no enclosing `{"sessions": [...]}` wrapper — the
+/// list itself is the resource and `vl dictation list` consumes it
+/// directly via `Vec<CaptureSession>`.
+async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = state.sessions.read().await;
+    let mut entries: Vec<CaptureSession> = sessions.values().cloned().collect();
+    // Stable order so pretty-printed output and shell-script parsing
+    // can rely on the listing — the underlying HashMap iteration order
+    // is otherwise nondeterministic.
+    entries.sort_by_key(|session| session.created_at_millis);
+    Json(entries)
 }
 
 async fn stream_events(
@@ -3241,6 +3266,66 @@ mod http_api_tests {
             result.failure_kind,
             Some(DictationFailureKind::RecordingFailed),
         );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_empty_array_when_no_sessions_have_been_created() {
+        // The endpoint is unconditionally available; on a fresh daemon
+        // it must return `[]`, not `{"sessions": []}` or 404. Pin both
+        // the status and the empty-array shape so a future wrapper
+        // type would require an explicit migration.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let (status, sessions): (StatusCode, Vec<CaptureSession>) =
+            get_json(router, "/v1/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_includes_a_running_session_after_dictation_start() {
+        // Start a one-shot live session via the public API and confirm
+        // `GET /v1/sessions` surfaces it. Pinning the round-trip
+        // protects against a future change that registered sessions
+        // somewhere other than `state.sessions` and silently broke
+        // the listing.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: None,
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::OneShot,
+        };
+        let (post_status, started): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&request).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::OK);
+        assert_eq!(started.state, SessionState::Listening);
+
+        let (status, sessions): (StatusCode, Vec<CaptureSession>) =
+            get_json(router, "/v1/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, started.session_id);
+        assert_eq!(sessions[0].state, SessionState::Listening);
     }
 
     #[tokio::test]
