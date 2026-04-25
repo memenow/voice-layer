@@ -484,6 +484,10 @@ mod tests {
         SegmentationMode, SessionMode, SessionState, StartDictationRequest, StopDictationRequest,
         TranscribeRequest, TranscriptionResult, TranslateRequest, TriggerKind, WorkerHealthSummary,
     };
+    // `ProviderDescriptor` and `ProviderKind` live in `provider.rs`;
+    // pulled in here because the openapi drift guard machinery is
+    // centralised in this module's tests rather than duplicated.
+    use crate::{ProviderDescriptor, ProviderKind};
     use uuid::Uuid;
 
     #[test]
@@ -1616,6 +1620,43 @@ mod tests {
         ]
     }
 
+    /// Materialise every `ProviderKind` variant. Inlined under
+    /// `ProviderDescriptor.kind`. Adding a new provider category
+    /// (e.g. a `Vad` kind) must update both this list and the openapi
+    /// schema.
+    fn enumerate_provider_kind_variants() -> Vec<ProviderKind> {
+        let _exhaustive: fn(ProviderKind) -> &'static str = |variant| match variant {
+            ProviderKind::Asr => "asr",
+            ProviderKind::Llm => "llm",
+            ProviderKind::Tts => "tts",
+            ProviderKind::HostAdapter => "host_adapter",
+        };
+        vec![
+            ProviderKind::Asr,
+            ProviderKind::Llm,
+            ProviderKind::Tts,
+            ProviderKind::HostAdapter,
+        ]
+    }
+
+    /// Sentinel for `ProviderDescriptor`. Strings empty / booleans
+    /// false so the cross-check exercises the property-presence and
+    /// required-list contract without depending on real catalog data.
+    /// The `kind` arm is materialised explicitly to keep the sentinel
+    /// readable; it's unrelated to the variant set the property-enum
+    /// guard pins.
+    fn provider_descriptor_sentinel() -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: String::new(),
+            kind: ProviderKind::Asr,
+            transport: String::new(),
+            local: false,
+            default_enabled: false,
+            experimental: false,
+            license: String::new(),
+        }
+    }
+
     #[test]
     fn openapi_worker_health_summary_documents_every_field() {
         assert_openapi_documents_every_field(
@@ -1934,6 +1975,28 @@ mod tests {
             "ComposeRequest",
             "archetype",
             &enumerate_composition_archetype_variants(),
+        );
+    }
+
+    // `ProviderDescriptor` lives in `provider.rs` but its openapi
+    // contract sits next to the rest of the schema components.
+    // Closing the drift surface for the last public component:
+
+    #[test]
+    fn openapi_provider_descriptor_documents_every_field() {
+        assert_openapi_documents_every_field(
+            "ProviderDescriptor",
+            &provider_descriptor_sentinel(),
+            &[],
+        );
+    }
+
+    #[test]
+    fn openapi_provider_descriptor_kind_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "ProviderDescriptor",
+            "kind",
+            &enumerate_provider_kind_variants(),
         );
     }
 }
