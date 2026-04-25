@@ -84,3 +84,62 @@ pub fn desktop_socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{default_socket_path, desktop_socket_path};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Serialises any test that mutates `VOICELAYER_SOCKET_PATH`.
+    /// Same rationale as the matching lock in `vl::uds::tests`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Pins the env-set branch. The desktop shell shares the socket
+    /// override convention with the CLI; a regression that always
+    /// returned `default_socket_path()` would silently ignore the
+    /// operator's `VOICELAYER_SOCKET_PATH` and connect to the wrong
+    /// daemon.
+    #[test]
+    fn desktop_socket_path_uses_voicelayer_socket_path_when_set() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("VOICELAYER_SOCKET_PATH");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::set_var("VOICELAYER_SOCKET_PATH", "/run/test-desktop/daemon.sock");
+        }
+        let path = desktop_socket_path();
+        assert_eq!(path, PathBuf::from("/run/test-desktop/daemon.sock"));
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("VOICELAYER_SOCKET_PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("VOICELAYER_SOCKET_PATH");
+            },
+        }
+    }
+
+    /// Pins the unset branch: with no override, the resolver must
+    /// delegate to `voicelayerd::default_socket_path()` so the CLI
+    /// and desktop shell always land on the same socket by default.
+    #[test]
+    fn desktop_socket_path_falls_back_to_default_socket_path_when_env_unset() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("VOICELAYER_SOCKET_PATH");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::remove_var("VOICELAYER_SOCKET_PATH");
+        }
+        assert_eq!(desktop_socket_path(), default_socket_path());
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("VOICELAYER_SOCKET_PATH", value);
+            }
+        }
+    }
+}
