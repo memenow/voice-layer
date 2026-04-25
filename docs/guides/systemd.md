@@ -131,6 +131,19 @@ binary so systemd tracks the server PID directly.
 `"server"` once the daemon successfully probes
 `http://$HOST:$PORT/`, otherwise `"cli"` or `"unconfigured"`.
 
+It also reports both unit files separately so a misconfigured install
+(daemon up, whisper-server unit missing or stopped) can be diagnosed
+without an extra `systemctl --user status` round trip:
+
+- `systemd_unit_installed` / `systemd_unit_active` — the daemon unit
+  (`voicelayerd.service`).
+- `whisper_server_unit_installed` / `whisper_server_unit_active` — the
+  optional persistent server unit
+  (`voicelayer-whisper-server.service`). `installed=true` plus
+  `active=false` is the expected state when you let the daemon
+  autostart whisper-server lazily; both `true` is the dedicated-unit
+  setup; both `false` is the cli-only fallback.
+
 ### Docker alternative
 
 The shipped unit runs a native `whisper-server` binary. To use the

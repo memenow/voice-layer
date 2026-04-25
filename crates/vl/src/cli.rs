@@ -305,6 +305,8 @@ struct DoctorReport {
     recorder: RecorderDiagnostics,
     systemd_unit_installed: bool,
     systemd_unit_active: bool,
+    whisper_server_unit_installed: bool,
+    whisper_server_unit_active: bool,
     wayland_display: Option<String>,
     x11_display: Option<String>,
     dbus_session_bus_address: Option<String>,
@@ -417,22 +419,32 @@ fn llama_autostart_active() -> bool {
     false
 }
 
-fn systemd_user_unit_path() -> Option<PathBuf> {
+/// Build the canonical path the install script lays a user unit at.
+/// `unit_file_name` is the full filename (e.g. `"voicelayerd.service"`),
+/// not the unit name passed to systemctl. Returns `None` when the
+/// environment lacks both `XDG_CONFIG_HOME` and `HOME`, which would
+/// only happen in a degenerate sandbox where no install location can
+/// be inferred.
+fn systemd_user_unit_path(unit_file_name: &str) -> Option<PathBuf> {
     let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config_dir.join("systemd/user/voicelayerd.service"))
+    Some(config_dir.join("systemd/user").join(unit_file_name))
 }
 
-fn systemd_unit_installed() -> bool {
-    systemd_user_unit_path()
+fn systemd_unit_installed(unit_file_name: &str) -> bool {
+    systemd_user_unit_path(unit_file_name)
         .map(|path| path.is_file())
         .unwrap_or(false)
 }
 
-fn systemd_unit_active() -> bool {
+/// Probe whether a user-level systemd unit is currently active by
+/// shelling out to `systemctl --user is-active`. `unit_name` is the
+/// systemd unit name without the `.service` suffix
+/// (`"voicelayerd"`, `"voicelayer-whisper-server"`).
+fn systemd_unit_active(unit_name: &str) -> bool {
     ProcessCommand::new("systemctl")
-        .args(["--user", "is-active", "voicelayerd"])
+        .args(["--user", "is-active", unit_name])
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -756,8 +768,12 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 global_shortcuts_portal_version: portal.version,
                 global_shortcuts_portal_error: portal.error,
                 recorder: recorder_diagnostics(RecorderBackend::Auto),
-                systemd_unit_installed: systemd_unit_installed(),
-                systemd_unit_active: systemd_unit_active(),
+                systemd_unit_installed: systemd_unit_installed("voicelayerd.service"),
+                systemd_unit_active: systemd_unit_active("voicelayerd"),
+                whisper_server_unit_installed: systemd_unit_installed(
+                    "voicelayer-whisper-server.service",
+                ),
+                whisper_server_unit_active: systemd_unit_active("voicelayer-whisper-server"),
                 wayland_display: std::env::var("WAYLAND_DISPLAY").ok(),
                 x11_display: std::env::var("DISPLAY").ok(),
                 dbus_session_bus_address: std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),
@@ -956,7 +972,10 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::sync::Mutex;
 
-    use super::{detect_whisper_mode, env_is_set, env_is_truthy, pid_matches_command};
+    use super::{
+        detect_whisper_mode, env_is_set, env_is_truthy, pid_matches_command,
+        systemd_unit_installed, systemd_user_unit_path,
+    };
 
     /// Serializes process-env mutation across every test in this module.
     /// Cargo runs unit tests concurrently by default, and Rust 2024 flagged
@@ -1072,6 +1091,101 @@ mod tests {
     /// checks would otherwise only catch *after* the binary has parsed
     /// args — here we stop the regression at parse time, where the user
     /// sees the error.
+    /// Helper that snapshots-and-clears two env vars under `ENV_LOCK`,
+    /// runs `body`, and restores the originals. Avoids the boilerplate
+    /// of preserving / restoring `XDG_CONFIG_HOME` and `HOME` in every
+    /// test that needs to drive `systemd_user_unit_path` through one of
+    /// its branches.
+    fn with_clean_xdg_and_home<R>(body: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        reset_var("XDG_CONFIG_HOME");
+        reset_var("HOME");
+        let result = body();
+        match prev_xdg {
+            Some(value) => set_var("XDG_CONFIG_HOME", value.to_str().unwrap_or_default()),
+            None => reset_var("XDG_CONFIG_HOME"),
+        }
+        match prev_home {
+            Some(value) => set_var("HOME", value.to_str().unwrap_or_default()),
+            None => reset_var("HOME"),
+        }
+        result
+    }
+
+    /// Pins the XDG branch. Doctor's `systemd_unit_installed` field
+    /// drives operator-facing diagnostics ("did the install script
+    /// land the unit?"); a regression that ignored `XDG_CONFIG_HOME`
+    /// would silently misreport on hosts that override it.
+    #[test]
+    fn systemd_user_unit_path_uses_xdg_config_home_when_set() {
+        with_clean_xdg_and_home(|| {
+            set_var("XDG_CONFIG_HOME", "/srv/test-xdg");
+            let path =
+                systemd_user_unit_path("voicelayerd.service").expect("XDG set must yield a path");
+            assert_eq!(
+                path,
+                std::path::PathBuf::from("/srv/test-xdg/systemd/user/voicelayerd.service"),
+            );
+        });
+    }
+
+    /// Pins the HOME-fallback branch. The install script targets
+    /// `~/.config/systemd/user/` regardless of XDG; this asserts the
+    /// helper agrees so doctor cannot disagree with the installer.
+    #[test]
+    fn systemd_user_unit_path_falls_back_to_home_dot_config_when_xdg_unset() {
+        with_clean_xdg_and_home(|| {
+            set_var("HOME", "/home/test-user");
+            let path = systemd_user_unit_path("voicelayer-whisper-server.service")
+                .expect("HOME set must yield a path");
+            assert_eq!(
+                path,
+                std::path::PathBuf::from(
+                    "/home/test-user/.config/systemd/user/voicelayer-whisper-server.service",
+                ),
+            );
+        });
+    }
+
+    /// Pins the no-anchor case. A degenerate sandbox (no XDG, no HOME)
+    /// must yield `None` so doctor reports the unit as not installed
+    /// instead of crashing or guessing a path that does not exist.
+    #[test]
+    fn systemd_user_unit_path_returns_none_when_xdg_and_home_both_unset() {
+        with_clean_xdg_and_home(|| {
+            assert!(systemd_user_unit_path("voicelayerd.service").is_none());
+        });
+    }
+
+    /// Pins the affirmative branch of `systemd_unit_installed` and
+    /// proves the unit-name parameter is honoured: the same XDG
+    /// directory holds `voicelayerd.service` but not
+    /// `voicelayer-whisper-server.service`, and the helper must
+    /// report exactly one as installed.
+    #[test]
+    fn systemd_unit_installed_distinguishes_present_and_absent_unit_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let unit_dir = tempdir.path().join("systemd/user");
+        std::fs::create_dir_all(&unit_dir).expect("create unit dir");
+        std::fs::write(unit_dir.join("voicelayerd.service"), b"")
+            .expect("touch voicelayerd.service");
+
+        with_clean_xdg_and_home(|| {
+            set_var("XDG_CONFIG_HOME", tempdir.path().to_str().expect("utf-8"));
+            assert!(
+                systemd_unit_installed("voicelayerd.service"),
+                "voicelayerd.service exists in the XDG dir; helper must report installed",
+            );
+            assert!(
+                !systemd_unit_installed("voicelayer-whisper-server.service"),
+                "whisper-server unit absent; helper must report not installed even though \
+                 the sibling unit is present in the same directory",
+            );
+        });
+    }
+
     mod dictation_start_parsing {
         use clap::Parser;
 
