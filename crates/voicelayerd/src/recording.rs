@@ -308,8 +308,8 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRecording, RecordingError, recorder_diagnostics, resolve_recorder_backend,
-        stop_recording_process,
+        ActiveRecording, RecordingError, maybe_cleanup_audio_file, recorder_diagnostics,
+        resolve_recorder_backend, stop_recording_process,
     };
     use std::fs;
     use tokio::process::Command;
@@ -425,5 +425,73 @@ mod tests {
             Err(RecordingError::MissingOutput(_)) => {}
             other => panic!("expected MissingOutput for empty file, got {other:?}"),
         }
+    }
+
+    /// Pins the `keep_audio = true` branch. The dictation lifecycle
+    /// hands the cleanup decision to the operator via the
+    /// `keep_audio` flag on `StartDictationRequest` /
+    /// `DictationCaptureRequest`; with the flag set the recording
+    /// must survive on disk and its path must be reported back so
+    /// `DictationCaptureResult.audio_file` can carry it. A regression
+    /// that always cleaned up regardless of the flag would silently
+    /// break debugging workflows that rely on retaining captures.
+    #[test]
+    fn maybe_cleanup_audio_file_keeps_file_and_returns_path_when_keep_audio_set() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let audio_file = tempdir.path().join("seed.wav");
+        fs::write(&audio_file, b"audio bytes").expect("seed audio");
+
+        let result = maybe_cleanup_audio_file(&audio_file, true);
+
+        assert_eq!(
+            result.as_deref(),
+            Some(audio_file.display().to_string()).as_deref()
+        );
+        assert!(
+            audio_file.exists(),
+            "keep_audio=true must leave the file in place; was deleted",
+        );
+    }
+
+    /// Pins the `keep_audio = false` branch. Default flow: the
+    /// recording is consumed by the worker for transcription and
+    /// then removed from the runtime directory. A regression that
+    /// returned the path even though the file was deleted would
+    /// surface a phantom audio_file in `DictationCaptureResult` and
+    /// the operator would dereference a nonexistent path.
+    #[test]
+    fn maybe_cleanup_audio_file_deletes_file_and_returns_none_when_keep_audio_false() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let audio_file = tempdir.path().join("seed.wav");
+        fs::write(&audio_file, b"audio bytes").expect("seed audio");
+
+        let result = maybe_cleanup_audio_file(&audio_file, false);
+
+        assert!(
+            result.is_none(),
+            "keep_audio=false must return None to suppress audio_file in the result",
+        );
+        assert!(
+            !audio_file.exists(),
+            "keep_audio=false must delete the file from disk",
+        );
+    }
+
+    /// Defensive: with `keep_audio = false` and the file already
+    /// missing, the cleanup must not panic. The current
+    /// implementation discards the `fs::remove_file` error, so this
+    /// pin protects against a future refactor that would surface
+    /// the absent-file IO error and crash the dictation path.
+    #[test]
+    fn maybe_cleanup_audio_file_tolerates_already_missing_file_when_keep_audio_false() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let audio_file = tempdir.path().join("never-existed.wav");
+        assert!(
+            !audio_file.exists(),
+            "test precondition: the audio file must not exist",
+        );
+
+        let result = maybe_cleanup_audio_file(&audio_file, false);
+        assert!(result.is_none());
     }
 }
