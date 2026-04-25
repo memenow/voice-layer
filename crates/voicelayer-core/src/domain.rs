@@ -1414,6 +1414,65 @@ mod tests {
         targets
     }
 
+    /// Walk an `install.sh` shell script and pull out every binary
+    /// name passed to `cargo build` via `--bin <name>`. The match is
+    /// purely textual — a line like
+    /// `cargo build --release --bin vl --bin vl-desktop` returns
+    /// `{"vl", "vl-desktop"}`. Stops at whitespace or a `\`
+    /// continuation marker, so a name with internal hyphens
+    /// (`vl-desktop`) is captured intact.
+    fn extract_install_sh_cargo_build_bins(source: &str) -> std::collections::BTreeSet<String> {
+        let mut bins = std::collections::BTreeSet::new();
+        let mut search = source;
+        while let Some(idx) = search.find("--bin ") {
+            let after = &search[idx + "--bin ".len()..];
+            let end = after
+                .find(|c: char| c.is_whitespace() || matches!(c, '\\' | ')' | '"' | '\''))
+                .unwrap_or(after.len());
+            let name = after[..end].trim();
+            if !name.is_empty() {
+                bins.insert(name.to_owned());
+            }
+            search = &after[end..];
+        }
+        bins
+    }
+
+    /// Walk an `install.sh` shell script and pull out every
+    /// `(source, dest)` pair from `install -m <mode> "<source>" "<dest>"`
+    /// invocations. Multi-line install commands are collapsed via
+    /// `\\\n` → ` ` so the source and dest end up on the same logical
+    /// line before scanning.
+    ///
+    /// Returns shell literals as-written, so `${REPO_ROOT}/...` and
+    /// `${BIN_DIR}/...` are preserved. Callers do their own
+    /// substitution (via `strip_prefix`) when resolving against the
+    /// real filesystem.
+    fn extract_install_sh_install_pairs(source: &str) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        let collapsed = source.replace("\\\n", " ");
+        for line in collapsed.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("install -m") {
+                continue;
+            }
+            let mut search = trimmed;
+            let mut quoted: Vec<String> = Vec::new();
+            while let Some(idx) = search.find('"') {
+                let after = &search[idx + 1..];
+                let Some(close) = after.find('"') else {
+                    break;
+                };
+                quoted.push(after[..close].to_owned());
+                search = &after[close + 1..];
+            }
+            if quoted.len() >= 2 {
+                pairs.push((quoted[0].clone(), quoted[1].clone()));
+            }
+        }
+        pairs
+    }
+
     /// Walk a systemd `.service` unit file and pull out the basename
     /// of every `ExecStart=%h/.local/bin/<name>` line. systemd
     /// expands `%h` to the user's home directory at runtime; the
@@ -4357,6 +4416,148 @@ jobs:
              in pyproject.toml or wire the import in the provider that needs them. \
              A dead extra installs cost without effect when an operator runs \
              `uv sync --extra vad`.",
+        );
+    }
+
+    #[test]
+    fn extract_install_sh_cargo_build_bins_collects_repeated_bin_flags() {
+        let sh = "\
+#!/usr/bin/env bash
+cargo build --release --bin vl --bin vl-desktop
+";
+        let bins = extract_install_sh_cargo_build_bins(sh);
+        assert_eq!(
+            bins,
+            ["vl", "vl-desktop"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_install_sh_cargo_build_bins_handles_line_continuations() {
+        let sh = "\
+cargo build --release \\
+  --bin vl \\
+  --bin vl-desktop
+";
+        let bins = extract_install_sh_cargo_build_bins(sh);
+        assert_eq!(
+            bins,
+            ["vl", "vl-desktop"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_install_sh_cargo_build_bins_strips_trailing_subshell_paren() {
+        // The shape used in `scripts/install.sh` today wraps the build
+        // in a `(cd ... && cargo build ...)` subshell, so the final
+        // `--bin <name>` runs straight into a `)`. Without dropping
+        // the paren the extractor returns `"vl-desktop)"` and any
+        // membership check against `"vl-desktop"` fails silently.
+        let sh = "(cd \"${REPO_ROOT}\" && cargo build --release --bin vl --bin vl-desktop)";
+        let bins = extract_install_sh_cargo_build_bins(sh);
+        assert_eq!(
+            bins,
+            ["vl", "vl-desktop"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_install_sh_install_pairs_collapses_continuation_lines() {
+        // The shape used in `scripts/install.sh` for the
+        // whisper-server-run wrapper: source on line N, dest on
+        // line N+1, separated by `\` line-join.
+        let sh = "\
+install -m 0755 \"${REPO_ROOT}/scripts/voicelayer-whisper-server-run.sh\" \\
+  \"${BIN_DIR}/voicelayer-whisper-server-run.sh\"
+install -m 0755 \"${REPO_ROOT}/target/release/vl\" \"${BIN_DIR}/vl\"
+";
+        let pairs = extract_install_sh_install_pairs(sh);
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "${REPO_ROOT}/scripts/voicelayer-whisper-server-run.sh".to_owned(),
+                    "${BIN_DIR}/voicelayer-whisper-server-run.sh".to_owned(),
+                ),
+                (
+                    "${REPO_ROOT}/target/release/vl".to_owned(),
+                    "${BIN_DIR}/vl".to_owned(),
+                ),
+            ],
+        );
+    }
+
+    /// Every `install -m 0755 "<source>" "${BIN_DIR}/<dest>"` line in
+    /// `scripts/install.sh` must point at a source that this script
+    /// actually produces or ships:
+    ///
+    /// - `${REPO_ROOT}/target/release/<name>` requires a matching
+    ///   `--bin <name>` flag in the `cargo build` invocation; without
+    ///   it cargo never emits the binary and the install fails at
+    ///   runtime.
+    /// - `${REPO_ROOT}/<rel>` (any other repo-relative path, e.g.
+    ///   `scripts/foo.sh`) requires the file to exist on disk.
+    ///
+    /// Catches a future contributor adding `--bin voicelayerd` to an
+    /// install line without remembering to add it to the
+    /// `cargo build` flags, or adding a wrapper script install
+    /// without committing the wrapper.
+    #[test]
+    fn install_sh_install_targets_resolve_to_either_built_or_shipped_sources() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let install_sh = std::fs::read_to_string(repo_root.join("scripts/install.sh"))
+            .expect("read scripts/install.sh");
+
+        let built_bins = extract_install_sh_cargo_build_bins(&install_sh);
+        assert!(
+            !built_bins.is_empty(),
+            "expected at least one `--bin` flag in install.sh's `cargo build`",
+        );
+        let pairs = extract_install_sh_install_pairs(&install_sh);
+        assert!(
+            !pairs.is_empty(),
+            "expected at least one `install -m` line in install.sh",
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+        for (source, dest) in pairs {
+            if !dest.contains("${BIN_DIR}") {
+                continue;
+            }
+            if let Some(name) = source.strip_prefix("${REPO_ROOT}/target/release/") {
+                if !built_bins.contains(name) {
+                    violations.push(format!(
+                        "{source} -> {dest}: install line copies a cargo binary that \
+                         the script never builds (no `--bin {name}` flag)",
+                    ));
+                }
+            } else if let Some(rel) = source.strip_prefix("${REPO_ROOT}/") {
+                let abs = repo_root.join(rel);
+                if !abs.exists() {
+                    violations.push(format!(
+                        "{source} -> {dest}: source path `{}` does not exist on disk",
+                        abs.display(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "scripts/install.sh references missing or unbuilt sources:\n  - {}\n\n\
+             For a `target/release/<name>` source, add `--bin <name>` to the \
+             `cargo build` line. For a repo-relative source (e.g. `scripts/foo.sh`), \
+             commit the file at the referenced path.",
+            violations.join("\n  - "),
         );
     }
 }
