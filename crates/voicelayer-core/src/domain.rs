@@ -1679,6 +1679,41 @@ mod tests {
         Some((name.to_owned(), kind))
     }
 
+    /// Walk a Markdown body and pull out every backtick-quoted
+    /// `crates/<name>` literal where `<name>` is a single segment
+    /// (no further `/`), composed of alphanumerics, hyphens, or
+    /// underscores. Designed for the README's Architecture section
+    /// and any prose mention of a workspace member crate. Rejects
+    /// deeper paths like `crates/vl/src/main.rs` (those are
+    /// already covered by `extract_doc_file_path_refs`) and
+    /// non-crate mentions like `crates/` (the bare directory).
+    fn extract_readme_crate_path_refs(contents: &str) -> std::collections::BTreeSet<String> {
+        let mut refs = std::collections::BTreeSet::new();
+        let mut search = contents;
+        while let Some(idx) = search.find('`') {
+            let after = &search[idx + 1..];
+            let Some(close) = after.find('`') else {
+                break;
+            };
+            let inner = &after[..close];
+            search = &after[close + 1..];
+            let Some(rest) = inner.strip_prefix("crates/") else {
+                continue;
+            };
+            if rest.is_empty() || rest.contains('/') {
+                continue;
+            }
+            if !rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                continue;
+            }
+            refs.insert(rest.to_owned());
+        }
+        refs
+    }
+
     /// Pull the version floor a README list-item declares for a
     /// language requirement. Targets the canonical
     /// `- <Lang> <X.Y>+` shape (e.g. `- Rust 1.88+` or
@@ -4854,5 +4889,92 @@ ENV_DIR=\"${VOICELAYER_INSTALL_ENV_DIR:-${HOME}/.config/voicelayer}\"
                 );
             }
         }
+    }
+
+    #[test]
+    fn extract_readme_crate_path_refs_collects_single_segment_paths() {
+        let md = "\
+- `crates/voicelayer-core`: shared types
+- `crates/voicelayerd`: daemon
+- `crates/vl`: CLI
+- See also `crates/vl/src/main.rs` for the entry point.
+- The bare directory `crates/` is not a crate.
+";
+        let refs = extract_readme_crate_path_refs(md);
+        assert_eq!(
+            refs,
+            ["vl", "voicelayer-core", "voicelayerd"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "deeper paths and bare `crates/` must be rejected",
+        );
+    }
+
+    #[test]
+    fn extract_readme_crate_path_refs_rejects_non_alphanumeric_segments() {
+        // A backtick-quoted `crates/foo bar` is prose, not a crate
+        // reference, and should be rejected.
+        let md = "Open `crates/foo bar` to see the demo.";
+        assert!(extract_readme_crate_path_refs(md).is_empty());
+    }
+
+    /// Every workspace member listed in `Cargo.toml` must be
+    /// mentioned in the README — typically in the Architecture
+    /// section, but anywhere in the file qualifies. And every
+    /// backtick-quoted `crates/<name>` reference in the README
+    /// must point at a real workspace member; a typo like
+    /// `crates/voicelayer-cor` becomes a broken cross-reference
+    /// the moment a contributor clicks through it.
+    ///
+    /// The drift mode in both directions is silent. Forward: a new
+    /// crate gets added to the workspace, the architecture section
+    /// stays a list of three, and a reader walks away thinking the
+    /// new crate is unimportant or doesn't exist. Reverse: a typo
+    /// or a renamed crate leaves the README pointing at nothing,
+    /// and `cargo` happily builds because the README is not part
+    /// of any compile path.
+    #[test]
+    fn readme_crate_mentions_match_workspace_members_bidirectionally() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let cargo_toml = std::fs::read_to_string(repo_root.join("Cargo.toml"))
+            .expect("read workspace Cargo.toml");
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("read README.md");
+
+        let members = extract_cargo_workspace_members(&cargo_toml);
+        let member_names: std::collections::BTreeSet<String> = members
+            .iter()
+            .filter_map(|m| m.strip_prefix("crates/").map(str::to_owned))
+            .collect();
+        assert!(
+            !member_names.is_empty(),
+            "expected at least one `crates/<name>` member in Cargo.toml — \
+             extract_cargo_workspace_members may be misparsing",
+        );
+
+        let readme_refs = extract_readme_crate_path_refs(&readme);
+        assert!(
+            !readme_refs.is_empty(),
+            "expected at least one `crates/<name>` reference in README — \
+             the Architecture section may have moved",
+        );
+
+        let missing_in_readme: Vec<&String> = member_names.difference(&readme_refs).collect();
+        assert!(
+            missing_in_readme.is_empty(),
+            "workspace members not mentioned in README: {missing_in_readme:?}\n\n\
+             Add a backtick-quoted `crates/<name>` reference in the README \
+             (typically under \"Architecture\") so a reader can locate the \
+             crate from the project front page.",
+        );
+
+        let typo_in_readme: Vec<&String> = readme_refs.difference(&member_names).collect();
+        assert!(
+            typo_in_readme.is_empty(),
+            "README references crates that the workspace does not declare: {typo_in_readme:?}\n\n\
+             Fix the typo, drop the mention, or add the member to \
+             [workspace] members in `Cargo.toml`.",
+        );
     }
 }
