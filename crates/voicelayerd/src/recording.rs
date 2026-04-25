@@ -308,8 +308,8 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRecording, RecordingError, maybe_cleanup_audio_file, recorder_diagnostics,
-        resolve_recorder_backend, stop_recording_process,
+        ActiveRecording, RecordingError, is_executable, maybe_cleanup_audio_file,
+        recorder_diagnostics, resolve_executable, resolve_recorder_backend, stop_recording_process,
     };
     use std::fs;
     use tokio::process::Command;
@@ -493,5 +493,82 @@ mod tests {
 
         let result = maybe_cleanup_audio_file(&audio_file, false);
         assert!(result.is_none());
+    }
+
+    /// `is_executable` is the gate `resolve_executable` uses to skip
+    /// non-executable PATH entries (e.g. data files that happen to
+    /// share a name with a binary). Pin the positive case so a
+    /// regression that always returned `false` cannot silently mask
+    /// pipewire / arecord availability behind "no executable found".
+    #[test]
+    fn is_executable_returns_true_when_owner_exec_bit_is_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("script");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("set executable mode");
+
+        assert!(is_executable(&path));
+    }
+
+    /// Pin the negative case so a regression that always returned
+    /// `true` cannot silently treat plain data files in PATH as
+    /// recorder binaries.
+    #[test]
+    fn is_executable_returns_false_when_no_exec_bits_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("data.txt");
+        fs::write(&path, b"plain bytes").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("set readable-only mode");
+
+        assert!(!is_executable(&path));
+    }
+
+    /// Defensive: a path that does not exist must return `false`
+    /// instead of bubbling up a metadata IO error. The current
+    /// `unwrap_or(false)` provides that contract; this pin keeps a
+    /// future refactor honest.
+    #[test]
+    fn is_executable_returns_false_when_path_does_not_exist() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("absent");
+        assert!(!path.exists(), "test precondition: path must not exist");
+
+        assert!(!is_executable(&path));
+    }
+
+    /// `resolve_executable` short-circuits the PATH search when the
+    /// argument has more than one path component (i.e. a relative
+    /// `./foo` or absolute `/usr/bin/foo`). The branch returns the
+    /// path as-is when it points at a real file. This test pins the
+    /// short-circuit so a regression that always re-entered PATH
+    /// search would be caught by the absolute-path-not-in-PATH
+    /// scenario it would silently break.
+    #[test]
+    fn resolve_executable_returns_absolute_path_when_it_points_at_a_real_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("seed");
+        fs::write(&path, b"x").expect("write");
+
+        let resolved = resolve_executable(path.to_str().expect("utf-8"));
+        assert_eq!(resolved.as_deref(), Some(path.as_path()));
+    }
+
+    /// Symmetric pin for the short-circuit's negative case: an
+    /// absolute path that does not exist must return `None` rather
+    /// than fall through to PATH search (which would never find it
+    /// anyway, but the wrong control flow would mask the bug).
+    #[test]
+    fn resolve_executable_returns_none_when_absolute_path_is_absent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("absent-binary");
+        assert!(!path.exists(), "test precondition: path must not exist");
+
+        let resolved = resolve_executable(path.to_str().expect("utf-8"));
+        assert!(resolved.is_none());
     }
 }
