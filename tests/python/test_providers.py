@@ -14,7 +14,9 @@ if str(PYTHON_ROOT) not in sys.path:
 
 from voicelayer_orchestrator.providers import (  # noqa: E402
     collapse_nonspeech_transcript,
+    provider_runtime_dir,
     reclaim_stale_lock,
+    supported_providers,
 )
 
 
@@ -150,6 +152,119 @@ class CollapseNonSpeechTranscriptTest(unittest.TestCase):
         self.assertEqual(collapse_nonspeech_transcript(""), "")
         self.assertEqual(collapse_nonspeech_transcript("   "), "")
         self.assertEqual(collapse_nonspeech_transcript("\n\n"), "")
+
+
+class ProviderRuntimeDirTest(unittest.TestCase):
+    """Covers :func:`provider_runtime_dir`, which both autostart adapters
+    use to anchor lock and pid files.
+
+    The Rust daemon exposes the same `XDG_RUNTIME_DIR`-driven contract
+    via :func:`voicelayerd::default_socket_path`; both sides must land
+    under `$XDG_RUNTIME_DIR/voicelayer/...` when the variable is set.
+    A regression that ignored the env var would scatter Python state
+    files into `/tmp` while the Rust socket lived under
+    `/run/user/<uid>`, leaving stale locks behind across reboots.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Each test owns an isolated tempdir to play the role of
+        # `XDG_RUNTIME_DIR`. The mapping passed to the helper is a
+        # plain dict so we never mutate `os.environ` and dodge the
+        # cross-test serialisation problem that ENV_LOCK solves on the
+        # Rust side.
+        self.tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-runtime-"))
+
+    def test_uses_xdg_runtime_dir_when_set(self) -> None:
+        environ = {"XDG_RUNTIME_DIR": str(self.tmp_root)}
+        path = provider_runtime_dir(environ)
+        self.assertEqual(path, self.tmp_root / "voicelayer" / "providers")
+        self.assertTrue(path.is_dir())
+
+    def test_falls_back_to_system_temp_when_xdg_runtime_dir_unset(self) -> None:
+        # The helper's `source = environ or os.environ` short-circuits
+        # an empty mapping to `os.environ`, so we have to pass a
+        # non-empty mapping that simply lacks `XDG_RUNTIME_DIR` to
+        # exercise the fallback. The dummy key is ignored by the
+        # helper but keeps the truthiness check happy.
+        environ = {"_test_marker": "1"}
+        path = provider_runtime_dir(environ)
+        self.assertEqual(path, pathlib.Path(tempfile.gettempdir()) / "voicelayer" / "providers")
+
+    def test_creates_runtime_dir_when_missing(self) -> None:
+        # Brand-new XDG dir: helper must mkdir the nested structure
+        # without raising. A regression that dropped `mkdir(parents=True)`
+        # would crash autostart on first boot before any state file
+        # ever lands.
+        environ = {"XDG_RUNTIME_DIR": str(self.tmp_root / "fresh")}
+        self.assertFalse((self.tmp_root / "fresh").exists())
+        path = provider_runtime_dir(environ)
+        self.assertTrue(path.is_dir())
+
+
+class SupportedProvidersTest(unittest.TestCase):
+    """Covers :func:`supported_providers`, which the worker emits in
+    response to JSON-RPC `list_providers`. Pinning the catalog shape
+    keeps the worker side aligned with the Rust default catalog and
+    catches drift in either direction (extra entry, dropped entry,
+    misclassified `kind`).
+    """
+
+    def test_includes_two_asr_providers_and_an_llm_when_no_endpoint_configured(
+        self,
+    ) -> None:
+        # Non-empty mapping with no VoiceLayer keys. `supported_providers`
+        # eventually calls helpers that short-circuit `environ or
+        # os.environ`, so an empty mapping would leak the developer's
+        # ambient env into the test. The dummy marker keeps the
+        # mapping truthy without supplying any voicelayer config.
+        catalog = supported_providers({"_test_marker": "1"})
+        ids = {entry["id"] for entry in catalog}
+        self.assertEqual(ids, {"whisper_cpp", "voxtral_realtime", "gemma_4_local"})
+        kinds = {entry["id"]: entry["kind"] for entry in catalog}
+        self.assertEqual(
+            kinds,
+            {"whisper_cpp": "asr", "voxtral_realtime": "asr", "gemma_4_local": "llm"},
+        )
+
+    def test_replaces_default_llm_with_configured_descriptor_when_endpoint_set(
+        self,
+    ) -> None:
+        # When the operator wires `VOICELAYER_LLM_ENDPOINT` /
+        # `VOICELAYER_LLM_MODEL`, `configured_llm_descriptor` returns
+        # a descriptor; the catalog substitutes it for `gemma_4_local`
+        # so `vl providers` shows the live endpoint instead of a
+        # confusing static placeholder.
+        environ = {
+            "VOICELAYER_LLM_ENDPOINT": "http://localhost:8080/v1",
+            "VOICELAYER_LLM_MODEL": "gpt-oss-20b",
+        }
+        catalog = supported_providers(environ)
+        ids = [entry["id"] for entry in catalog]
+        self.assertNotIn("gemma_4_local", ids)
+        # The configured descriptor uses a synthesized id but always
+        # has kind=llm; the asr pair stays put.
+        kinds = {entry["kind"] for entry in catalog}
+        self.assertEqual(kinds, {"asr", "llm"})
+
+    def test_whisper_transport_flips_to_whisper_cli_when_whisper_config_present(
+        self,
+    ) -> None:
+        # `transport` reflects whether the worker would dispatch through
+        # whisper-cli (configured) or fall back to the legacy stdio
+        # bridge. `vl providers` surfaces this so the operator can tell
+        # at a glance whether the binary was wired up.
+        environ = {
+            "VOICELAYER_WHISPER_BIN": "/usr/local/bin/whisper-cli",
+            "VOICELAYER_WHISPER_MODEL_PATH": "/var/cache/voicelayer/ggml-base.en.bin",
+        }
+        catalog = supported_providers(environ)
+        whisper = next(entry for entry in catalog if entry["id"] == "whisper_cpp")
+        self.assertEqual(whisper["transport"], "whisper_cli")
+
+        catalog = supported_providers({"_test_marker": "1"})
+        whisper = next(entry for entry in catalog if entry["id"] == "whisper_cpp")
+        self.assertEqual(whisper["transport"], "stdio_worker")
 
 
 if __name__ == "__main__":
