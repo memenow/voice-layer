@@ -4391,6 +4391,56 @@ jobs:
         );
     }
 
+    /// `README.md` and `CLAUDE.md` both document the verification
+    /// chain. The README copy is the contributor-facing list (plus
+    /// the one-time `uv sync --group dev` setup step); the
+    /// `CLAUDE.md` copy is the per-task chain Claude / agents are
+    /// expected to run after the env is already synced. The two
+    /// must agree on the *task-level* steps so a contributor's
+    /// expectation matches the agent's behaviour: filtering
+    /// `uv sync` out of the README list, the rest must be a
+    /// byte-for-byte match.
+    ///
+    /// The drift mode is the README quietly adding a check the
+    /// agent never runs (or vice versa): a human reading the README
+    /// sees green, the agent reading `CLAUDE.md` sees green, but
+    /// the two were checking different things.
+    #[test]
+    fn readme_verification_chain_matches_claude_md_chain_modulo_uv_sync() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("read README.md");
+        let claude_md =
+            std::fs::read_to_string(repo_root.join("CLAUDE.md")).expect("read CLAUDE.md");
+
+        let readme_raw = extract_claude_md_verification_chain(&readme);
+        let claude_raw = extract_claude_md_verification_chain(&claude_md);
+        assert!(
+            !readme_raw.is_empty(),
+            "README's first ```bash``` block (under \"Verification Chain\") not found",
+        );
+        assert!(
+            !claude_raw.is_empty(),
+            "CLAUDE.md's first ```bash``` block not found",
+        );
+
+        let readme_filtered: Vec<String> = readme_raw
+            .into_iter()
+            .filter(|cmd| !cmd.starts_with("uv sync"))
+            .collect();
+
+        assert_eq!(
+            readme_filtered, claude_raw,
+            "verification chain drift between README.md and CLAUDE.md.\n\
+             README (filtered, no `uv sync`): {readme_filtered:#?}\n\
+             CLAUDE.md: {claude_raw:#?}\n\n\
+             The README's contributor-facing list and CLAUDE.md's agent-facing \
+             list must agree on every task-level step. The only sanctioned \
+             addition in README is `uv sync --group dev` (a one-time setup \
+             that runs before the chain, not as part of it).",
+        );
+    }
+
     /// `CLAUDE.md` documents the verification chain that contributors
     /// (and Claude) must run before closing a task; `.github/workflows/ci.yml`
     /// must run the same chain so CI mirrors local-pass discipline. A
