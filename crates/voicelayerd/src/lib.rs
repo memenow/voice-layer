@@ -1866,6 +1866,61 @@ mod tests {
         }
     }
 
+    /// Pins the env-set branch of `default_project_root`. The
+    /// daemon resolves the Python worker's project root from this
+    /// variable; a regression that always fell through to
+    /// `current_dir()` would silently spawn the worker in the
+    /// caller's cwd (e.g. `~`) where `uv run` cannot find the
+    /// project, breaking JSON-RPC startup with a confusing error.
+    #[test]
+    fn default_project_root_uses_voicelayer_project_root_when_set() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("VOICELAYER_PROJECT_ROOT");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::set_var("VOICELAYER_PROJECT_ROOT", "/srv/voicelayer-from-systemd");
+        }
+        let path = default_project_root();
+        assert_eq!(path, PathBuf::from("/srv/voicelayer-from-systemd"));
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("VOICELAYER_PROJECT_ROOT", value);
+            },
+            None => unsafe {
+                std::env::remove_var("VOICELAYER_PROJECT_ROOT");
+            },
+        }
+    }
+
+    /// Pins the unset branch: with no override, the resolver falls
+    /// through to `current_dir()`. The chained `unwrap_or_else(|| ".")`
+    /// is the last-resort fallback for the unrealistic case where
+    /// `current_dir()` itself fails (deleted cwd) — exercising it
+    /// requires unsafe filesystem manipulation, so this test pins
+    /// the realistic happy path: env unset, cwd available, result
+    /// equals the cwd.
+    #[test]
+    fn default_project_root_falls_back_to_current_dir_when_env_unset() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("VOICELAYER_PROJECT_ROOT");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::remove_var("VOICELAYER_PROJECT_ROOT");
+        }
+        let path = default_project_root();
+        let cwd = std::env::current_dir().expect("current_dir should be available in tests");
+        assert_eq!(path, cwd);
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("VOICELAYER_PROJECT_ROOT", value);
+            }
+        }
+    }
+
     #[test]
     fn stitch_segment_transcripts_on_empty_input_returns_empty_string_and_no_language() {
         let (text, language) = stitch_segment_transcripts(&[]);
