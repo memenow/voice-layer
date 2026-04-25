@@ -649,12 +649,17 @@ mod tests {
 
         // Inline form: scan for `required: [a, b, c]` at the schema's
         // own indent level (six spaces) so nested oneOf branches don't
-        // bleed into the outer schema's required list.
+        // bleed into the outer schema's required list. Slice the inner
+        // list at the first `]` so a future trailing comment
+        // (`required: [a, b]  # ...`) cannot leak into the last entry.
         let mut inline: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for line in section.lines() {
             if let Some(rest) = line.strip_prefix("      required: [") {
-                let rest = rest.trim_end_matches(']');
-                for entry in rest.split(',') {
+                let inner = match rest.find(']') {
+                    Some(end) => &rest[..end],
+                    None => continue,
+                };
+                for entry in inner.split(',') {
                     let name = entry.trim();
                     if !name.is_empty() {
                         inline.insert(name.to_owned());
@@ -664,6 +669,130 @@ mod tests {
             }
         }
         inline
+    }
+
+    #[test]
+    fn isolate_schema_section_returns_empty_for_unknown_schema() {
+        let yaml = "    components:\n    Foo:\n      type: object\n";
+        assert!(isolate_schema_section(yaml, "Bar").is_empty());
+    }
+
+    #[test]
+    fn isolate_schema_section_terminates_at_next_component_heading() {
+        // Two adjacent schema components at the canonical 4-space
+        // heading indent. The walker must capture every line under
+        // `Foo` and stop the moment the next 4-space heading (`Bar:`)
+        // appears, so generic fields like `name` under Bar never leak
+        // into Foo's slice.
+        let yaml = "
+    Foo:
+      type: object
+      required: [a]
+      properties:
+        a:
+          type: string
+    Bar:
+      type: object
+      properties:
+        name:
+          type: string
+";
+        let section = isolate_schema_section(yaml, "Foo");
+        assert!(section.contains("        a:"));
+        assert!(
+            !section.contains("name:"),
+            "Foo's section must not bleed into Bar's properties; got:\n{section}",
+        );
+    }
+
+    #[test]
+    fn parse_required_set_handles_block_form() {
+        let section = "\
+    Foo:
+      required:
+        - a
+        - b
+      properties:
+        a:
+          type: string
+        b:
+          type: string
+";
+        let set = parse_required_set(section);
+        assert!(set.contains("a"));
+        assert!(set.contains("b"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn parse_required_set_handles_inline_form() {
+        let section = "\
+    Foo:
+      required: [a, b, c]
+      properties:
+        a:
+          type: string
+";
+        let set = parse_required_set(section);
+        assert!(set.contains("a"));
+        assert!(set.contains("b"));
+        assert!(set.contains("c"));
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn parse_required_set_inline_form_drops_trailing_yaml_comment() {
+        // Future-proofs the inline branch: if a maintainer adds a
+        // trailing comment (perfectly valid YAML), the parser must
+        // slice at `]` rather than trimming `]` off the end. Without
+        // the `find(']')` slice this would yield an entry like
+        // `b  # comment`.
+        let section = "\
+    Foo:
+      required: [a, b]  # documents Foo's contract
+      properties:
+        a:
+          type: string
+";
+        let set = parse_required_set(section);
+        assert!(set.contains("a"));
+        assert!(set.contains("b"));
+        assert_eq!(set.len(), 2, "got: {set:?}");
+    }
+
+    #[test]
+    fn parse_required_set_returns_empty_when_no_required_declared() {
+        let section = "\
+    Foo:
+      type: object
+      properties:
+        a:
+          type: string
+";
+        assert!(parse_required_set(section).is_empty());
+    }
+
+    #[test]
+    fn parse_required_set_block_form_stops_at_next_key() {
+        // The block-form scanner must release `in_block` the moment a
+        // line at the schema-key indent (or any non-`        - `
+        // prefix) appears, so neighboring keys like `properties` never
+        // get mis-parsed as required entries.
+        let section = "\
+    Foo:
+      required:
+        - a
+      properties:
+        a:
+          type: string
+";
+        let set = parse_required_set(section);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("a"));
+        assert!(
+            !set.iter().any(|name| name.contains("properties")),
+            "block scan must not absorb sibling keys; got: {set:?}",
+        );
     }
 
     fn worker_health_summary_sentinel() -> WorkerHealthSummary {
