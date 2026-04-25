@@ -1089,6 +1089,45 @@ mod tests {
         names
     }
 
+    /// Pull the first quoted-string value bound to `key` in a TOML
+    /// document. Matches lines of the form `key = "..."` ignoring
+    /// leading whitespace; returns `None` when the key is missing.
+    /// Section headers (`[workspace.package]` etc.) are not tracked
+    /// — every `key = "..."` line in the file is fair game, and the
+    /// first match wins. The pinned values this helper covers
+    /// (`channel`, `rust-version`) appear once each in their target
+    /// files, so first-match is the right semantics.
+    fn extract_toml_string_value(contents: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key} = \"");
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(&prefix)
+                && let Some(end) = rest.find('"')
+            {
+                return Some(rest[..end].to_owned());
+            }
+        }
+        None
+    }
+
+    /// Pull the first quoted-string value bound to `key` in a YAML
+    /// document. Matches lines of the form `key: "..."` ignoring
+    /// leading whitespace. As with `extract_toml_string_value`, no
+    /// section / nesting tracking — the helper is intended for
+    /// exactly-once keys like the workflow's `toolchain:` step input.
+    fn extract_yaml_string_value(contents: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key}: \"");
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(&prefix)
+                && let Some(end) = rest.find('"')
+            {
+                return Some(rest[..end].to_owned());
+            }
+        }
+        None
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1425,6 +1464,55 @@ components:
         // Deeper-indent fields like `nested_field:` (8 spaces) must
         // be excluded too.
         assert!(!names.contains("nested_field"));
+    }
+
+    #[test]
+    fn extract_toml_string_value_matches_indent_and_quoted_value() {
+        let toml = concat!(
+            "[workspace.package]\n",
+            "version = \"0.1.0\"\n",
+            "rust-version = \"1.88\"\n",
+            "\n",
+            "[toolchain]\n",
+            "  channel = \"1.90\"\n", // intentionally indented to prove trim
+        );
+        assert_eq!(
+            extract_toml_string_value(toml, "rust-version").as_deref(),
+            Some("1.88"),
+        );
+        assert_eq!(
+            extract_toml_string_value(toml, "channel").as_deref(),
+            Some("1.90"),
+        );
+    }
+
+    #[test]
+    fn extract_toml_string_value_returns_none_when_key_absent() {
+        let toml = "version = \"0.1.0\"\n";
+        assert!(extract_toml_string_value(toml, "rust-version").is_none());
+    }
+
+    #[test]
+    fn extract_yaml_string_value_handles_indented_step_inputs() {
+        let yaml = concat!(
+            "jobs:\n",
+            "  verify:\n",
+            "    steps:\n",
+            "      - uses: dtolnay/rust-toolchain@master\n",
+            "        with:\n",
+            "          toolchain: \"1.88\"\n",
+            "          components: rustfmt, clippy\n",
+        );
+        assert_eq!(
+            extract_yaml_string_value(yaml, "toolchain").as_deref(),
+            Some("1.88"),
+        );
+    }
+
+    #[test]
+    fn extract_yaml_string_value_returns_none_when_key_absent() {
+        let yaml = "jobs:\n  verify:\n    runs-on: ubuntu-latest\n";
+        assert!(extract_yaml_string_value(yaml, "toolchain").is_none());
     }
 
     /// Pins both directions of the soft-list override:
@@ -2167,5 +2255,53 @@ components:
                  Defined components: {defined:?}",
             );
         }
+    }
+
+    /// The rust toolchain pin lives in three places that must agree:
+    /// `rust-toolchain.toml` (rustup), the `[workspace.package]
+    /// rust-version` in the root `Cargo.toml` (used by `cargo` to
+    /// reject older toolchains), and the `toolchain:` step input in
+    /// `.github/workflows/ci.yml` (which downloads the version CI
+    /// runs). The header comment in `rust-toolchain.toml` calls out
+    /// the cross-file requirement, but no test enforced it — this
+    /// pin closes that drift so a future bump must update all three
+    /// or fail at `cargo test` instead of silently letting CI run
+    /// against a different toolchain than developers do.
+    #[test]
+    fn rust_toolchain_pin_is_consistent_across_repo_files() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+
+        let toolchain_toml = std::fs::read_to_string(format!("{repo_root}/rust-toolchain.toml"))
+            .expect("read rust-toolchain.toml");
+        let cargo_toml = std::fs::read_to_string(format!("{repo_root}/Cargo.toml"))
+            .expect("read root Cargo.toml");
+        let ci_yml = std::fs::read_to_string(format!("{repo_root}/.github/workflows/ci.yml"))
+            .expect("read .github/workflows/ci.yml");
+
+        let rustup_channel = extract_toml_string_value(&toolchain_toml, "channel").expect(
+            "rust-toolchain.toml must declare `channel = \"...\"`; \
+             extract_toml_string_value may be misparsing",
+        );
+        let cargo_rust_version = extract_toml_string_value(&cargo_toml, "rust-version").expect(
+            "Cargo.toml must declare `rust-version = \"...\"`; \
+             extract_toml_string_value may be misparsing",
+        );
+        let ci_toolchain = extract_yaml_string_value(&ci_yml, "toolchain").expect(
+            ".github/workflows/ci.yml must declare `toolchain: \"...\"`; \
+             extract_yaml_string_value may be misparsing",
+        );
+
+        assert_eq!(
+            rustup_channel, cargo_rust_version,
+            "rust-toolchain.toml `channel = \"{rustup_channel}\"` does not match \
+             Cargo.toml `rust-version = \"{cargo_rust_version}\"`. Bump both together \
+             so `cargo` and `rustup` agree on the floor.",
+        );
+        assert_eq!(
+            rustup_channel, ci_toolchain,
+            "rust-toolchain.toml `channel = \"{rustup_channel}\"` does not match \
+             ci.yml `toolchain: \"{ci_toolchain}\"`. CI must run on the same toolchain \
+             developers use locally.",
+        );
     }
 }
