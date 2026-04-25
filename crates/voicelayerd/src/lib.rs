@@ -1985,6 +1985,7 @@ mod test_support {
                 config_path.display().to_string(),
             ],
             project_root: dir.to_path_buf(),
+            timeout_override: None,
         }
     }
 

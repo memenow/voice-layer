@@ -47,6 +47,15 @@ pub struct WorkerCommand {
     pub executable: String,
     pub args: Vec<String>,
     pub project_root: PathBuf,
+    /// Optional per-instance timeout override that bypasses the
+    /// env-driven default in `worker_call_timeout`. Only used by tests
+    /// to drive the `TimedOut` error variant with a short budget —
+    /// production constructions leave it `None` and the env-driven
+    /// default applies. Using a per-instance field instead of mutating
+    /// `VOICELAYER_WORKER_TIMEOUT_SECONDS` avoids the
+    /// `clippy::await_holding_lock` problem that arises when an
+    /// `ENV_LOCK` mutex is held across the subprocess `.await`.
+    pub(crate) timeout_override: Option<Duration>,
 }
 
 impl WorkerCommand {
@@ -57,6 +66,7 @@ impl WorkerCommand {
                 executable: uv_python.display().to_string(),
                 args: vec!["-m".to_owned(), WORKER_MODULE.to_owned()],
                 project_root,
+                timeout_override: None,
             };
         }
 
@@ -71,7 +81,16 @@ impl WorkerCommand {
                 WORKER_MODULE.to_owned(),
             ],
             project_root,
+            timeout_override: None,
         }
+    }
+
+    /// Override the per-call timeout for this `WorkerCommand`. Used by
+    /// tests; production code never sets this.
+    #[cfg(test)]
+    pub(crate) fn with_timeout_override(mut self, timeout: Duration) -> Self {
+        self.timeout_override = Some(timeout);
+        self
     }
 
     pub fn display(&self) -> String {
@@ -187,7 +206,10 @@ impl WorkerCommand {
         drop(stdin);
 
         let mut reader = BufReader::new(stdout).lines();
-        let line = timeout(worker_call_timeout(method), reader.next_line())
+        let timeout_duration = self
+            .timeout_override
+            .unwrap_or_else(|| worker_call_timeout(method));
+        let line = timeout(timeout_duration, reader.next_line())
             .await
             .map_err(|_| WorkerCallError::TimedOut)??
             .ok_or(WorkerCallError::EmptyResponse)?;
@@ -291,7 +313,7 @@ pub enum WorkerCallError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
 
     use super::{
         DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCallError, WorkerCommand,
@@ -449,6 +471,7 @@ mod tests {
             executable: "sh".to_owned(),
             args: vec!["-c".to_owned(), combined],
             project_root: std::env::current_dir().expect("current_dir should resolve"),
+            timeout_override: None,
         }
     }
 
@@ -458,6 +481,7 @@ mod tests {
             executable: "/voicelayer-test/definitely-not-a-real-binary".to_owned(),
             args: vec![],
             project_root: std::env::current_dir().expect("current_dir should resolve"),
+            timeout_override: None,
         };
         match worker.health().await {
             Err(WorkerCallError::Io(_)) => {}
@@ -530,6 +554,24 @@ mod tests {
                 assert_eq!(code, Some(7));
             }
             other => panic!("expected ProcessExited; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_timed_out_when_subprocess_never_responds() {
+        // Closes the gap left by #29: subprocess consumes stdin then
+        // sleeps far longer than the override budget, so
+        // `reader.next_line()` never resolves and `timeout()` produces
+        // `WorkerCallError::TimedOut`. `kill_on_drop(true)` reaps the
+        // shell when the helper future drops on the early return.
+        //
+        // Uses `with_timeout_override` instead of mutating
+        // `VOICELAYER_WORKER_TIMEOUT_SECONDS` so no global mutex is
+        // held across the await.
+        let worker = shell_worker("sleep 30").with_timeout_override(Duration::from_millis(100));
+        match worker.health().await {
+            Err(WorkerCallError::TimedOut) => {}
+            other => panic!("expected TimedOut from unresponsive subprocess; got {other:?}"),
         }
     }
 }
