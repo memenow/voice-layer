@@ -1282,6 +1282,55 @@ mod tests {
         members
     }
 
+    /// Walk a Rust source string and pull out every shortcut id
+    /// declared as `pub const SHORTCUT_<NAME>: &str = "<value>";`.
+    /// Targets `vl-desktop::portal::SHORTCUT_TOGGLE` and any future
+    /// siblings. The fixed shape leaves no room for fuzzy matches:
+    /// a literal that is not a shortcut const cannot satisfy the
+    /// prefix.
+    fn collect_rust_shortcut_ids(source: &str) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub const SHORTCUT_") else {
+                continue;
+            };
+            let Some(equals_pos) = rest.find(" = \"") else {
+                continue;
+            };
+            let after_equals = &rest[equals_pos + " = \"".len()..];
+            if let Some(end) = after_equals.find('"') {
+                ids.insert(after_equals[..end].to_owned());
+            }
+        }
+        ids
+    }
+
+    /// Walk a Markdown doc string and pull out every backtick-quoted
+    /// `voicelayer.<word>` literal. Excludes `dictation.*` SSE event
+    /// names (different prefix) and any other non-shortcut content.
+    /// The contents-rejection on whitespace and emptiness keeps a
+    /// trailing prose match (`\`voicelayer prefix\``) from polluting
+    /// the set.
+    fn collect_doc_shortcut_ids(contents: &str) -> std::collections::BTreeSet<String> {
+        let needle = "`voicelayer.";
+        let mut ids = std::collections::BTreeSet::new();
+        let mut search = contents;
+        while let Some(idx) = search.find(needle) {
+            let after = &search[idx + 1..]; // skip the opening backtick
+            let inner: String = after.chars().take_while(|c| *c != '`').collect();
+            if !inner.is_empty() && !inner.contains(' ') {
+                ids.insert(inner.clone());
+            }
+            let consumed = inner.len() + 1; // backtick + content
+            if consumed >= search.len() - idx {
+                break;
+            }
+            search = &search[idx + consumed..];
+        }
+        ids
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1833,6 +1882,31 @@ components:
         assert_eq!(members.len(), 4);
         assert!(members.contains("crates/voicelayer-core"));
         assert!(members.contains("crates/vl-desktop"));
+    }
+
+    #[test]
+    fn collect_rust_shortcut_ids_extracts_quoted_const_value() {
+        let source = concat!(
+            "pub const SHORTCUT_TOGGLE: &str = \"voicelayer.dictation_toggle\";\n",
+            "pub const SHORTCUT_PUSH_TO_TALK: &str = \"voicelayer.ptt\";\n",
+            "// `pub const NOT_A_SHORTCUT: &str = \"prose\"` should be ignored\n",
+        );
+        let ids = collect_rust_shortcut_ids(source);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("voicelayer.dictation_toggle"));
+        assert!(ids.contains("voicelayer.ptt"));
+    }
+
+    #[test]
+    fn collect_doc_shortcut_ids_dedupes_repeated_mentions() {
+        let md = concat!(
+            "the GUI registers `voicelayer.dictation_toggle` via portal.\n",
+            "later: `vl-desktop` registers `voicelayer.dictation_toggle` again.\n",
+            "an SSE event like `dictation.completed` does not match the prefix.\n",
+        );
+        let ids = collect_doc_shortcut_ids(md);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("voicelayer.dictation_toggle"));
     }
 
     #[test]
@@ -2958,6 +3032,58 @@ components:
                  instead of declaring a literal — a divergent version would \
                  defeat the openapi/cargo version pin and confuse anyone \
                  matching `vl --version` against the published crate.",
+            );
+        }
+    }
+
+    /// Pin every `pub const SHORTCUT_*: &str = "..."` value in
+    /// `vl-desktop::portal` against the corresponding mention in
+    /// `docs/architecture/overview.md`. The shortcut id flows in
+    /// both directions: the Rust constant feeds
+    /// `org.freedesktop.portal.GlobalShortcuts.bind_shortcuts`, and
+    /// the doc explains the resulting hotkey to operators. A rename
+    /// on either side without the other would silently mislead a
+    /// reader trying to match what they see in their portal UI
+    /// against the doc.
+    #[test]
+    fn vl_desktop_shortcut_ids_match_overview_doc() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let portal_src =
+            std::fs::read_to_string(format!("{repo_root}/crates/vl-desktop/src/portal.rs"))
+                .expect("read vl-desktop portal.rs");
+        let overview =
+            std::fs::read_to_string(format!("{repo_root}/docs/architecture/overview.md"))
+                .expect("read overview.md");
+
+        let rust_ids = collect_rust_shortcut_ids(&portal_src);
+        let doc_ids = collect_doc_shortcut_ids(&overview);
+
+        assert!(
+            !rust_ids.is_empty(),
+            "vl-desktop portal.rs must declare at least one `pub const SHORTCUT_*` \
+             constant; collect_rust_shortcut_ids may be misparsing",
+        );
+        assert!(
+            !doc_ids.is_empty(),
+            "overview.md must mention at least one `\\`voicelayer.<id>\\`` shortcut; \
+             collect_doc_shortcut_ids may be misparsing",
+        );
+
+        for id in &rust_ids {
+            assert!(
+                doc_ids.contains(id),
+                "Rust constant SHORTCUT_*=\"{id}\" is never mentioned in \
+                 docs/architecture/overview.md. Add a backtick-quoted reference \
+                 so operators can match the portal UI against the doc.",
+            );
+        }
+        for id in &doc_ids {
+            assert!(
+                rust_ids.contains(id),
+                "overview.md mentions `\\`{id}\\`` but no matching \
+                 `pub const SHORTCUT_*: &str = \"{id}\";` exists in \
+                 crates/vl-desktop/src/portal.rs. Either drop the doc \
+                 mention or add the Rust constant.",
             );
         }
     }
