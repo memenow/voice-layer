@@ -1818,6 +1818,50 @@ mod tests {
     }
 
     /// Pull every package name declared under
+    /// `[dependency-groups].<group>` in pyproject. Same array shape
+    /// as `[project.optional-dependencies]` (multi-line or single-
+    /// line, with PEP 508 specifiers) — only the section heading
+    /// differs. Reuses `extract_pep508_names_from_inline` for the
+    /// per-line extraction so the version-specifier strip behaviour
+    /// stays in lockstep.
+    fn extract_pyproject_dependency_group(
+        contents: &str,
+        group: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut in_section = false;
+        let mut in_array = false;
+        let array_open = format!("{group} = [");
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_section = trimmed.starts_with("[dependency-groups]");
+                in_array = false;
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            if !in_array {
+                if let Some(rest) = trimmed.strip_prefix(&array_open) {
+                    in_array = true;
+                    extract_pep508_names_from_inline(rest, &mut names);
+                    if rest.contains(']') {
+                        in_array = false;
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with(']') {
+                in_array = false;
+                continue;
+            }
+            extract_pep508_names_from_inline(trimmed, &mut names);
+        }
+        names
+    }
+
+    /// Pull every package name declared under
     /// `[project.optional-dependencies].<group>` in pyproject. Handles
     /// the canonical multi-line array form (`<group> = [` opens, each
     /// `"<spec>"` row contributes one entry, `]` on its own line
@@ -4975,6 +5019,111 @@ ENV_DIR=\"${VOICELAYER_INSTALL_ENV_DIR:-${HOME}/.config/voicelayer}\"
             "README references crates that the workspace does not declare: {typo_in_readme:?}\n\n\
              Fix the typo, drop the mention, or add the member to \
              [workspace] members in `Cargo.toml`.",
+        );
+    }
+
+    #[test]
+    fn extract_pyproject_dependency_group_handles_multiline_array_form() {
+        let pyproject = "\
+[dependency-groups]
+dev = [
+    \"pytest>=9.0.3,<10\",
+    \"ruff>=0.15.11\",
+]
+
+[tool.setuptools]
+package-dir = { \"\" = \"python\" }
+";
+        let names = extract_pyproject_dependency_group(pyproject, "dev");
+        assert_eq!(
+            names,
+            ["pytest", "ruff"].iter().map(|s| (*s).to_owned()).collect(),
+        );
+    }
+
+    #[test]
+    fn extract_pyproject_dependency_group_returns_empty_when_section_absent() {
+        let pyproject = "[project]\nname = \"foo\"\n";
+        let names = extract_pyproject_dependency_group(pyproject, "dev");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn extract_pyproject_dependency_group_does_not_leak_optional_deps_section() {
+        // A `vad` group declared under `[project.optional-dependencies]`
+        // (the surface PR #74 covers) must NOT appear when the caller
+        // asks for `[dependency-groups].vad`. The two sections live
+        // under different headings even though they share the array
+        // shape; mixing them up would wire the dev-deps drift guard
+        // against the wrong source.
+        let pyproject = "\
+[project.optional-dependencies]
+vad = [\"numpy>=2.0\", \"onnxruntime>=1.18\"]
+
+[dependency-groups]
+dev = [\"pytest>=9.0.3,<10\"]
+";
+        assert_eq!(
+            extract_pyproject_dependency_group(pyproject, "dev"),
+            ["pytest"].iter().map(|s| (*s).to_owned()).collect(),
+        );
+        assert!(
+            extract_pyproject_dependency_group(pyproject, "vad").is_empty(),
+            "vad lives under [project.optional-dependencies], not [dependency-groups]",
+        );
+    }
+
+    /// Every package declared under `[dependency-groups].dev` in
+    /// `pyproject.toml` must be invoked at least once in
+    /// `.github/workflows/ci.yml`'s verify job, in the canonical
+    /// `uv run <package>` shape.
+    ///
+    /// The drift mode is silent and gating-side: a contributor adds
+    /// `mypy` to `dev` thinking it now runs in CI, the CI workflow
+    /// keeps invoking only `pytest` and `ruff`, and a regression
+    /// `mypy` would have caught lands cleanly.
+    ///
+    /// The reverse direction (every `uv run` invocation matches a
+    /// dev-dep) is intentionally not enforced — `uv run pytest` and
+    /// `uv run ruff` are the only `uv run` invocations today, and
+    /// both ARE in dev-deps; if a future workflow runs e.g.
+    /// `uv run python` for a one-off probe, the test should not
+    /// fight that.
+    #[test]
+    fn every_pyproject_dev_dep_is_invoked_in_ci_verify_job() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let pyproject =
+            std::fs::read_to_string(repo_root.join("pyproject.toml")).expect("read pyproject.toml");
+        let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml"))
+            .expect("read .github/workflows/ci.yml");
+
+        let dev_deps = extract_pyproject_dependency_group(&pyproject, "dev");
+        assert!(
+            !dev_deps.is_empty(),
+            "expected at least one package in `[dependency-groups].dev` — \
+             pyproject may have been refactored away from dependency-groups",
+        );
+
+        let ci_commands = extract_ci_verify_run_commands(&ci_yaml);
+        let invoked: std::collections::BTreeSet<String> = ci_commands
+            .iter()
+            .filter_map(|cmd| cmd.strip_prefix("uv run "))
+            .filter_map(|tail| tail.split_whitespace().next().map(str::to_owned))
+            .collect();
+        assert!(
+            !invoked.is_empty(),
+            "expected at least one `uv run <package>` step in CI — \
+             extract_ci_verify_run_commands may be misparsing",
+        );
+
+        let unused: Vec<&String> = dev_deps.difference(&invoked).collect();
+        assert!(
+            unused.is_empty(),
+            "pyproject [dependency-groups].dev declares packages CI never \
+             invokes via `uv run`: {unused:?}\n\nEither drop the dep from \
+             pyproject.toml or add a `uv run <package> ...` step to the \
+             verify job in .github/workflows/ci.yml.",
         );
     }
 }
