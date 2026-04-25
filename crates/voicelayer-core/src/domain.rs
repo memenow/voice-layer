@@ -1304,6 +1304,56 @@ mod tests {
         None
     }
 
+    /// Walk a Markdown body and pull out every `[text](path.md)` or
+    /// `[text](path.md#fragment)` link target whose path component
+    /// ends in `.md`. Skips absolute URLs (`http://`, `https://`,
+    /// `mailto:`) — those are not local cross-references and live
+    /// outside the repo's drift surface. The fragment is stripped
+    /// before matching the `.md` suffix so anchored links resolve
+    /// to the same file.
+    fn extract_markdown_md_links(contents: &str) -> Vec<String> {
+        let mut links = Vec::new();
+        let mut search = contents;
+        while let Some(idx) = search.find("](") {
+            let after = &search[idx + "](".len()..];
+            let Some(close) = after.find(')') else {
+                break;
+            };
+            let link = &after[..close];
+            search = &after[close + 1..];
+            if link.starts_with("http://")
+                || link.starts_with("https://")
+                || link.starts_with("mailto:")
+            {
+                continue;
+            }
+            let path_part = link.split('#').next().unwrap_or(link);
+            if path_part.ends_with(".md") {
+                links.push(path_part.to_owned());
+            }
+        }
+        links
+    }
+
+    /// Recursively collect every `.md` file under `start`. Used by
+    /// the cross-reference resolution test to walk the docs tree
+    /// without pulling in `walkdir`.
+    fn collect_markdown_files(
+        start: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(start)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect_markdown_files(&path, out)?;
+            } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
     /// Walk an `install.sh` shell script and pull out every basename
     /// it copies into `${BIN_DIR}/`. Targets the canonical line
     /// shape `install -m 0755 "..." "${BIN_DIR}/<name>"` (the form
@@ -1962,6 +2012,22 @@ components:
     fn extract_pyproject_license_text_returns_none_when_field_absent() {
         let toml = "[project]\nname = \"foo\"\n";
         assert!(extract_pyproject_license_text(toml).is_none());
+    }
+
+    #[test]
+    fn extract_markdown_md_links_strips_fragments_and_skips_urls() {
+        let md = concat!(
+            "See [Desktop](./desktop.md) and [Setup](./setup.md#install).\n",
+            "External: [crates.io](https://crates.io/crates/voicelayerd).\n",
+            "Mailto: [team](mailto:team@example.com).\n",
+            "Repo path: [overview](docs/architecture/overview.md).\n",
+            "Non-md link: [readme](./README.txt).\n",
+        );
+        let links = extract_markdown_md_links(md);
+        assert_eq!(links.len(), 3);
+        assert!(links.contains(&"./desktop.md".to_owned()));
+        assert!(links.contains(&"./setup.md".to_owned()));
+        assert!(links.contains(&"docs/architecture/overview.md".to_owned()));
     }
 
     #[test]
@@ -3339,5 +3405,59 @@ components:
                  would otherwise fail post-install with `Executable file not found`.",
             );
         }
+    }
+
+    /// Walk every `.md` file under `docs/` plus the repo-root
+    /// `README.md`, pull out every relative `[text](path.md)` link
+    /// (fragments stripped), and assert each resolves to an existing
+    /// file. Markdown convention: link targets are relative to the
+    /// containing file's parent directory, so a link from
+    /// `docs/guides/systemd.md` to `./desktop.md` resolves to
+    /// `docs/guides/desktop.md`.
+    ///
+    /// Catches: a doc renamed without updating inbound links, or a
+    /// new link typo that points at a nonexistent file. Either would
+    /// produce a 404 in any rendered view (GitHub, mdBook, etc.).
+    #[test]
+    fn every_markdown_doc_cross_reference_resolves_to_an_existing_file() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let mut md_files = vec![repo_root.join("README.md")];
+        collect_markdown_files(&repo_root.join("docs"), &mut md_files)
+            .expect("walk docs/ directory");
+        assert!(
+            md_files.len() > 1,
+            "expected README.md plus at least one doc under docs/; \
+             collect_markdown_files may be misparsing",
+        );
+
+        let mut broken: Vec<String> = Vec::new();
+        for md_file in &md_files {
+            let contents = match std::fs::read_to_string(md_file) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let parent = md_file.parent().unwrap_or_else(|| std::path::Path::new(""));
+            for link in extract_markdown_md_links(&contents) {
+                let resolved = parent.join(&link);
+                if !resolved.exists() {
+                    broken.push(format!(
+                        "{} → `{link}` (resolved to {})",
+                        md_file
+                            .strip_prefix(&repo_root)
+                            .unwrap_or(md_file)
+                            .display(),
+                        resolved.display(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "broken markdown cross-references:\n  - {}\n\n\
+             Either rename the link target back, drop the reference, \
+             or add a stub doc at the target path.",
+            broken.join("\n  - "),
+        );
     }
 }
