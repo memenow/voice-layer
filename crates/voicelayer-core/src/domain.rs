@@ -588,29 +588,57 @@ mod tests {
 
         // 2. Required-list cross-check.
         let required_set = parse_required_set(&section);
+        if let Err(detail) =
+            check_required_consistency(schema_name, object, &required_set, serde_default_fields)
+        {
+            panic!("{detail}");
+        }
+    }
+
+    /// Cross-check a serialised sentinel against an openapi schema's
+    /// `required` set. Returns `Ok(())` when every non-Option field is
+    /// listed (and every Option field is not), or `Err(detail)` with a
+    /// human-readable explanation of the first mismatch encountered.
+    ///
+    /// Fields named in `serde_default_fields` are skipped in either
+    /// direction — their wire contract is "may be absent on input,
+    /// daemon defaults", so the openapi schema may legitimately list or
+    /// omit them.
+    ///
+    /// Extracted from `assert_openapi_documents_every_field` so the
+    /// override-loop's behaviour can be unit-tested without a real
+    /// openapi file on disk.
+    fn check_required_consistency(
+        schema_name: &str,
+        object: &serde_json::Map<String, serde_json::Value>,
+        required_set: &std::collections::BTreeSet<String>,
+        serde_default_fields: &[&str],
+    ) -> Result<(), String> {
         for (field, field_value) in object {
             if serde_default_fields.contains(&field.as_str()) {
-                // Wire-optional via serde-default; openapi may list or
-                // omit it without violating the contract. Skip both
-                // arms of the cross-check.
                 continue;
             }
             let is_option = field_value.is_null();
             let listed = required_set.contains(field.as_str());
             match (is_option, listed) {
-                (false, false) => panic!(
-                    "openapi {schema_name} required list is missing `{field}`; \
-                     the Rust field is non-Option so it always serialises — the schema \
-                     must list it under required.",
-                ),
-                (true, true) => panic!(
-                    "openapi {schema_name} required list contains `{field}`, but \
-                     the Rust field is Option<_> and may legitimately be absent. Drop it \
-                     from required (or change the Rust side to a non-Option type).",
-                ),
+                (false, false) => {
+                    return Err(format!(
+                        "openapi {schema_name} required list is missing `{field}`; \
+                         the Rust field is non-Option so it always serialises — the schema \
+                         must list it under required.",
+                    ));
+                }
+                (true, true) => {
+                    return Err(format!(
+                        "openapi {schema_name} required list contains `{field}`, but \
+                         the Rust field is Option<_> and may legitimately be absent. Drop it \
+                         from required (or change the Rust side to a non-Option type).",
+                    ));
+                }
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// Walk the openapi YAML line-by-line and return the slice that
@@ -815,40 +843,25 @@ mod tests {
         );
     }
 
-    /// `serde_default_fields` should silence the required-list cross
-    /// check for the named fields in either direction. This sentinel
-    /// schema declares `flag` as not-required while the Rust struct
-    /// would serialise it as a real value (non-null) — without the
-    /// override, the helper would panic with
-    /// "non-Option but missing from required". The override is the
-    /// escape hatch for `#[serde(default)]` non-Option fields.
+    /// Pins both directions of the soft-list override:
+    /// 1. With `flag` listed in `serde_default_fields`, the cross-check
+    ///    returns `Ok(())` even though `flag` is non-null and missing
+    ///    from `required`.
+    /// 2. Without that override, the *same input* produces an `Err`
+    ///    naming the mismatched field — proving the override is doing
+    ///    real work, not just masking a no-op path.
+    ///
+    /// The check operates on an in-memory section + sentinel, so it
+    /// pins `check_required_consistency` directly instead of needing
+    /// a fake openapi file on disk.
     #[test]
-    fn assert_openapi_documents_every_field_skips_required_check_for_serde_default_fields() {
+    fn check_required_consistency_skips_serde_default_fields_only_when_listed() {
         #[derive(serde::Serialize)]
         struct Sample {
             id: String,
             flag: bool,
         }
 
-        // The schema deliberately lists only `id` as required. Without
-        // the soft-list override, `flag` (non-Option, serialises as
-        // `false`) would trip the required-list check. Pin the
-        // override behavior here so a future regression in the helper
-        // is caught locally instead of cascading through every
-        // serde-default-using request schema.
-        let yaml_path = format!(
-            "{}/../../openapi/voicelayerd.v1.yaml",
-            env!("CARGO_MANIFEST_DIR"),
-        );
-        let _expect_real_path = std::fs::read_to_string(&yaml_path)
-            .expect("openapi file is read by the helper as a sanity check");
-        // The helper reads the openapi file by absolute path. We can't
-        // redirect that read at runtime, so this test stops short of
-        // calling assert_openapi_documents_every_field directly and
-        // instead exercises the equivalent code path inline against an
-        // in-memory section. The soft-list override logic lives entirely
-        // in the field-iteration loop, so we replicate just that loop
-        // here for the unit pin.
         let section = "\
     Sample:
       required: [id]
@@ -865,22 +878,20 @@ mod tests {
         .expect("serialise Sample");
         let object = value.as_object().expect("Sample is a JSON object");
         let required_set = parse_required_set(section);
-        let serde_default_fields: &[&str] = &["flag"];
 
-        // Recreate the cross-check inline. With the override, the loop
-        // must finish without panicking even though `flag` is non-null
-        // and missing from required.
-        for (field, field_value) in object {
-            if serde_default_fields.contains(&field.as_str()) {
-                continue;
-            }
-            let is_option = field_value.is_null();
-            let listed = required_set.contains(field.as_str());
-            assert!(
-                !(matches!((is_option, listed), (false, false) | (true, true))),
-                "unexpected required mismatch on {field}",
-            );
-        }
+        check_required_consistency("Sample", object, &required_set, &["flag"])
+            .expect("soft-list override must silence the missing-required complaint for `flag`");
+
+        let detail = check_required_consistency("Sample", object, &required_set, &[])
+            .expect_err("without the override, `flag` must trip the required-list check");
+        assert!(
+            detail.contains("`flag`"),
+            "the error must name the offending field; got: {detail}",
+        );
+        assert!(
+            detail.contains("non-Option"),
+            "the error must explain the rule that fired; got: {detail}",
+        );
     }
 
     fn worker_health_summary_sentinel() -> WorkerHealthSummary {
