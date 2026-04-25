@@ -172,6 +172,15 @@ enum DictationCommand {
         /// Defaults to 1 (flush on the first silent probe after speech).
         #[arg(long, default_value_t = 1)]
         silence_gap_probes: u32,
+        /// When set, the CLI sleeps `N` seconds after the daemon
+        /// confirms the session is listening, then issues the matching
+        /// stop request and prints the final `DictationCaptureResult`
+        /// instead of just the listening session. Useful for benchmarks
+        /// and smoke checks where the operator wants a one-command
+        /// start-record-stop flow. Must be >= 1; omit for the default
+        /// "print listening session, leave running" behavior.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        duration_seconds: Option<u32>,
     },
     Stop {
         session_id: uuid::Uuid,
@@ -533,6 +542,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 probe_secs,
                 max_segment_secs,
                 silence_gap_probes,
+                duration_seconds,
             } => {
                 let segmentation = build_segmentation_mode(
                     mode,
@@ -556,7 +566,39 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let session: voicelayer_core::CaptureSession =
                     uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request).await?;
-                println!("{}", serde_json::to_string_pretty(&session)?);
+
+                match duration_seconds {
+                    None => {
+                        // Original behavior: print the listening session and
+                        // leave the orchestrator running. Operator must
+                        // call `vl dictation stop <id>` themselves.
+                        println!("{}", serde_json::to_string_pretty(&session)?);
+                    }
+                    Some(seconds) => {
+                        // One-command start-record-stop: hold the session
+                        // for `seconds`, then issue stop and print the
+                        // final result instead of the listening session.
+                        // The session id is intentionally not printed here
+                        // — the operator has nothing to do with it. Any
+                        // unrecoverable error during sleep or stop bubbles
+                        // up; callers shouldn't see a half-finished output.
+                        eprintln!(
+                            "session {} listening; auto-stopping after {seconds}s",
+                            session.session_id,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(u64::from(seconds)))
+                            .await;
+                        let result: voicelayer_core::DictationCaptureResult = uds_post_json(
+                            &cli_socket_path(),
+                            "/v1/sessions/dictation/stop",
+                            &StopDictationRequest {
+                                session_id: session.session_id,
+                            },
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    }
+                }
             }
             DictationCommand::Stop { session_id } => {
                 let result: voicelayer_core::DictationCaptureResult = uds_post_json(
@@ -1149,6 +1191,40 @@ mod tests {
                 "0",
             ])
             .expect_err("--max-segment-secs 0 must be rejected at parse time");
+        }
+
+        #[test]
+        fn duration_seconds_accepts_a_positive_integer() {
+            try_parse(&["vl", "dictation", "start", "--duration-seconds", "10"])
+                .expect("--duration-seconds 10 must parse cleanly on the default one-shot path");
+        }
+
+        #[test]
+        fn duration_seconds_rejects_zero() {
+            // Symmetric with the other clap range-parsed knobs: 0 is
+            // rejected at parse time so the operator gets a precise
+            // "0 is not in 1..=4294967295" error rather than a noop
+            // round-trip to the daemon.
+            try_parse(&["vl", "dictation", "start", "--duration-seconds", "0"])
+                .expect_err("--duration-seconds 0 must be rejected at parse time");
+        }
+
+        #[test]
+        fn duration_seconds_composes_with_vad_gated_mode() {
+            try_parse(&[
+                "vl",
+                "dictation",
+                "start",
+                "--mode",
+                "vad-gated",
+                "--probe-secs",
+                "2",
+                "--max-segment-secs",
+                "30",
+                "--duration-seconds",
+                "8",
+            ])
+            .expect("vad-gated + duration-seconds must parse together");
         }
     }
 }
