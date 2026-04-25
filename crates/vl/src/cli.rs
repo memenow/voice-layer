@@ -27,6 +27,7 @@ use crate::uds::{DaemonOutcome, cli_socket_path, try_daemon_post, uds_get_json, 
 #[derive(Debug, Parser)]
 #[command(name = "vl")]
 #[command(about = "VoiceLayer operator CLI")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -1356,6 +1357,26 @@ mod tests {
         fn list_parses_with_no_args() {
             try_parse(&["vl", "dictation", "list"])
                 .expect("dictation list must parse with no positional args or flags");
+        }
+
+        /// `vl --version` is the binary's "what release am I running?"
+        /// affordance. Combined with the openapi `info.version`
+        /// pin from #55, an operator who reports a bug can match the
+        /// CLI version string against the contract version they
+        /// were targeting. Pin the wiring so a future refactor that
+        /// dropped the `#[command(version)]` attribute would surface
+        /// at `cargo test`, not at first user complaint.
+        #[test]
+        fn top_level_version_flag_emits_cargo_pkg_version() {
+            let error = try_parse(&["vl", "--version"])
+                .expect_err("clap exits with DisplayVersion when --version is passed");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(env!("CARGO_PKG_VERSION")),
+                "version output should include CARGO_PKG_VERSION ({}); got {rendered}",
+                env!("CARGO_PKG_VERSION"),
+            );
         }
 
         #[test]
