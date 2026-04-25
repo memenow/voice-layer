@@ -432,4 +432,104 @@ mod tests {
             other => panic!("expected Rpc error from unconfigured VAD; got {other:?}"),
         }
     }
+
+    /// Build a `WorkerCommand` that runs an arbitrary shell script as
+    /// the JSON-RPC worker. The helper prepends `cat > /dev/null;`
+    /// so the subprocess always consumes the daemon's request from
+    /// stdin before running the caller's response snippet — without
+    /// that, `printf '...'; exit 0` style scripts close the stdin pipe
+    /// before our `write_all` lands and the test fails with
+    /// `BrokenPipe` instead of the variant we wanted to exercise. The
+    /// script's stdout becomes the response line and its final exit
+    /// status feeds the post-response classification (success /
+    /// `ProcessExited`).
+    fn shell_worker(response_script: &str) -> WorkerCommand {
+        let combined = format!("cat > /dev/null; {response_script}");
+        WorkerCommand {
+            executable: "sh".to_owned(),
+            args: vec!["-c".to_owned(), combined],
+            project_root: std::env::current_dir().expect("current_dir should resolve"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_io_error_when_executable_does_not_exist() {
+        let worker = WorkerCommand {
+            executable: "/voicelayer-test/definitely-not-a-real-binary".to_owned(),
+            args: vec![],
+            project_root: std::env::current_dir().expect("current_dir should resolve"),
+        };
+        match worker.health().await {
+            Err(WorkerCallError::Io(_)) => {}
+            other => panic!("expected Io error from missing executable; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_empty_response_when_subprocess_writes_nothing() {
+        // The shell exits cleanly without ever writing to stdout, so
+        // `BufReader::next_line` resolves to `None` and the call
+        // surface translates that to `EmptyResponse`.
+        let worker = shell_worker("exit 0");
+        match worker.health().await {
+            Err(WorkerCallError::EmptyResponse) => {}
+            other => panic!("expected EmptyResponse from silent subprocess; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_json_error_when_response_is_not_json() {
+        // `printf` writes a single line that is not parseable as
+        // JSON-RPC. `serde_json::from_str` fails and the helper
+        // converts it to `WorkerCallError::Json` via `From`.
+        let worker = shell_worker("printf '%s\\n' 'not-json-at-all'");
+        match worker.health().await {
+            Err(WorkerCallError::Json(_)) => {}
+            other => panic!("expected Json error from garbage stdout; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_invalid_protocol_version_when_jsonrpc_field_disagrees() {
+        // The response parses cleanly as JsonRpcResponse but the
+        // `jsonrpc` field doesn't match the protocol constant — the
+        // helper rejects it before reading the result.
+        let worker =
+            shell_worker(r#"printf '%s\n' '{"jsonrpc":"1.0","id":"x","result":{"providers":[]}}'"#);
+        match worker.list_providers().await {
+            Err(WorkerCallError::InvalidProtocolVersion(version)) => {
+                assert_eq!(version, "1.0");
+            }
+            other => panic!("expected InvalidProtocolVersion; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_malformed_response_when_neither_result_nor_error_present() {
+        // Valid JSON-RPC envelope but neither `result` nor `error` is
+        // populated. The helper defends against this since servers
+        // sometimes ship a half-formed response on internal failures.
+        let worker = shell_worker(r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x"}'"#);
+        match worker.list_providers().await {
+            Err(WorkerCallError::MalformedResponse) => {}
+            other => panic!("expected MalformedResponse; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_call_returns_process_exited_when_subprocess_returns_nonzero_after_response() {
+        // Subprocess writes a valid response then exits with a
+        // non-zero status. The helper surfaces the exit code so the
+        // operator can tell the worker crashed mid-shutdown rather
+        // than the response itself being broken.
+        let worker = shell_worker(
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x","result":{"providers":[]}}'; exit 7"#,
+        );
+        match worker.list_providers().await {
+            Err(WorkerCallError::ProcessExited(code, _stderr)) => {
+                assert_eq!(code, Some(7));
+            }
+            other => panic!("expected ProcessExited; got {other:?}"),
+        }
+    }
 }
