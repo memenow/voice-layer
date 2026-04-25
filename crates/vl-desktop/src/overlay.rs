@@ -131,3 +131,84 @@ pub fn render_session_stage(stage: SessionStage) -> &'static str {
         SessionStage::Failed => "failed",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DaemonStatus, HotkeyStatus, SessionStage, State, render_daemon_status, render_session_stage,
+    };
+
+    /// Adding a `DaemonStatus` variant forces the `render_*` match to
+    /// fail compile until the new arm is wired; this test pins the
+    /// *labels* operators see in the UI so a casual rename ("healthy"
+    /// → "ok") doesn't slip through unnoticed.
+    #[test]
+    fn render_daemon_status_pins_user_visible_labels() {
+        assert_eq!(render_daemon_status(DaemonStatus::Unknown), "unknown");
+        assert_eq!(
+            render_daemon_status(DaemonStatus::Probing),
+            "probing daemon..."
+        );
+        assert_eq!(
+            render_daemon_status(DaemonStatus::Healthy),
+            "daemon healthy"
+        );
+        assert_eq!(
+            render_daemon_status(DaemonStatus::Unreachable),
+            "daemon unreachable",
+        );
+    }
+
+    #[test]
+    fn render_session_stage_pins_user_visible_labels() {
+        assert_eq!(render_session_stage(SessionStage::Idle), "idle");
+        assert_eq!(
+            render_session_stage(SessionStage::Starting),
+            "starting dictation...",
+        );
+        assert_eq!(
+            render_session_stage(SessionStage::Listening),
+            "listening — speak now",
+        );
+        assert_eq!(render_session_stage(SessionStage::Stopping), "stopping...");
+        assert_eq!(render_session_stage(SessionStage::Completed), "completed");
+        assert_eq!(render_session_stage(SessionStage::Failed), "failed");
+    }
+
+    /// `HotkeyStatus::default()` deliberately starts with
+    /// `portal_available=false` and an explanatory error so the UI
+    /// shows "hotkey unavailable: not probed" before the first probe
+    /// completes — instead of misleadingly claiming the hotkey works.
+    /// Pin the wording since it's user-facing.
+    #[test]
+    fn hotkey_status_default_marks_portal_unprobed() {
+        let status = HotkeyStatus::default();
+        assert!(
+            !status.portal_available,
+            "default must start as unavailable until probe completes",
+        );
+        assert_eq!(status.portal_error.as_deref(), Some("not probed"));
+    }
+
+    /// `State::default()` is what the iced App boots with. Every field
+    /// must start empty/idle so a fresh window doesn't accidentally
+    /// render a stale transcript or claim a session is in progress.
+    #[test]
+    fn state_default_starts_idle_with_no_session() {
+        let state = State::default();
+        assert_eq!(state.daemon, DaemonStatus::Unknown);
+        assert_eq!(state.session_stage, SessionStage::Idle);
+        assert!(state.session_id.is_none());
+        assert!(state.transcript.is_none());
+        assert!(state.detected_language.is_none());
+        assert!(state.last_notes.is_empty());
+        assert!(state.error.is_none());
+        // The embedded `HotkeyStatus` is exercised in detail by
+        // `hotkey_status_default_marks_portal_unprobed`; here we only
+        // confirm the default propagates by checking the boolean side.
+        assert!(
+            !state.hotkey.portal_available,
+            "the embedded HotkeyStatus must default to unprobed",
+        );
+    }
+}
