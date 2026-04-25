@@ -1640,6 +1640,36 @@ mod tests {
         Some((name.to_owned(), kind))
     }
 
+    /// Pull the version floor a README list-item declares for a
+    /// language requirement. Targets the canonical
+    /// `- <Lang> <X.Y>+` shape (e.g. `- Rust 1.88+` or
+    /// `- Python 3.12+`) in the Requirements section. Stops at the
+    /// first character that is not a digit or `.`, so the trailing
+    /// `+` (and any prose after it) does not leak into the captured
+    /// token.
+    ///
+    /// Returns `None` when the language line is absent or written in
+    /// a different shape — callers are expected to surface that as
+    /// "the README has been refactored; this drift guard needs to
+    /// follow", not as a silent pass.
+    fn extract_readme_requirement_floor(contents: &str, lang: &str) -> Option<String> {
+        let prefix = format!("- {lang} ");
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix(&prefix) else {
+                continue;
+            };
+            let token: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+        None
+    }
+
     /// Walk `CLAUDE.md` and pull out the verification chain — the
     /// `&&`-joined sequence of commands inside the first fenced
     /// ```bash``` block. Strips the leading `&& ` continuation
@@ -4558,6 +4588,85 @@ install -m 0755 \"${REPO_ROOT}/target/release/vl\" \"${BIN_DIR}/vl\"
              `cargo build` line. For a repo-relative source (e.g. `scripts/foo.sh`), \
              commit the file at the referenced path.",
             violations.join("\n  - "),
+        );
+    }
+
+    #[test]
+    fn extract_readme_requirement_floor_strips_trailing_plus_and_prose() {
+        let md = "\
+### Requirements
+
+- Rust 1.88+
+- Python 3.12+ (managed through `uv`)
+- Ubuntu with PipeWire
+";
+        assert_eq!(
+            extract_readme_requirement_floor(md, "Rust"),
+            Some("1.88".to_owned()),
+        );
+        assert_eq!(
+            extract_readme_requirement_floor(md, "Python"),
+            Some("3.12".to_owned()),
+        );
+    }
+
+    #[test]
+    fn extract_readme_requirement_floor_returns_none_when_language_absent() {
+        let md = "\
+### Requirements
+
+- Rust 1.88+
+";
+        assert!(extract_readme_requirement_floor(md, "Python").is_none());
+    }
+
+    /// The README's "Requirements" list documents the toolchain
+    /// floors a contributor needs locally. Those floors must agree
+    /// with the canonical sources:
+    /// - `Rust X.Y+` ↔ `Cargo.toml` `[workspace.package].rust-version`
+    /// - `Python X.Y+` ↔ `pyproject.toml` `requires-python = ">=X.Y"`
+    ///
+    /// The drift mode is silent and especially confusing for new
+    /// contributors: the README invites them to install Rust 1.87,
+    /// the workspace MSRV is now 1.88, and `cargo build` fails with
+    /// a one-line "package requires rustc 1.88 or newer" error that
+    /// reads like a build-environment problem rather than a
+    /// documentation lag.
+    ///
+    /// `cargo` and `pyproject` are already pinned to each other
+    /// (PR #67 for the cargo↔pyproject leg, the MSRV-triangle test
+    /// for cargo↔rust-toolchain↔ci); this test closes the README
+    /// leg.
+    #[test]
+    fn readme_requirements_match_cargo_and_pyproject_toolchain_floors() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("read README.md");
+        let cargo_toml = std::fs::read_to_string(repo_root.join("Cargo.toml"))
+            .expect("read workspace Cargo.toml");
+        let pyproject =
+            std::fs::read_to_string(repo_root.join("pyproject.toml")).expect("read pyproject.toml");
+
+        let readme_rust = extract_readme_requirement_floor(&readme, "Rust")
+            .expect("README must declare `- Rust <X.Y>+` in Requirements — line may have moved");
+        let readme_python = extract_readme_requirement_floor(&readme, "Python")
+            .expect("README must declare `- Python <X.Y>+` in Requirements — line may have moved");
+
+        let cargo_rust = extract_toml_string_value(&cargo_toml, "rust-version")
+            .expect("Cargo.toml [workspace.package].rust-version not found");
+        let pyproject_python = extract_python_version_floor_from_pyproject(&pyproject)
+            .expect("pyproject.toml requires-python not found or unparseable");
+
+        assert_eq!(
+            readme_rust, cargo_rust,
+            "README declares `Rust {readme_rust}+` but `Cargo.toml` rust-version is \
+             `{cargo_rust}`. Bump the README list when the workspace MSRV moves.",
+        );
+        assert_eq!(
+            readme_python, pyproject_python,
+            "README declares `Python {readme_python}+` but `pyproject.toml` \
+             requires-python floor is `{pyproject_python}`. Bump the README list \
+             when the python floor moves.",
         );
     }
 }
