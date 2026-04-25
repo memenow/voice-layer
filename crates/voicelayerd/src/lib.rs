@@ -4389,3 +4389,173 @@ mod openapi_route_alignment_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sse_event_doc_alignment_tests {
+    //! Cross-check that every backtick-quoted SSE event name in
+    //! `docs/architecture/overview.md` corresponds to an
+    //! `EventEnvelope::new("<name>", ...)` emission somewhere in
+    //! `crates/voicelayerd/src/lib.rs`. Forward direction only: the
+    //! doc enumerates the dictation-pipeline events that operators
+    //! consume, but the daemon also emits non-dictation events
+    //! (`compose.job_created`, `transcription.completed`, etc.) that
+    //! the doc intentionally does not mention. Reverse-direction
+    //! enforcement would require lifting the doc to an exhaustive
+    //! event reference, which is out of scope for this guard.
+    //!
+    //! The drift mode the forward direction catches is doc rot: the
+    //! doc claims `dictation.fancy_new_event` is emitted but the
+    //! daemon never produces it. Operators wiring an SSE consumer
+    //! against the doc see no event and have no way to discover the
+    //! name was retired.
+    use std::collections::BTreeSet;
+
+    /// Walk a Rust source string and pull every event name from
+    /// `EventEnvelope::new("<name>", ...)` calls. Tolerates the
+    /// multi-line layout the daemon uses today
+    /// (`EventEnvelope::new(\n    "<name>",\n ...)`): the scanner
+    /// finds each `EventEnvelope::new(` occurrence, skips
+    /// whitespace, and reads the next `"..."` literal. Stops at the
+    /// first `#[cfg(test)]` line so synthetic test fixtures
+    /// (`test.single_event`) do not leak into the production set.
+    fn collect_event_envelope_names(source: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let mut search = source;
+        // Truncate at the first `#[cfg(test)]` so test-only event
+        // fixtures don't pollute the captured set.
+        if let Some(idx) = search.find("#[cfg(test)]") {
+            search = &search[..idx];
+        }
+        while let Some(idx) = search.find("EventEnvelope::new(") {
+            let after = &search[idx + "EventEnvelope::new(".len()..];
+            let trimmed = after.trim_start();
+            search = after;
+            let Some(stripped) = trimmed.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = stripped.find('"') else {
+                continue;
+            };
+            let name = &stripped[..end];
+            if !name.is_empty() {
+                names.insert(name.to_owned());
+            }
+        }
+        names
+    }
+
+    /// Walk a Markdown body and pull every backtick-quoted token of
+    /// shape `dictation.<word>` (lowercase letters and underscores
+    /// only after the dot). Designed for the SSE event mentions in
+    /// `docs/architecture/overview.md`. Excludes the `worker.*`,
+    /// `compose.*`, and `transcription.*` namespaces, which the
+    /// doc does not enumerate today and the forward-direction
+    /// guard does not require to be enumerated.
+    fn collect_doc_dictation_event_names(contents: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let mut search = contents;
+        while let Some(idx) = search.find('`') {
+            let after = &search[idx + 1..];
+            let Some(close) = after.find('`') else {
+                break;
+            };
+            let inner = &after[..close];
+            search = &after[close + 1..];
+            let Some(rest) = inner.strip_prefix("dictation.") else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            if !rest.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                continue;
+            }
+            names.insert(format!("dictation.{rest}"));
+        }
+        names
+    }
+
+    #[test]
+    fn collect_event_envelope_names_handles_multiline_layout_and_skips_test_module() {
+        let source = "
+let _ = state.events.send(EventEnvelope::new(
+    \"dictation.session_created\",
+    payload,
+));
+let _ = state.events.send(EventEnvelope::new(\"dictation.completed\", payload));
+#[cfg(test)]
+mod tests {
+    let _ = events.send(EventEnvelope::new(\"test.synthetic\", payload));
+}
+";
+        let names = collect_event_envelope_names(source);
+        assert_eq!(
+            names,
+            ["dictation.completed", "dictation.session_created"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "the test-module event must be excluded by the #[cfg(test)] truncation",
+        );
+    }
+
+    #[test]
+    fn collect_doc_dictation_event_names_filters_to_dictation_namespace_only() {
+        let md = "\
+- `dictation.session_created` — fired when the session is created.
+- `dictation.completed` / `dictation.failed` — terminal pair.
+- `compose.job_created` — out of scope for this guard.
+- The `dictation.with space` token is not an event.
+";
+        let names = collect_doc_dictation_event_names(md);
+        assert_eq!(
+            names,
+            [
+                "dictation.completed",
+                "dictation.failed",
+                "dictation.session_created"
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+        );
+    }
+
+    /// Every dictation-namespace SSE event name the architecture
+    /// overview enumerates must correspond to a real
+    /// `EventEnvelope::new(...)` emission in the daemon. The
+    /// reverse direction (every emitted event is documented) is
+    /// intentionally not enforced — the daemon emits several
+    /// non-dictation events the doc does not promise to list.
+    #[test]
+    fn every_doc_dictation_event_resolves_to_an_event_envelope_emission() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let lib_source = std::fs::read_to_string(format!("{manifest}/src/lib.rs"))
+            .expect("read voicelayerd lib.rs");
+        let overview =
+            std::fs::read_to_string(format!("{manifest}/../../docs/architecture/overview.md"))
+                .expect("read docs/architecture/overview.md");
+
+        let emitted = collect_event_envelope_names(&lib_source);
+        let doc_events = collect_doc_dictation_event_names(&overview);
+
+        assert!(
+            !emitted.is_empty(),
+            "expected at least one EventEnvelope::new emission in lib.rs",
+        );
+        assert!(
+            !doc_events.is_empty(),
+            "expected at least one dictation event reference in overview.md",
+        );
+
+        let undocumented_in_code: Vec<&String> = doc_events.difference(&emitted).collect();
+        assert!(
+            undocumented_in_code.is_empty(),
+            "docs/architecture/overview.md mentions dictation events the daemon \
+             does not emit: {undocumented_in_code:?}\n\nEither rename the doc \
+             reference to match the actual event, drop the mention, or wire up \
+             an `EventEnvelope::new(\"<name>\", ...)` emission in \
+             crates/voicelayerd/src/lib.rs.",
+        );
+    }
+}
