@@ -1035,6 +1035,60 @@ mod tests {
         }
     }
 
+    /// Collect every `#/components/schemas/<Name>` reference that
+    /// appears as the value of a `$ref:` line. Tolerates both quoted
+    /// (`"..."`) and unquoted forms; the only requirement is the
+    /// `$ref:` token at the start of the line (after trimming) and a
+    /// matching component-prefixed value.
+    fn collect_schema_refs(contents: &str) -> std::collections::BTreeSet<String> {
+        let prefix = "#/components/schemas/";
+        let mut refs = std::collections::BTreeSet::new();
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("$ref:") else {
+                continue;
+            };
+            let unquoted = rest.trim().trim_matches(['"', '\'']);
+            if let Some(name) = unquoted.strip_prefix(prefix) {
+                refs.insert(name.to_owned());
+            }
+        }
+        refs
+    }
+
+    /// Collect every PascalCase schema heading at the canonical
+    /// four-space `components.schemas.<Name>:` indent. Path keys
+    /// (e.g. `/v1/health:`) live at the same indent under `paths:`
+    /// but always start with `/`, so the leading-uppercase filter
+    /// excludes them. Future lower-case schema names would slip
+    /// through, but openapi convention (and every existing schema
+    /// in this contract) uses PascalCase.
+    fn collect_defined_schema_names(contents: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for line in contents.lines() {
+            let Some(stripped) = line.strip_prefix("    ") else {
+                continue;
+            };
+            // 4-space-only indent: deeper indents must be excluded.
+            if stripped.starts_with(' ') {
+                continue;
+            }
+            let Some(name) = stripped.strip_suffix(':') else {
+                continue;
+            };
+            // PascalCase guard: paths start with `/`, descriptions
+            // would have spaces, etc.
+            if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                continue;
+            }
+            if name.contains(' ') {
+                continue;
+            }
+            names.insert(name.to_owned());
+        }
+        names
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1293,6 +1347,84 @@ mod tests {
           enum: [a, b]
 ";
         assert!(parse_property_string_enum(section, "style").is_empty());
+    }
+
+    #[test]
+    fn collect_schema_refs_handles_double_and_single_quoted_forms() {
+        // Both quoting styles are valid YAML and the parser must
+        // accept either. An unquoted `$ref: #/...` form would be
+        // interpreted by YAML as `$ref:` (empty) with the rest as a
+        // comment, so it is intentionally not included here.
+        let yaml = "\
+paths:
+  /a:
+    get:
+      responses:
+        \"200\":
+          content:
+            application/json:
+              schema:
+                $ref: \"#/components/schemas/Alpha\"
+        \"201\":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Beta'
+";
+        let refs = collect_schema_refs(yaml);
+        assert!(refs.contains("Alpha"));
+        assert!(refs.contains("Beta"));
+    }
+
+    #[test]
+    fn collect_schema_refs_ignores_non_components_refs() {
+        let yaml = "\
+paths:
+  /a:
+    parameters:
+      - $ref: \"#/components/parameters/SomeParam\"
+    get:
+      responses:
+        \"200\":
+          content:
+            application/json:
+              schema:
+                $ref: \"#/components/schemas/Alpha\"
+";
+        let refs = collect_schema_refs(yaml);
+        assert!(refs.contains("Alpha"));
+        assert!(
+            !refs.contains("SomeParam"),
+            "non-schema refs must be ignored; got: {refs:?}",
+        );
+    }
+
+    #[test]
+    fn collect_defined_schema_names_skips_paths_and_deeper_indents() {
+        let yaml = "\
+paths:
+  /v1/health:
+    get:
+      responses: {}
+components:
+  schemas:
+    Foo:
+      type: object
+    Bar:
+      type: object
+      properties:
+        nested_field:
+          type: string
+";
+        let names = collect_defined_schema_names(yaml);
+        // PascalCase 4-space-indent headings are picked up.
+        assert!(names.contains("Foo"));
+        assert!(names.contains("Bar"));
+        // Path keys start with `/` and fail the uppercase guard.
+        assert!(!names.iter().any(|n| n.starts_with('/')));
+        // Deeper-indent fields like `nested_field:` (8 spaces) must
+        // be excluded too.
+        assert!(!names.contains("nested_field"));
     }
 
     /// Pins both directions of the soft-list override:
@@ -1998,5 +2130,42 @@ mod tests {
             "kind",
             &enumerate_provider_kind_variants(),
         );
+    }
+
+    /// Structural integrity check on the openapi YAML: every
+    /// `$ref: "#/components/schemas/<Name>"` must point to a schema
+    /// component that the file actually declares. Unlike the rust↔
+    /// openapi drift guards above, this test is purely a YAML lint
+    /// — it catches typos and rename-without-update regressions
+    /// inside the contract file itself, regardless of whether the
+    /// rust side has matching types. A broken `$ref` would still
+    /// load via `serde_json::from_str` (the daemon never resolves
+    /// refs at runtime), so the only place to catch it is at
+    /// build/test time.
+    #[test]
+    fn openapi_every_schema_ref_resolves_to_a_defined_component() {
+        let openapi_path = format!(
+            "{}/../../openapi/voicelayerd.v1.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let contents =
+            std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
+
+        let defined = collect_defined_schema_names(&contents);
+        let refs = collect_schema_refs(&contents);
+        assert!(
+            !refs.is_empty(),
+            "expected at least one $ref in the openapi file; \
+             collect_schema_refs may be misparsing",
+        );
+
+        for reference in &refs {
+            assert!(
+                defined.contains(reference),
+                "openapi `$ref: #/components/schemas/{reference}` does not resolve — \
+                 schema is not declared. Either fix the typo or add the missing schema. \
+                 Defined components: {defined:?}",
+            );
+        }
     }
 }
