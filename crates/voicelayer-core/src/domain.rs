@@ -477,10 +477,12 @@ pub fn now_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureSession, CompositionReceipt, DictationCaptureResult, DictationFailureKind,
-        HealthResponse, InjectTarget, InjectionPlan, LanguageProfile, PreviewArtifact,
-        PreviewStatus, SessionMode, SessionState, TranscriptionResult, TriggerKind,
-        WorkerHealthSummary,
+        CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
+        DictationCaptureResult, DictationFailureKind, HealthResponse, InjectRequest, InjectTarget,
+        InjectionPlan, LanguageProfile, PreviewArtifact, PreviewStatus, RewriteRequest,
+        RewriteStyle, SegmentationMode, SessionMode, SessionState, StartDictationRequest,
+        StopDictationRequest, TranscribeRequest, TranscriptionResult, TranslateRequest,
+        TriggerKind, WorkerHealthSummary,
     };
     use uuid::Uuid;
 
@@ -538,10 +540,22 @@ mod tests {
     ///    (serialised as a non-null value) appears under `required:`,
     ///    and every Option field (serialised as `null`) does not.
     ///
+    /// `serde_default_fields` lists Rust fields that are non-Option but
+    /// annotated with `#[serde(default)]`, so they serialise as a real
+    /// value yet are wire-optional. Such fields are excluded from the
+    /// required-list cross-check (the openapi schema may legitimately
+    /// list them as required or omit them — the contract is the absence
+    /// of a hard requirement, not its presence). Property-presence is
+    /// still enforced. Pass `&[]` for schemas with no such fields.
+    ///
     /// Supports both YAML required-list forms in the source file:
     /// block (`      required:\n        - foo`) and inline
     /// (`      required: [foo, bar]`).
-    fn assert_openapi_documents_every_field<T: serde::Serialize>(schema_name: &str, sentinel: &T) {
+    fn assert_openapi_documents_every_field<T: serde::Serialize>(
+        schema_name: &str,
+        sentinel: &T,
+        serde_default_fields: &[&str],
+    ) {
         let openapi_path = format!(
             "{}/../../openapi/voicelayerd.v1.yaml",
             env!("CARGO_MANIFEST_DIR"),
@@ -574,23 +588,57 @@ mod tests {
 
         // 2. Required-list cross-check.
         let required_set = parse_required_set(&section);
+        if let Err(detail) =
+            check_required_consistency(schema_name, object, &required_set, serde_default_fields)
+        {
+            panic!("{detail}");
+        }
+    }
+
+    /// Cross-check a serialised sentinel against an openapi schema's
+    /// `required` set. Returns `Ok(())` when every non-Option field is
+    /// listed (and every Option field is not), or `Err(detail)` with a
+    /// human-readable explanation of the first mismatch encountered.
+    ///
+    /// Fields named in `serde_default_fields` are skipped in either
+    /// direction — their wire contract is "may be absent on input,
+    /// daemon defaults", so the openapi schema may legitimately list or
+    /// omit them.
+    ///
+    /// Extracted from `assert_openapi_documents_every_field` so the
+    /// override-loop's behaviour can be unit-tested without a real
+    /// openapi file on disk.
+    fn check_required_consistency(
+        schema_name: &str,
+        object: &serde_json::Map<String, serde_json::Value>,
+        required_set: &std::collections::BTreeSet<String>,
+        serde_default_fields: &[&str],
+    ) -> Result<(), String> {
         for (field, field_value) in object {
+            if serde_default_fields.contains(&field.as_str()) {
+                continue;
+            }
             let is_option = field_value.is_null();
             let listed = required_set.contains(field.as_str());
             match (is_option, listed) {
-                (false, false) => panic!(
-                    "openapi {schema_name} required list is missing `{field}`; \
-                     the Rust field is non-Option so it always serialises — the schema \
-                     must list it under required.",
-                ),
-                (true, true) => panic!(
-                    "openapi {schema_name} required list contains `{field}`, but \
-                     the Rust field is Option<_> and may legitimately be absent. Drop it \
-                     from required (or change the Rust side to a non-Option type).",
-                ),
+                (false, false) => {
+                    return Err(format!(
+                        "openapi {schema_name} required list is missing `{field}`; \
+                         the Rust field is non-Option so it always serialises — the schema \
+                         must list it under required.",
+                    ));
+                }
+                (true, true) => {
+                    return Err(format!(
+                        "openapi {schema_name} required list contains `{field}`, but \
+                         the Rust field is Option<_> and may legitimately be absent. Drop it \
+                         from required (or change the Rust side to a non-Option type).",
+                    ));
+                }
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// Walk the openapi YAML line-by-line and return the slice that
@@ -795,6 +843,57 @@ mod tests {
         );
     }
 
+    /// Pins both directions of the soft-list override:
+    /// 1. With `flag` listed in `serde_default_fields`, the cross-check
+    ///    returns `Ok(())` even though `flag` is non-null and missing
+    ///    from `required`.
+    /// 2. Without that override, the *same input* produces an `Err`
+    ///    naming the mismatched field — proving the override is doing
+    ///    real work, not just masking a no-op path.
+    ///
+    /// The check operates on an in-memory section + sentinel, so it
+    /// pins `check_required_consistency` directly instead of needing
+    /// a fake openapi file on disk.
+    #[test]
+    fn check_required_consistency_skips_serde_default_fields_only_when_listed() {
+        #[derive(serde::Serialize)]
+        struct Sample {
+            id: String,
+            flag: bool,
+        }
+
+        let section = "\
+    Sample:
+      required: [id]
+      properties:
+        id:
+          type: string
+        flag:
+          type: boolean
+";
+        let value = serde_json::to_value(Sample {
+            id: String::new(),
+            flag: false,
+        })
+        .expect("serialise Sample");
+        let object = value.as_object().expect("Sample is a JSON object");
+        let required_set = parse_required_set(section);
+
+        check_required_consistency("Sample", object, &required_set, &["flag"])
+            .expect("soft-list override must silence the missing-required complaint for `flag`");
+
+        let detail = check_required_consistency("Sample", object, &required_set, &[])
+            .expect_err("without the override, `flag` must trip the required-list check");
+        assert!(
+            detail.contains("`flag`"),
+            "the error must name the offending field; got: {detail}",
+        );
+        assert!(
+            detail.contains("non-Option"),
+            "the error must explain the rule that fired; got: {detail}",
+        );
+    }
+
     fn worker_health_summary_sentinel() -> WorkerHealthSummary {
         WorkerHealthSummary {
             status: String::new(),
@@ -851,6 +950,7 @@ mod tests {
         assert_openapi_documents_every_field(
             "WorkerHealthSummary",
             &worker_health_summary_sentinel(),
+            &[],
         );
     }
 
@@ -862,17 +962,17 @@ mod tests {
             version: String::new(),
             worker: worker_health_summary_sentinel(),
         };
-        assert_openapi_documents_every_field("HealthResponse", &sentinel);
+        assert_openapi_documents_every_field("HealthResponse", &sentinel, &[]);
     }
 
     #[test]
     fn openapi_capture_session_documents_every_field() {
-        assert_openapi_documents_every_field("CaptureSession", &capture_session_sentinel());
+        assert_openapi_documents_every_field("CaptureSession", &capture_session_sentinel(), &[]);
     }
 
     #[test]
     fn openapi_preview_artifact_documents_every_field() {
-        assert_openapi_documents_every_field("PreviewArtifact", &preview_artifact_sentinel());
+        assert_openapi_documents_every_field("PreviewArtifact", &preview_artifact_sentinel(), &[]);
     }
 
     #[test]
@@ -881,7 +981,7 @@ mod tests {
             job_id: Uuid::nil(),
             preview: preview_artifact_sentinel(),
         };
-        assert_openapi_documents_every_field("CompositionReceipt", &sentinel);
+        assert_openapi_documents_every_field("CompositionReceipt", &sentinel, &[]);
     }
 
     #[test]
@@ -891,7 +991,7 @@ mod tests {
             payload: String::new(),
             auto_submit: false,
         };
-        assert_openapi_documents_every_field("InjectionPlan", &sentinel);
+        assert_openapi_documents_every_field("InjectionPlan", &sentinel, &[]);
     }
 
     #[test]
@@ -899,6 +999,7 @@ mod tests {
         assert_openapi_documents_every_field(
             "TranscriptionResult",
             &transcription_result_sentinel(),
+            &[],
         );
     }
 
@@ -910,6 +1011,108 @@ mod tests {
             audio_file: None,
             failure_kind: None,
         };
-        assert_openapi_documents_every_field("DictationCaptureResult", &sentinel);
+        assert_openapi_documents_every_field("DictationCaptureResult", &sentinel, &[]);
+    }
+
+    // Request-side drift guards. Pattern matches the response-side
+    // ones above, with the addition that fields annotated with
+    // `#[serde(default)]` on the Rust struct are passed in
+    // `serde_default_fields` so the required-list cross-check tolerates
+    // either listing them under `required:` or omitting them — the
+    // wire contract is "may be absent on input, daemon defaults".
+
+    #[test]
+    fn openapi_start_dictation_request_documents_every_field() {
+        let sentinel = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: None,
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::OneShot,
+        };
+        assert_openapi_documents_every_field(
+            "StartDictationRequest",
+            &sentinel,
+            &["translate_to_english", "keep_audio", "segmentation"],
+        );
+    }
+
+    #[test]
+    fn openapi_stop_dictation_request_documents_every_field() {
+        let sentinel = StopDictationRequest {
+            session_id: Uuid::nil(),
+        };
+        assert_openapi_documents_every_field("StopDictationRequest", &sentinel, &[]);
+    }
+
+    #[test]
+    fn openapi_dictation_capture_request_documents_every_field() {
+        let sentinel = DictationCaptureRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            duration_seconds: 0,
+            recorder_backend: None,
+            translate_to_english: false,
+            keep_audio: false,
+        };
+        assert_openapi_documents_every_field(
+            "DictationCaptureRequest",
+            &sentinel,
+            &["translate_to_english", "keep_audio"],
+        );
+    }
+
+    #[test]
+    fn openapi_compose_request_documents_every_field() {
+        let sentinel = ComposeRequest {
+            spoken_prompt: String::new(),
+            archetype: None,
+            output_language: None,
+        };
+        assert_openapi_documents_every_field("ComposeRequest", &sentinel, &[]);
+    }
+
+    #[test]
+    fn openapi_rewrite_request_documents_every_field() {
+        let sentinel = RewriteRequest {
+            source_text: String::new(),
+            style: RewriteStyle::MoreFormal,
+            output_language: None,
+        };
+        assert_openapi_documents_every_field("RewriteRequest", &sentinel, &[]);
+    }
+
+    #[test]
+    fn openapi_translate_request_documents_every_field() {
+        let sentinel = TranslateRequest {
+            source_text: String::new(),
+            target_language: String::new(),
+        };
+        assert_openapi_documents_every_field("TranslateRequest", &sentinel, &[]);
+    }
+
+    #[test]
+    fn openapi_transcribe_request_documents_every_field() {
+        let sentinel = TranscribeRequest {
+            audio_file: String::new(),
+            language: None,
+            translate_to_english: false,
+        };
+        assert_openapi_documents_every_field(
+            "TranscribeRequest",
+            &sentinel,
+            &["translate_to_english"],
+        );
+    }
+
+    #[test]
+    fn openapi_inject_request_documents_every_field() {
+        let sentinel = InjectRequest {
+            target: InjectTarget::GuiAccessible,
+            text: String::new(),
+            auto_submit: false,
+        };
+        assert_openapi_documents_every_field("InjectRequest", &sentinel, &["auto_submit"]);
     }
 }
