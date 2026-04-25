@@ -179,6 +179,9 @@ While a VAD-gated session is live the daemon streams these per-probe / per-unit 
   `speech_ratio`.
 - `dictation.speech_unit_flushed` — once per flushed pending buffer (silence-triggered or
   max-duration-triggered).
+- `dictation.speech_unit_failed` — emitted instead of `speech_unit_flushed` when the
+  `stitch_wav_segments` RPC errors during a flush; the session ultimately surfaces as
+  `dictation.failed` with `failure_kind: asr_failed`.
 - `dictation.speech_unit_transcribed` — once per flushed unit's background transcribe task.
 - `dictation.completed` / `dictation.failed` — same shape as fixed mode; `text` is the
   concatenated transcripts of every flushed speech unit.
@@ -190,8 +193,10 @@ operator can inspect it in the SSE stream.
 
 When VAD is **not** configured (`VOICELAYER_WHISPER_VAD_ENABLED` unset or
 `VOICELAYER_WHISPER_VAD_MODEL_PATH` missing), the daemon still accepts `--mode vad-gated`
-requests but every probe falls back to "speech", which degrades the mode to fixed-cadence
-segmentation. Configure VAD properly before relying on the gating to bound transcribe inputs.
+requests but every probe falls back to "speech". Silence-triggered flushes never fire, so
+`max_segment_secs` becomes the only remaining flush trigger — the effective cadence is the
+buffered-duration cap, not `probe_secs`. Configure VAD properly before relying on the gating
+to bound transcribe inputs.
 
 ## Current Scope
 
