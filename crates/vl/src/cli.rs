@@ -1197,7 +1197,7 @@ mod tests {
         });
     }
 
-    mod dictation_start_parsing {
+    mod dictation_parsing {
         use clap::Parser;
 
         use super::super::Args;
@@ -1350,6 +1350,34 @@ mod tests {
                 "8",
             ])
             .expect("vad-gated + duration-seconds must parse together");
+        }
+
+        #[test]
+        fn list_parses_with_no_args() {
+            try_parse(&["vl", "dictation", "list"])
+                .expect("dictation list must parse with no positional args or flags");
+        }
+
+        #[test]
+        fn stop_requires_a_session_id_positional() {
+            let error = try_parse(&["vl", "dictation", "stop"])
+                .expect_err("dictation stop without a session_id must error at parse time");
+            // clap's missing-required-arg message names the argument.
+            let message = error.to_string();
+            assert!(
+                message.contains("session_id") || message.contains("SESSION_ID"),
+                "missing-arg error should name session_id; got {message}",
+            );
+        }
+
+        #[test]
+        fn stop_rejects_malformed_session_id() {
+            // The CLI uses `uuid::Uuid` as the value type, so clap
+            // rejects non-UUID strings at parse time. Pin that the
+            // operator gets a clean error message instead of the
+            // request reaching the daemon and surfacing as a 500.
+            try_parse(&["vl", "dictation", "stop", "not-a-uuid"])
+                .expect_err("dictation stop must reject a non-UUID session_id at parse time");
         }
     }
 }
