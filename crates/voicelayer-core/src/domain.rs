@@ -1168,6 +1168,32 @@ mod tests {
         None
     }
 
+    /// Pull a YAML scalar value bound to `key`, accepting either the
+    /// bare form (`key: value`) or a quoted form (`key: "value"` /
+    /// `key: 'value'`). Stops at the first whitespace or quote
+    /// inside the value, so a trailing `# comment` cannot leak into
+    /// the token. Companion to `extract_yaml_string_value`, which
+    /// requires the quoted form — this helper is for fields like
+    /// openapi's `info.version: 0.1.0` written as a bare scalar.
+    fn extract_yaml_bare_string_value(contents: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key}: ");
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix(&prefix) else {
+                continue;
+            };
+            let stripped = rest.trim_start_matches(['"', '\'']);
+            let token: String = stripped
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                .collect();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+        None
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1606,6 +1632,47 @@ components:
     fn extract_uv_python_install_version_returns_none_when_command_absent() {
         let yaml = "jobs:\n  verify:\n    steps:\n      - run: cargo build\n";
         assert!(extract_uv_python_install_version(yaml).is_none());
+    }
+
+    #[test]
+    fn extract_yaml_bare_string_value_handles_both_bare_and_quoted_forms() {
+        let yaml = concat!(
+            "info:\n",
+            "  title: Local Control API\n",
+            "  version: 0.1.0\n",
+            "  description: |\n",
+            "    multi-line block\n",
+        );
+        // Bare-scalar version (no quotes) is the default openapi style.
+        assert_eq!(
+            extract_yaml_bare_string_value(yaml, "version").as_deref(),
+            Some("0.1.0"),
+        );
+        // Quoted form must work too — both styles are valid YAML.
+        let quoted = "info:\n  version: \"0.2.0\"\n";
+        assert_eq!(
+            extract_yaml_bare_string_value(quoted, "version").as_deref(),
+            Some("0.2.0"),
+        );
+    }
+
+    #[test]
+    fn extract_yaml_bare_string_value_stops_at_trailing_inline_comment() {
+        // Pin the comment-tolerance so a trailing `# note` cannot leak
+        // into the token. The take-while exits at whitespace, so the
+        // helper trims at the first space — comment text never bleeds
+        // into the version string.
+        let yaml = "info:\n  version: 1.2.3  # bumped 2026-04-25\n";
+        assert_eq!(
+            extract_yaml_bare_string_value(yaml, "version").as_deref(),
+            Some("1.2.3"),
+        );
+    }
+
+    #[test]
+    fn extract_yaml_bare_string_value_returns_none_when_key_absent() {
+        let yaml = "info:\n  title: nope\n";
+        assert!(extract_yaml_bare_string_value(yaml, "version").is_none());
     }
 
     /// Pins both directions of the soft-list override:
@@ -2428,6 +2495,40 @@ components:
             "python version drift: pyproject.toml `requires-python = \">={pyproject_floor}\"` \
              but ci.yml runs `uv python install {ci_install}`. Update both together so the \
              test matrix matches the manifest's declared floor.",
+        );
+    }
+
+    /// Pin `openapi.info.version` against the workspace
+    /// `[workspace.package] version` in the root `Cargo.toml`. Both
+    /// claim to describe the same release artefact, so a bump that
+    /// updated only one side would publish an openapi document
+    /// labeled with the wrong release. Operators reading the yaml in
+    /// isolation (e.g. someone consuming the contract through a code
+    /// generator) would see a stale version and silently target an
+    /// older daemon.
+    #[test]
+    fn openapi_info_version_matches_cargo_workspace_version() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+
+        let cargo_toml = std::fs::read_to_string(format!("{repo_root}/Cargo.toml"))
+            .expect("read root Cargo.toml");
+        let openapi = std::fs::read_to_string(format!("{repo_root}/openapi/voicelayerd.v1.yaml"))
+            .expect("read openapi contract");
+
+        let cargo_version = extract_toml_string_value(&cargo_toml, "version").expect(
+            "Cargo.toml must declare `version = \"...\"` under [workspace.package]; \
+             extract_toml_string_value may be misparsing",
+        );
+        let openapi_version = extract_yaml_bare_string_value(&openapi, "version").expect(
+            "openapi/voicelayerd.v1.yaml must declare `info.version: ...`; \
+             extract_yaml_bare_string_value may be misparsing",
+        );
+
+        assert_eq!(
+            cargo_version, openapi_version,
+            "version drift: Cargo.toml `version = \"{cargo_version}\"` does not match \
+             openapi/voicelayerd.v1.yaml `info.version: {openapi_version}`. Bump both \
+             together so the contract document and the published crate share a label.",
         );
     }
 }
