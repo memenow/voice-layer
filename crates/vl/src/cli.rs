@@ -1401,4 +1401,184 @@ mod tests {
                 .expect_err("dictation stop must reject a non-UUID session_id at parse time");
         }
     }
+
+    mod readme_subcommand_alignment {
+        //! Cross-check that every `vl <cmd>` mention in `README.md`
+        //! resolves to a real top-level subcommand declared in this
+        //! file's `enum Command`. Forward direction only: the CLI
+        //! includes `preview` (an internal subcommand) which the
+        //! README intentionally does not advertise; reverse-direction
+        //! enforcement would require exposing it.
+        //!
+        //! The drift mode is silent: the README invites a contributor
+        //! to run `vl scribe-file` (typo) or `vl old-name` (after a
+        //! rename), the user copy-pastes the line, clap returns
+        //! `error: unrecognized subcommand`, and the only fix is to
+        //! reverse-engineer the real name from `--help`.
+        use std::collections::BTreeSet;
+
+        /// Walk `README.md` and pull every `vl <subcommand>` token,
+        /// covering both shapes the README uses today:
+        /// - `cargo run -p vl -- <cmd>` (in fenced code blocks)
+        /// - `` `vl <cmd>` `` (inline backticks)
+        ///
+        /// Only the *first* token after `vl ` (or `-p vl -- `) is
+        /// captured — that is the top-level subcommand. Sub-subcommands
+        /// like `dictation foreground-ptt` contribute only `dictation`
+        /// to the set; the deeper alignment is left to clap's own
+        /// parse-time errors.
+        pub(super) fn extract_readme_vl_subcommand_mentions(contents: &str) -> BTreeSet<String> {
+            let mut subs = BTreeSet::new();
+            for prefix in ["-p vl -- ", "`vl "] {
+                let mut search = contents;
+                while let Some(idx) = search.find(prefix) {
+                    let after = &search[idx + prefix.len()..];
+                    let token: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-' || c.is_ascii_digit())
+                        .collect();
+                    if !token.is_empty() && !token.starts_with('-') {
+                        subs.insert(token);
+                    }
+                    search = after;
+                }
+            }
+            subs
+        }
+
+        /// Walk this file (`crates/vl/src/cli.rs`) and pull every
+        /// top-level `enum Command` variant name, kebab-cased to
+        /// match clap's auto-derived subcommand names. Variants are
+        /// recognised by their 4-space indent and PascalCase shape;
+        /// inner sub-fields (deeper indent) and the closing brace
+        /// are filtered out.
+        pub(super) fn extract_clap_top_level_command_names(source: &str) -> BTreeSet<String> {
+            let mut names = BTreeSet::new();
+            let mut in_enum = false;
+            for line in source.lines() {
+                if line.trim() == "enum Command {" {
+                    in_enum = true;
+                    continue;
+                }
+                if !in_enum {
+                    continue;
+                }
+                if line.trim() == "}" {
+                    break;
+                }
+                let Some(rest) = line.strip_prefix("    ") else {
+                    continue;
+                };
+                if rest.starts_with(' ') {
+                    continue;
+                }
+                let token: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !token.is_empty() && token.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    names.insert(pascal_to_kebab(&token));
+                }
+            }
+            names
+        }
+
+        fn pascal_to_kebab(s: &str) -> String {
+            let mut out = String::new();
+            for (i, c) in s.chars().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    out.push('-');
+                }
+                out.push(c.to_ascii_lowercase());
+            }
+            out
+        }
+
+        #[test]
+        fn pascal_to_kebab_handles_acronym_and_multiword_variants() {
+            assert_eq!(pascal_to_kebab("Doctor"), "doctor");
+            assert_eq!(
+                pascal_to_kebab("PrintBracketedPaste"),
+                "print-bracketed-paste"
+            );
+            assert_eq!(pascal_to_kebab("RecordTranscribe"), "record-transcribe");
+        }
+
+        #[test]
+        fn extract_readme_vl_subcommand_mentions_handles_both_shapes() {
+            let md = "\
+The `vl doctor` invocation is a quick environment probe.
+
+```bash
+cargo run -p vl -- daemon run --project-root \"$(pwd)\"
+cargo run -p vl -- providers
+```
+
+`vl --help` prints clap's auto-generated reference.
+";
+            let mentions = extract_readme_vl_subcommand_mentions(md);
+            assert_eq!(
+                mentions,
+                ["daemon", "doctor", "providers"]
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                "`vl --help` must NOT contribute `--help` to the set",
+            );
+        }
+
+        #[test]
+        fn extract_clap_top_level_command_names_collects_unit_and_struct_variants() {
+            let source = "\
+enum Command {
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    Doctor,
+    PrintBracketedPaste {
+        text: String,
+    },
+}
+";
+            let names = extract_clap_top_level_command_names(source);
+            assert_eq!(
+                names,
+                ["daemon", "doctor", "print-bracketed-paste"]
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+            );
+        }
+
+        #[test]
+        fn every_readme_vl_subcommand_mention_resolves_to_a_clap_command_variant() {
+            let manifest = env!("CARGO_MANIFEST_DIR");
+            let cli_rs = std::fs::read_to_string(format!("{manifest}/src/cli.rs"))
+                .expect("read crates/vl/src/cli.rs");
+            let readme = std::fs::read_to_string(format!("{manifest}/../../README.md"))
+                .expect("read README.md");
+
+            let mentions = extract_readme_vl_subcommand_mentions(&readme);
+            let variants = extract_clap_top_level_command_names(&cli_rs);
+            assert!(
+                !mentions.is_empty(),
+                "expected at least one `vl <cmd>` reference in README — \
+                 the scanner may have lost its anchors",
+            );
+            assert!(
+                !variants.is_empty(),
+                "expected at least one variant in `enum Command` — \
+                 the parser may have lost its anchor",
+            );
+
+            let invalid: Vec<&String> = mentions.difference(&variants).collect();
+            assert!(
+                invalid.is_empty(),
+                "README references vl subcommands that do not exist in the \
+                 CLI: {invalid:?}\n\nFix the typo, drop the mention, or add \
+                 the variant to `enum Command` in crates/vl/src/cli.rs.",
+            );
+        }
+    }
 }
