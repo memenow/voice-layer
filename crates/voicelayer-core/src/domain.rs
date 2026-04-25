@@ -1473,6 +1473,46 @@ mod tests {
         ]
     }
 
+    /// Materialise every `TriggerKind` variant. The exhaustiveness
+    /// closure pins the wire labels every schema embedding this enum
+    /// must list. The same set is duplicated inline under three
+    /// schemas (`StartDictationRequest`, `DictationCaptureRequest`,
+    /// `CaptureSession`) so each gets its own drift-guard test below.
+    fn enumerate_trigger_kind_variants() -> Vec<TriggerKind> {
+        let _exhaustive: fn(TriggerKind) -> &'static str = |variant| match variant {
+            TriggerKind::PushToTalk => "push_to_talk",
+            TriggerKind::Toggle => "toggle",
+            TriggerKind::Cli => "cli",
+            TriggerKind::Tui => "tui",
+            TriggerKind::TrayButton => "tray_button",
+        };
+        vec![
+            TriggerKind::PushToTalk,
+            TriggerKind::Toggle,
+            TriggerKind::Cli,
+            TriggerKind::Tui,
+            TriggerKind::TrayButton,
+        ]
+    }
+
+    /// Materialise every `InjectTarget` variant. The same set is
+    /// duplicated inline under `InjectRequest` and `InjectionPlan` so
+    /// each gets its own drift-guard test below.
+    fn enumerate_inject_target_variants() -> Vec<InjectTarget> {
+        let _exhaustive: fn(InjectTarget) -> &'static str = |variant| match variant {
+            InjectTarget::GuiAccessible => "gui_accessible",
+            InjectTarget::GuiClipboard => "gui_clipboard",
+            InjectTarget::TerminalBracketedPaste => "terminal_bracketed_paste",
+            InjectTarget::TerminalKittyRemote => "terminal_kitty_remote",
+        };
+        vec![
+            InjectTarget::GuiAccessible,
+            InjectTarget::GuiClipboard,
+            InjectTarget::TerminalBracketedPaste,
+            InjectTarget::TerminalKittyRemote,
+        ]
+    }
+
     #[test]
     fn openapi_worker_health_summary_documents_every_field() {
         assert_openapi_documents_every_field(
@@ -1689,6 +1729,59 @@ mod tests {
             "RewriteRequest",
             "style",
             &enumerate_rewrite_style_variants(),
+        );
+    }
+
+    // `TriggerKind` is duplicated inline under three schemas. Pin
+    // each occurrence so a drift in any one of them — e.g. someone
+    // forgets `tray_button` while rewriting one schema's enum — is
+    // caught instead of silently desynchronising the contract.
+
+    #[test]
+    fn openapi_start_dictation_request_trigger_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "StartDictationRequest",
+            "trigger",
+            &enumerate_trigger_kind_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_dictation_capture_request_trigger_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "DictationCaptureRequest",
+            "trigger",
+            &enumerate_trigger_kind_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_capture_session_trigger_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "CaptureSession",
+            "trigger",
+            &enumerate_trigger_kind_variants(),
+        );
+    }
+
+    // `InjectTarget` is duplicated inline under two schemas; same
+    // rationale.
+
+    #[test]
+    fn openapi_inject_request_target_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "InjectRequest",
+            "target",
+            &enumerate_inject_target_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_injection_plan_target_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "InjectionPlan",
+            "target",
+            &enumerate_inject_target_variants(),
         );
     }
 }
