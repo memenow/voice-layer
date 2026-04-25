@@ -528,6 +528,39 @@ mod tests {
         methods
     }
 
+    /// Walk a Markdown body of `docs/architecture/python-worker-protocol.md`
+    /// and pull the JSON-RPC method names listed under the
+    /// `## Required Methods` heading. Each entry is a bullet line of
+    /// shape `- \`<name>\``, where `<name>` is lowercase letters and
+    /// underscores only. The section terminates at the next heading
+    /// (`## ...`) so prose mentions of method names later in the doc
+    /// (e.g. under `## Current Behavior`) are not re-captured.
+    fn extract_protocol_doc_method_names(contents: &str) -> std::collections::BTreeSet<String> {
+        let mut methods = std::collections::BTreeSet::new();
+        let mut in_section = false;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("## ") {
+                in_section = trimmed == "## Required Methods";
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            let Some(rest) = trimmed.strip_prefix("- `") else {
+                continue;
+            };
+            let Some(end) = rest.find('`') else {
+                continue;
+            };
+            let name = &rest[..end];
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                methods.insert(name.to_owned());
+            }
+        }
+        methods
+    }
+
     /// Walk a Python source string and collect every method name the
     /// dispatch tree compares against. Two patterns are recognised:
     /// `method == "X"` (comparison form, used at six call sites in
@@ -617,6 +650,91 @@ if method in {\"compose\", \"rewrite\", \"translate\"}:\n\
         assert!(methods.contains("compose"));
         assert!(methods.contains("rewrite"));
         assert!(methods.contains("translate"));
+    }
+
+    #[test]
+    fn extract_protocol_doc_method_names_collects_only_required_methods_section() {
+        let md = "\
+# Worker Protocol
+
+## Transport
+
+prose about stdin/stdout
+
+## Required Methods
+
+- `health`
+- `compose`
+- `rewrite`
+
+## Current Behavior
+
+The `health` method also reports llm and asr probes.
+The `transcribe` method (mentioned only in prose here) is not in
+the bullet list above and must not be captured.
+";
+        let methods = extract_protocol_doc_method_names(md);
+        assert_eq!(
+            methods,
+            ["compose", "health", "rewrite"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "later prose mentions of `transcribe` must not leak into the set",
+        );
+    }
+
+    /// Cross-check the protocol doc's enumerated method list against
+    /// the Python worker's dispatch tree. By transitivity through
+    /// `every_rust_call_method_has_a_python_dispatch_arm_and_vice_versa`,
+    /// passing this test plus that one means the doc, the Rust
+    /// caller, and the Python implementation are all in agreement
+    /// about the set of supported JSON-RPC methods.
+    ///
+    /// The drift mode is documentation rot: a method gets added to
+    /// the worker but the doc bullet list still enumerates the old
+    /// set, or a method is renamed and the doc lags behind.
+    /// Operators reading the doc in isolation see a stale picture of
+    /// the protocol.
+    #[test]
+    fn every_protocol_doc_method_is_dispatched_in_python_worker() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let doc_source = std::fs::read_to_string(format!(
+            "{manifest}/../../docs/architecture/python-worker-protocol.md"
+        ))
+        .expect("read python-worker-protocol.md");
+        let python_source = std::fs::read_to_string(format!(
+            "{manifest}/../../python/voicelayer_orchestrator/worker.py"
+        ))
+        .expect("read python worker.py");
+
+        let doc_methods = extract_protocol_doc_method_names(&doc_source);
+        assert!(
+            !doc_methods.is_empty(),
+            "expected at least one method in `## Required Methods` — \
+             extract_protocol_doc_method_names may be misparsing or \
+             the heading may have moved",
+        );
+        let dispatched = collect_python_dispatched_methods(&python_source);
+
+        let missing: Vec<&String> = doc_methods.difference(&dispatched).collect();
+        assert!(
+            missing.is_empty(),
+            "protocol doc lists methods the Python worker does not dispatch: \
+             {missing:?}\n\nEither add the dispatch arm in \
+             python/voicelayer_orchestrator/worker.py or drop the entry from \
+             the `## Required Methods` bullet list in \
+             docs/architecture/python-worker-protocol.md.",
+        );
+
+        let undocumented: Vec<&String> = dispatched.difference(&doc_methods).collect();
+        assert!(
+            undocumented.is_empty(),
+            "Python worker dispatches methods not listed in the protocol doc: \
+             {undocumented:?}\n\nAdd a `- \\`<name>\\`` entry under \
+             `## Required Methods` in docs/architecture/python-worker-protocol.md \
+             so the doc reflects what the worker actually accepts.",
+        );
     }
 
     /// Cross-check every Rust JSON-RPC method literal against the
