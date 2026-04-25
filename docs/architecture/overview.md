@@ -12,16 +12,21 @@ The system must work across GUI applications and terminal/TUI surfaces without s
 ## Runtime Topology
 
 ```text
-+------------------+      JSON over UDS      +------------------+
-| CLI / TUI / UI   | <---------------------> | voicelayerd      |
-+------------------+                         +------------------+
-                                                     |
-                                                     | JSON-RPC over stdio
-                                                     v
-                                            +----------------------+
-                                            | Python orchestrator  |
-                                            +----------------------+
++--------+   +--------------+      JSON over UDS      +------------------+
+|  vl    |   |  vl-desktop  | <---------------------> | voicelayerd      |
+| (CLI)  |   | (iced GUI)   |                         +------------------+
++--------+   +--------------+                                  |
+                                                               | JSON-RPC over stdio
+                                                               v
+                                                      +----------------------+
+                                                      | Python orchestrator  |
+                                                      +----------------------+
 ```
+
+`vl` and `vl-desktop` share the same `/v1` socket, session store, and SSE event stream; only the
+operator-facing surface differs (terminal vs. iced window). `vl-desktop` additionally registers
+`voicelayer.dictation_toggle` through the XDG GlobalShortcuts portal so a system-wide hotkey can
+trigger the same start/stop calls the GUI buttons issue.
 
 ## Component Responsibilities
 
@@ -45,14 +50,19 @@ The first-class domain language is:
 
 - `CaptureSession`
 - `TranscriptChunk`
-- `CompositionJob`
+- `CompositionReceipt` (carries a `PreviewArtifact`)
 - `PreviewArtifact`
 - `InjectionPlan`
+- `InjectTarget`
 - `ProviderDescriptor`
-- `HotkeyBinding`
-- `LanguageProfile`
+- `LanguageProfile` / `LanguageStrategy`
+- `SegmentationMode` (one_shot / fixed / vad_gated)
+- `DictationFailureKind`
 
-These names should remain stable across Rust, Python, and OpenAPI surfaces.
+These names should remain stable across Rust, Python, and OpenAPI surfaces. Hotkey bindings
+are intentionally not part of the public domain language: portal-registered shortcuts (in
+`vl-desktop`) and CLI keybindings (in `vl`) are operator-facing handles, not contract-bearing
+types.
 
 ## Initial Transport Decisions
 
@@ -180,9 +190,18 @@ caught and downgraded to "transcribe the raw WAV" so no request is lost. See
 
 This scaffold deliberately defers:
 
-- GNOME portal hotkey binding beyond availability probing
-- AT-SPI writable target discovery
-- Terminal-specific adapters such as kitty remote control beyond the existing `kitten @` client
-- Desktop GUI entry point
+- AT-SPI writable target discovery (the `atspi_accessible_text` host adapter is registered in
+  the catalog but the injection adapter is not yet wired up).
+- Native kitty remote-control over its UNIX socket (the existing `kitten @ send-text` path
+  shipped via `--kitty-match` is the only kitty integration today).
+- Tray icon entry, in-window settings panel, and the embedded preview editor inside
+  `vl-desktop` — the iced shell currently exposes only daemon health, start/stop, and a
+  read-only transcript pane.
 
-The repository already defines the seams for those additions so the first implementation does not need to redesign the public interfaces.
+`vl-desktop`, GNOME portal hotkey binding (`vl-desktop` registers `voicelayer.dictation_toggle`
+through `org.freedesktop.portal.GlobalShortcuts`), and the systemd user units (one for the
+daemon, one optional unit for `whisper-server`) are no longer deferred; see
+`docs/guides/desktop.md` and `docs/guides/systemd.md`.
+
+The repository already defines the seams for the remaining additions so the first implementation
+does not need to redesign the public interfaces.
