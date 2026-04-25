@@ -1128,6 +1128,46 @@ mod tests {
         None
     }
 
+    /// Pull the python version floor out of `pyproject.toml`. The
+    /// field is shaped `requires-python = ">=X.Y"`; this helper
+    /// strips the `>=` (or bare `>`) prefix so callers compare the
+    /// raw `X.Y` token rather than the comparator-bearing string.
+    /// Returns `None` when the field is absent or carries no
+    /// recognised version literal.
+    fn extract_python_version_floor_from_pyproject(contents: &str) -> Option<String> {
+        let value = extract_toml_string_value(contents, "requires-python")?;
+        let trimmed = value.trim();
+        let stripped = trimmed
+            .strip_prefix(">=")
+            .or_else(|| trimmed.strip_prefix('>'))
+            .unwrap_or(trimmed);
+        let candidate = stripped.trim();
+        if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate.to_owned())
+        }
+    }
+
+    /// Pull the python version CI installs out of a `uv python
+    /// install <version>` shell line in a workflow yaml. The version
+    /// token is the first whitespace-delimited word after the install
+    /// command. Returns `None` when the file does not invoke
+    /// `uv python install` at all.
+    fn extract_uv_python_install_version(contents: &str) -> Option<String> {
+        let needle = "uv python install ";
+        for line in contents.lines() {
+            if let Some(idx) = line.find(needle) {
+                let after = &line[idx + needle.len()..];
+                let token: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -1513,6 +1553,59 @@ components:
     fn extract_yaml_string_value_returns_none_when_key_absent() {
         let yaml = "jobs:\n  verify:\n    runs-on: ubuntu-latest\n";
         assert!(extract_yaml_string_value(yaml, "toolchain").is_none());
+    }
+
+    #[test]
+    fn extract_python_version_floor_strips_comparator_prefix() {
+        let toml = concat!(
+            "[project]\n",
+            "name = \"voicelayer-orchestrator\"\n",
+            "requires-python = \">=3.12\"\n",
+        );
+        assert_eq!(
+            extract_python_version_floor_from_pyproject(toml).as_deref(),
+            Some("3.12"),
+        );
+    }
+
+    #[test]
+    fn extract_python_version_floor_handles_bare_greater_than_and_no_prefix() {
+        let with_gt = "requires-python = \">3.11\"\n";
+        assert_eq!(
+            extract_python_version_floor_from_pyproject(with_gt).as_deref(),
+            Some("3.11"),
+        );
+        let bare = "requires-python = \"3.10\"\n";
+        assert_eq!(
+            extract_python_version_floor_from_pyproject(bare).as_deref(),
+            Some("3.10"),
+        );
+    }
+
+    #[test]
+    fn extract_python_version_floor_returns_none_when_field_absent() {
+        let toml = "[project]\nname = \"foo\"\n";
+        assert!(extract_python_version_floor_from_pyproject(toml).is_none());
+    }
+
+    #[test]
+    fn extract_uv_python_install_version_reads_first_token_after_command() {
+        let yaml = concat!(
+            "      - name: Install Python\n",
+            "        run: uv python install 3.12\n",
+            "      - name: Sync deps\n",
+            "        run: uv sync --group dev\n",
+        );
+        assert_eq!(
+            extract_uv_python_install_version(yaml).as_deref(),
+            Some("3.12"),
+        );
+    }
+
+    #[test]
+    fn extract_uv_python_install_version_returns_none_when_command_absent() {
+        let yaml = "jobs:\n  verify:\n    steps:\n      - run: cargo build\n";
+        assert!(extract_uv_python_install_version(yaml).is_none());
     }
 
     /// Pins both directions of the soft-list override:
@@ -2302,6 +2395,39 @@ components:
             "rust-toolchain.toml `channel = \"{rustup_channel}\"` does not match \
              ci.yml `toolchain: \"{ci_toolchain}\"`. CI must run on the same toolchain \
              developers use locally.",
+        );
+    }
+
+    /// Mirror of `rust_toolchain_pin_is_consistent_across_repo_files`
+    /// for python: `pyproject.toml`'s `requires-python` floor must
+    /// match the version `ci.yml` installs via `uv python install`.
+    /// A bump that updates one without the other would let CI run on
+    /// a newer interpreter than the manifest claims to support — or
+    /// the inverse, where `pyproject.toml` widens the floor but CI
+    /// still runs on the older version.
+    #[test]
+    fn python_version_pin_is_consistent_across_pyproject_and_ci() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+
+        let pyproject = std::fs::read_to_string(format!("{repo_root}/pyproject.toml"))
+            .expect("read pyproject.toml");
+        let ci_yml = std::fs::read_to_string(format!("{repo_root}/.github/workflows/ci.yml"))
+            .expect("read .github/workflows/ci.yml");
+
+        let pyproject_floor = extract_python_version_floor_from_pyproject(&pyproject).expect(
+            "pyproject.toml must declare `requires-python = \">=...\"`; \
+                 extract_python_version_floor_from_pyproject may be misparsing",
+        );
+        let ci_install = extract_uv_python_install_version(&ci_yml).expect(
+            ".github/workflows/ci.yml must invoke `uv python install <version>`; \
+             extract_uv_python_install_version may be misparsing",
+        );
+
+        assert_eq!(
+            pyproject_floor, ci_install,
+            "python version drift: pyproject.toml `requires-python = \">={pyproject_floor}\"` \
+             but ci.yml runs `uv python install {ci_install}`. Update both together so the \
+             test matrix matches the manifest's declared floor.",
         );
     }
 }
