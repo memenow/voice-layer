@@ -1769,6 +1769,14 @@ mod tests {
         stitch_segment_transcripts,
     };
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Serialises any test that mutates process-wide env vars in this
+    /// module. Cargo runs unit tests concurrently and Rust 2024 made
+    /// `env::set_var` `unsafe` precisely because a concurrent reader
+    /// in another thread is UB. Take this lock for the duration of
+    /// every `XDG_RUNTIME_DIR` (or future env-var) mutation.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_segment(
         id: usize,
@@ -1793,6 +1801,69 @@ mod tests {
     fn default_paths_are_resolved() {
         assert!(!default_socket_path().as_os_str().is_empty());
         assert!(!default_project_root().as_os_str().is_empty());
+    }
+
+    /// Pins the XDG-driven branch of `default_socket_path`. The
+    /// systemd-managed install path goes through `XDG_RUNTIME_DIR`,
+    /// so a regression that always returned `temp_dir()` would land
+    /// the daemon socket in `/tmp/voicelayer/...` even on a properly
+    /// configured user session.
+    #[test]
+    fn default_socket_path_uses_xdg_runtime_dir_when_set() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/9001");
+        }
+        let path = default_socket_path();
+        assert_eq!(path, PathBuf::from("/run/user/9001/voicelayer/daemon.sock"),);
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_RUNTIME_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_RUNTIME_DIR");
+            },
+        }
+    }
+
+    /// Pins the fallback branch: with no `XDG_RUNTIME_DIR` configured
+    /// (e.g. a headless `cargo test` running outside a logind session),
+    /// the daemon must still resolve a socket path so the fallback
+    /// path lands under `env::temp_dir()`. A regression that returned
+    /// an empty `PathBuf` here would crash the daemon at bind time
+    /// with no actionable error.
+    #[test]
+    fn default_socket_path_falls_back_to_temp_dir_when_xdg_runtime_dir_unset() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let path = default_socket_path();
+        let expected_base = std::env::temp_dir();
+        assert!(
+            path.starts_with(&expected_base),
+            "fallback path must live under env::temp_dir() (`{}`); got `{}`",
+            expected_base.display(),
+            path.display(),
+        );
+        assert!(
+            path.ends_with("voicelayer/daemon.sock"),
+            "fallback path must keep the `voicelayer/daemon.sock` suffix; got `{}`",
+            path.display(),
+        );
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("XDG_RUNTIME_DIR", value);
+            }
+        }
     }
 
     #[test]
