@@ -1282,6 +1282,45 @@ mod tests {
         members
     }
 
+    /// Walk an `install.sh` shell script and pull out every basename
+    /// it copies into `${BIN_DIR}/`. Targets the canonical line
+    /// shape `install -m 0755 "..." "${BIN_DIR}/<name>"` (the form
+    /// `scripts/install.sh` uses today). The basename runs from
+    /// `${BIN_DIR}/` to the next `"`.
+    fn extract_install_sh_bin_targets(source: &str) -> std::collections::BTreeSet<String> {
+        let needle = "\"${BIN_DIR}/";
+        let mut targets = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            if let Some(idx) = line.find(needle) {
+                let after = &line[idx + needle.len()..];
+                if let Some(end) = after.find('"')
+                    && !after[..end].is_empty()
+                {
+                    targets.insert(after[..end].to_owned());
+                }
+            }
+        }
+        targets
+    }
+
+    /// Walk a systemd `.service` unit file and pull out the basename
+    /// of every `ExecStart=%h/.local/bin/<name>` line. systemd
+    /// expands `%h` to the user's home directory at runtime; the
+    /// basename is what install.sh must put on disk.
+    fn extract_systemd_execstart_basenames(source: &str) -> std::collections::BTreeSet<String> {
+        let prefix = "ExecStart=%h/.local/bin/";
+        let mut basenames = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let basename: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+                if !basename.is_empty() {
+                    basenames.insert(basename);
+                }
+            }
+        }
+        basenames
+    }
+
     /// Walk a Rust source string and pull out every shortcut id
     /// declared as `pub const SHORTCUT_<NAME>: &str = "<value>";`.
     /// Targets `vl-desktop::portal::SHORTCUT_TOGGLE` and any future
@@ -1882,6 +1921,36 @@ components:
         assert_eq!(members.len(), 4);
         assert!(members.contains("crates/voicelayer-core"));
         assert!(members.contains("crates/vl-desktop"));
+    }
+
+    #[test]
+    fn extract_install_sh_bin_targets_picks_up_quoted_basenames() {
+        let sh = concat!(
+            "BIN_DIR=\"${VOICELAYER_INSTALL_BIN_DIR:-${HOME}/.local/bin}\"\n",
+            "install -m 0755 \"${REPO_ROOT}/target/release/vl\" \"${BIN_DIR}/vl\"\n",
+            "install -m 0755 \"${REPO_ROOT}/scripts/wrapper.sh\" \\\n",
+            "  \"${BIN_DIR}/voicelayer-whisper-server-run.sh\"\n",
+        );
+        let targets = extract_install_sh_bin_targets(sh);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains("vl"));
+        assert!(targets.contains("voicelayer-whisper-server-run.sh"));
+    }
+
+    #[test]
+    fn extract_systemd_execstart_basenames_drops_arguments() {
+        // The full line is `ExecStart=%h/.local/bin/vl daemon run ...`
+        // — only `vl` is the binary basename. Pin that the parser
+        // stops at whitespace so trailing args do not leak.
+        let unit = concat!(
+            "[Service]\n",
+            "ExecStart=%h/.local/bin/vl daemon run --socket-path %t/x.sock\n",
+            "ExecStart=%h/.local/bin/voicelayer-whisper-server-run.sh\n",
+        );
+        let basenames = extract_systemd_execstart_basenames(unit);
+        assert_eq!(basenames.len(), 2);
+        assert!(basenames.contains("vl"));
+        assert!(basenames.contains("voicelayer-whisper-server-run.sh"));
     }
 
     #[test]
@@ -3084,6 +3153,56 @@ components:
                  `pub const SHORTCUT_*: &str = \"{id}\";` exists in \
                  crates/vl-desktop/src/portal.rs. Either drop the doc \
                  mention or add the Rust constant.",
+            );
+        }
+    }
+
+    /// Every `ExecStart=%h/.local/bin/<basename>` referenced by a
+    /// systemd unit must correspond to an `install -m 0755 "..."
+    /// "${BIN_DIR}/<basename>"` line in `scripts/install.sh`. A unit
+    /// that points at a binary the installer doesn't lay down would
+    /// fail at first `systemctl --user enable --now <unit>` with
+    /// "Executable file not found" — *after* the operator already
+    /// committed to the install. The reverse direction is
+    /// intentionally one-way: install.sh is allowed to lay down
+    /// extras (e.g. `vl-desktop`, the GUI shell) that no unit
+    /// supervises.
+    #[test]
+    fn systemd_execstart_binaries_are_all_installed_by_install_sh() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let install_sh = std::fs::read_to_string(format!("{repo_root}/scripts/install.sh"))
+            .expect("read scripts/install.sh");
+        let bin_targets = extract_install_sh_bin_targets(&install_sh);
+        assert!(
+            !bin_targets.is_empty(),
+            "scripts/install.sh must install at least one file to ${{BIN_DIR}}; \
+             extract_install_sh_bin_targets may be misparsing",
+        );
+
+        let unit_dir = std::path::PathBuf::from(format!("{repo_root}/systemd"));
+        let mut execstart_basenames = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&unit_dir).expect("read systemd directory") {
+            let entry = entry.expect("read entry");
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("service") {
+                continue;
+            }
+            let unit = std::fs::read_to_string(&path).expect("read service file");
+            execstart_basenames.extend(extract_systemd_execstart_basenames(&unit));
+        }
+        assert!(
+            !execstart_basenames.is_empty(),
+            "expected at least one systemd unit with `ExecStart=%h/.local/bin/...`; \
+             extract_systemd_execstart_basenames may be misparsing",
+        );
+
+        for basename in &execstart_basenames {
+            assert!(
+                bin_targets.contains(basename),
+                "systemd unit ExecStart references `%h/.local/bin/{basename}` but \
+                 scripts/install.sh does not install a file named `{basename}` to \
+                 BIN_DIR. Add the install line — `systemctl --user enable --now` \
+                 would otherwise fail post-install with `Executable file not found`.",
             );
         }
     }
