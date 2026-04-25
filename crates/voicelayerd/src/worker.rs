@@ -491,6 +491,181 @@ mod tests {
         );
     }
 
+    /// Walk a Rust source string and collect every method name passed
+    /// as the first quoted string after `.call(...)` or
+    /// `.call::<...>(...)`. Stops at the first column-zero
+    /// `#[cfg(test)]` line — the marker for a top-level test
+    /// module — so synthetic fixtures inside `worker::tests` do not
+    /// pollute the production set. Indented `#[cfg(test)]`
+    /// attributes that gate inline test-only items (e.g.
+    /// `with_timeout_override` on `WorkerCommand`) are *not* test
+    /// fixtures; they sit alongside production code and must be
+    /// included in the scan. The trailing-lowercase filter rejects
+    /// mixed-case or symbol-bearing tokens so a quoted error
+    /// message would not slip through.
+    fn collect_rust_call_methods(source: &str) -> std::collections::BTreeSet<String> {
+        let mut methods = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            if line == "#[cfg(test)]" {
+                break;
+            }
+            let Some(call_pos) = line.find(".call") else {
+                continue;
+            };
+            let after_call = &line[call_pos + ".call".len()..];
+            let Some(first_quote) = after_call.find('"') else {
+                continue;
+            };
+            let inside = &after_call[first_quote + 1..];
+            let Some(close) = inside.find('"') else {
+                continue;
+            };
+            let method = &inside[..close];
+            if !method.is_empty() && method.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                methods.insert(method.to_owned());
+            }
+        }
+        methods
+    }
+
+    /// Walk a Python source string and collect every method name the
+    /// dispatch tree compares against. Two patterns are recognised:
+    /// `method == "X"` (comparison form, used at six call sites in
+    /// the current worker) and `method in {"X", "Y", ...}` (set
+    /// form, used once for the compose/rewrite/translate group).
+    /// The trailing-lowercase filter rejects accidental matches.
+    fn collect_python_dispatched_methods(source: &str) -> std::collections::BTreeSet<String> {
+        let mut methods = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            if let Some(idx) = line.find("method == \"") {
+                let after = &line[idx + "method == \"".len()..];
+                if let Some(close) = after.find('"') {
+                    let token = &after[..close];
+                    if !token.is_empty()
+                        && token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    {
+                        methods.insert(token.to_owned());
+                    }
+                }
+            }
+            if let Some(idx) = line.find("method in {") {
+                let after = &line[idx + "method in {".len()..];
+                if let Some(close) = after.find('}') {
+                    let inner = &after[..close];
+                    let mut search = inner;
+                    while let Some(start) = search.find('"') {
+                        let after_quote = &search[start + 1..];
+                        let Some(end) = after_quote.find('"') else {
+                            break;
+                        };
+                        let token = &after_quote[..end];
+                        if !token.is_empty()
+                            && token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                        {
+                            methods.insert(token.to_owned());
+                        }
+                        search = &after_quote[end + 1..];
+                    }
+                }
+            }
+        }
+        methods
+    }
+
+    #[test]
+    fn collect_rust_call_methods_extracts_names_from_turbofish_and_plain_call() {
+        let source = "\
+            self.call::<(), _>(\"health\", None).await\n\
+            self.call(\"compose\", Some(request)).await\n\
+            self.call(\"transcribe\", Some(request)).await\n\
+        ";
+        let methods = collect_rust_call_methods(source);
+        assert_eq!(methods.len(), 3);
+        assert!(methods.contains("health"));
+        assert!(methods.contains("compose"));
+        assert!(methods.contains("transcribe"));
+    }
+
+    #[test]
+    fn collect_rust_call_methods_stops_at_first_cfg_test_line() {
+        let source = "\
+            self.call(\"real\", None)\n\
+            #[cfg(test)]\n\
+            mod tests {\n\
+                router.call(\"synthetic\", None)\n\
+            }\n\
+        ";
+        let methods = collect_rust_call_methods(source);
+        assert!(methods.contains("real"));
+        assert!(!methods.contains("synthetic"));
+    }
+
+    #[test]
+    fn collect_python_dispatched_methods_handles_equality_and_set_forms() {
+        let source = "\
+if method == \"health\":\n\
+    return health_response()\n\
+elif method == \"transcribe\":\n\
+    return transcribe_response()\n\
+if method in {\"compose\", \"rewrite\", \"translate\"}:\n\
+    return generate_response()\n\
+";
+        let methods = collect_python_dispatched_methods(source);
+        assert_eq!(methods.len(), 5);
+        assert!(methods.contains("health"));
+        assert!(methods.contains("transcribe"));
+        assert!(methods.contains("compose"));
+        assert!(methods.contains("rewrite"));
+        assert!(methods.contains("translate"));
+    }
+
+    /// Cross-check every Rust JSON-RPC method literal against the
+    /// Python worker's dispatch tree, in both directions. A regression
+    /// renaming the Rust constant or the Python dispatch arm would
+    /// surface as `-32601 Method not found` at runtime; this test
+    /// catches the drift before the code ships.
+    #[test]
+    fn every_rust_call_method_has_a_python_dispatch_arm_and_vice_versa() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let rust_source = std::fs::read_to_string(format!("{manifest}/src/worker.rs"))
+            .expect("read voicelayerd worker.rs");
+        let python_source = std::fs::read_to_string(format!(
+            "{manifest}/../../python/voicelayer_orchestrator/worker.py"
+        ))
+        .expect("read python worker.py");
+
+        let rust_methods = collect_rust_call_methods(&rust_source);
+        let python_methods = collect_python_dispatched_methods(&python_source);
+
+        assert!(
+            !rust_methods.is_empty(),
+            "expected at least one .call(\"...\") in worker.rs; \
+             collect_rust_call_methods may be misparsing",
+        );
+        assert!(
+            !python_methods.is_empty(),
+            "expected at least one method dispatch in worker.py; \
+             collect_python_dispatched_methods may be misparsing",
+        );
+
+        for method in &rust_methods {
+            assert!(
+                python_methods.contains(method),
+                "rust .call(\"{method}\") has no matching Python dispatch arm. \
+                 Add `if method == \"{method}\":` (or include `\"{method}\"` in \
+                 the existing set form) to python/voicelayer_orchestrator/worker.py.",
+            );
+        }
+        for method in &python_methods {
+            assert!(
+                rust_methods.contains(method),
+                "Python dispatches `{method}` but the Rust daemon never calls it. \
+                 Either add a `.call(\"{method}\", ...)` site in worker.rs or drop \
+                 the dispatch arm.",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn worker_command_can_call_health() {
         let project_root = std::env::current_dir().expect("current_dir should be available");
