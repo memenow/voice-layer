@@ -4087,39 +4087,90 @@ mod openapi_route_alignment_tests {
     //! route or a documented-but-unimplemented path was previously
     //! invisible to every existing guard.
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    /// Walk a source string and pull out every `"/v1/..."` path
-    /// passed as the first argument to `.route(...)`. Stops at the
+    /// Allowlist of HTTP method tokens we recognise on either side of
+    /// the contract. Keeps the parsers from mistaking other
+    /// four-space-indent keys (e.g. `summary:`, `responses:`,
+    /// `requestBody:`, `parameters:`) for methods just because they
+    /// happen to be at the same depth, and excludes axum builder
+    /// helpers like `with_state` that are never legitimate methods.
+    const HTTP_METHODS: &[&str] = &[
+        "get", "post", "put", "delete", "patch", "head", "options", "trace",
+    ];
+
+    /// Walk a source string and pull out every `(path, method)` pair
+    /// declared by `.route("PATH", METHOD(...))` calls. Stops at the
     /// first `#[cfg(test)]` line so synthetic fixtures and helper
     /// strings inside test modules do not pollute the production
     /// route set. Production routes in `voicelayerd::lib.rs` all
     /// land in `build_app_router` ahead of every test module.
-    fn collect_axum_routes(source: &str) -> BTreeSet<String> {
-        let mut routes = BTreeSet::new();
+    fn collect_axum_route_methods(source: &str) -> BTreeMap<String, BTreeSet<String>> {
+        let mut routes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for line in source.lines() {
             if line.trim() == "#[cfg(test)]" {
                 break;
             }
             let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix(".route(\"")
-                && let Some(end) = rest.find('"')
-            {
-                routes.insert(rest[..end].to_owned());
+            let Some(after_path_open) = trimmed.strip_prefix(".route(\"") else {
+                continue;
+            };
+            let Some(quote_end) = after_path_open.find('"') else {
+                continue;
+            };
+            let path = after_path_open[..quote_end].to_owned();
+            // After the closing `"` of the path, the next non-comma /
+            // non-space token is the method builder.
+            let tail = after_path_open[quote_end + 1..]
+                .trim_start_matches(',')
+                .trim_start();
+            let Some(open_paren) = tail.find('(') else {
+                continue;
+            };
+            let method = tail[..open_paren].trim().to_owned();
+            if !HTTP_METHODS.contains(&method.as_str()) {
+                // `.route(path, with_state(...))` and similar
+                // non-method builder calls would otherwise pollute
+                // the set. We only care about the eight HTTP verbs.
+                continue;
             }
+            routes.entry(path).or_default().insert(method);
         }
         routes
     }
 
-    /// Walk an openapi YAML and pull out every top-level path key
-    /// inside the `paths:` block. Path keys are at two-space indent
-    /// (under the `paths:` heading at column zero). The walker
-    /// tolerates trailing top-level keys (`components:`, etc.) by
-    /// closing the paths scope on any column-zero non-empty line
-    /// after the opening `paths:` heading.
-    fn collect_openapi_paths(contents: &str) -> BTreeSet<String> {
-        let mut paths = BTreeSet::new();
+    /// Pull a method token out of a four-space-indent line. Tolerates
+    /// both the block form (`    get:` followed by nested keys on
+    /// the next line) and the inline form (`    get: {}`,
+    /// `    get: someValue`); both end up with the method name in the
+    /// substring before the first `:`. Returns `None` when the line is
+    /// not at four-space indent, has no colon, or names a key that is
+    /// not on `HTTP_METHODS` (so `summary:`, `responses:`,
+    /// `requestBody:`, etc. are filtered out).
+    fn extract_method_at_method_indent(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("    ")?;
+        if rest.starts_with(' ') {
+            return None;
+        }
+        let colon_pos = rest.find(':')?;
+        let method = &rest[..colon_pos];
+        if HTTP_METHODS.contains(&method) {
+            Some(method)
+        } else {
+            None
+        }
+    }
+
+    /// Walk an openapi YAML and pull out every `(path, method)` pair.
+    /// Path keys are at two-space indent under the `paths:` block;
+    /// each method is a four-space-indent key under its parent path
+    /// whose name is one of the allowlisted HTTP verbs. Bigger keys
+    /// at the same indent (`summary:`, `responses:`, `requestBody:`)
+    /// are filtered out by the allowlist.
+    fn collect_openapi_path_methods(contents: &str) -> BTreeMap<String, BTreeSet<String>> {
+        let mut paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut in_paths = false;
+        let mut current_path: Option<String> = None;
         for line in contents.lines() {
             if line == "paths:" {
                 in_paths = true;
@@ -4130,6 +4181,7 @@ mod openapi_route_alignment_tests {
                 && line.chars().next().is_some_and(|c| !c.is_whitespace())
             {
                 in_paths = false;
+                current_path = None;
                 continue;
             }
             if !in_paths {
@@ -4140,14 +4192,25 @@ mod openapi_route_alignment_tests {
                 && !name.contains(' ')
                 && !name.is_empty()
             {
-                paths.insert(format!("/{name}"));
+                let path = format!("/{name}");
+                paths.entry(path.clone()).or_default();
+                current_path = Some(path);
+                continue;
+            }
+            if let Some(path) = &current_path
+                && let Some(method) = extract_method_at_method_indent(line)
+            {
+                paths
+                    .get_mut(path)
+                    .expect("current_path entry was inserted above")
+                    .insert(method.to_owned());
             }
         }
         paths
     }
 
     #[test]
-    fn collect_axum_routes_extracts_chained_route_calls() {
+    fn collect_axum_route_methods_extracts_each_method_token() {
         let source = "\
             Router::new()\n\
                 .route(\"/v1/health\", get(get_health))\n\
@@ -4155,19 +4218,39 @@ mod openapi_route_alignment_tests {
                 .route(\"/v1/sessions/dictation\", post(create_dictation_session))\n\
                 .with_state(state)\n\
         ";
-        let routes = collect_axum_routes(source);
+        let routes = collect_axum_route_methods(source);
         assert_eq!(routes.len(), 3);
-        assert!(routes.contains("/v1/health"));
-        assert!(routes.contains("/v1/sessions"));
-        assert!(routes.contains("/v1/sessions/dictation"));
+        assert!(routes.get("/v1/health").is_some_and(|m| m.contains("get")));
+        assert!(
+            routes
+                .get("/v1/sessions")
+                .is_some_and(|m| m.contains("get"))
+        );
+        assert!(
+            routes
+                .get("/v1/sessions/dictation")
+                .is_some_and(|m| m.contains("post"))
+        );
     }
 
     #[test]
-    fn collect_axum_routes_stops_at_first_cfg_test_line() {
-        // Pin the production-only scope: a `.route(...)` line inside
-        // a test module must not be picked up as a production route,
-        // otherwise the synthetic fixtures in this very file would
-        // make the integration test self-referential.
+    fn collect_axum_route_methods_ignores_non_method_builders() {
+        // `.with_state(state)` looks like `.method(...)` to a naive
+        // parser. The HTTP-method allowlist filters it out so a
+        // builder chain entry never lands as a synthetic route.
+        let source = "\
+            Router::new()\n\
+                .route(\"/v1/real\", get(real_handler))\n\
+                .with_state(state)\n\
+                .layer(some_layer())\n\
+        ";
+        let routes = collect_axum_route_methods(source);
+        assert_eq!(routes.len(), 1);
+        assert!(routes.get("/v1/real").is_some_and(|m| m.contains("get")));
+    }
+
+    #[test]
+    fn collect_axum_route_methods_stops_at_first_cfg_test_line() {
         let source = "\
             Router::new()\n\
                 .route(\"/v1/real\", get(handler))\n\
@@ -4176,20 +4259,16 @@ mod openapi_route_alignment_tests {
                 let _ = router.route(\"/v1/synthetic\", get(handler));\n\
             }\n\
         ";
-        let routes = collect_axum_routes(source);
-        assert!(routes.contains("/v1/real"));
+        let routes = collect_axum_route_methods(source);
+        assert!(routes.contains_key("/v1/real"));
         assert!(
-            !routes.contains("/v1/synthetic"),
+            !routes.contains_key("/v1/synthetic"),
             "test-block routes must be ignored; got {routes:?}",
         );
     }
 
     #[test]
-    fn collect_openapi_paths_extracts_top_level_path_keys() {
-        // Indents matter, so use literal newlines between lines and
-        // rely on the opening `\<newline>` to eat only the first
-        // source newline. Each subsequent source line preserves its
-        // leading whitespace, mirroring real openapi/voicelayerd.v1.yaml.
+    fn collect_openapi_path_methods_extracts_methods_under_each_path() {
         let yaml = concat!(
             "openapi: 3.1.0\n",
             "info:\n",
@@ -4198,26 +4277,51 @@ mod openapi_route_alignment_tests {
             "  /v1/health:\n",
             "    get:\n",
             "      operationId: getHealth\n",
-            "  /v1/sessions:\n",
-            "    get:\n",
-            "      operationId: listSessions\n",
+            "  /v1/sessions/dictation:\n",
+            "    post:\n",
+            "      operationId: startLiveDictationSession\n",
+            "      requestBody:\n",
+            "        required: true\n",
             "components:\n",
             "  schemas:\n",
             "    HealthResponse:\n",
             "      type: object\n",
         );
-        let paths = collect_openapi_paths(yaml);
+        let paths = collect_openapi_path_methods(yaml);
         assert_eq!(paths.len(), 2);
-        assert!(paths.contains("/v1/health"));
-        assert!(paths.contains("/v1/sessions"));
+        assert!(paths.get("/v1/health").is_some_and(|m| m.contains("get")));
+        assert!(
+            paths
+                .get("/v1/sessions/dictation")
+                .is_some_and(|m| m.contains("post"))
+        );
     }
 
     #[test]
-    fn collect_openapi_paths_ignores_indented_keys_outside_paths_block() {
-        // A `/v1/something:`-shaped string at deeper indent (e.g.
-        // inside a description literal block) must not be mistaken
-        // for a top-level path. Pin the scoping so nested content
-        // cannot accidentally pollute the path set.
+    fn collect_openapi_path_methods_ignores_non_method_keys_at_method_indent() {
+        // `summary:`, `description:`, `responses:`, `requestBody:`,
+        // `parameters:` all live at four-space indent under a path
+        // entry. Only the eight HTTP verbs are real method keys; the
+        // allowlist must filter the rest out.
+        let yaml = concat!(
+            "paths:\n",
+            "  /v1/foo:\n",
+            "    summary: not a method\n",
+            "    description: also not a method\n",
+            "    get:\n",
+            "      operationId: getFoo\n",
+            "    requestBody:\n",
+            "      content: {}\n",
+            "components: {}\n",
+        );
+        let paths = collect_openapi_path_methods(yaml);
+        let methods = paths.get("/v1/foo").expect("/v1/foo declared");
+        assert_eq!(methods.len(), 1);
+        assert!(methods.contains("get"));
+    }
+
+    #[test]
+    fn collect_openapi_path_methods_ignores_indented_keys_outside_paths_block() {
         let yaml = concat!(
             "paths:\n",
             "  /v1/real:\n",
@@ -4228,13 +4332,14 @@ mod openapi_route_alignment_tests {
             "      description: |\n",
             "        See /v1/not-a-path: discussed in the changelog.\n",
         );
-        let paths = collect_openapi_paths(yaml);
+        let paths = collect_openapi_path_methods(yaml);
         assert_eq!(paths.len(), 1);
-        assert!(paths.contains("/v1/real"));
+        let methods = paths.get("/v1/real").expect("real path");
+        assert!(methods.contains("get"));
     }
 
     #[test]
-    fn every_axum_route_has_an_openapi_path_entry_and_vice_versa() {
+    fn every_axum_route_method_matches_an_openapi_method_and_vice_versa() {
         let source_path = format!("{}/src/lib.rs", env!("CARGO_MANIFEST_DIR"));
         let openapi_path = format!(
             "{}/../../openapi/voicelayerd.v1.yaml",
@@ -4244,33 +4349,43 @@ mod openapi_route_alignment_tests {
         let source = std::fs::read_to_string(&source_path).expect("read voicelayerd lib.rs");
         let openapi = std::fs::read_to_string(&openapi_path).expect("read openapi contract");
 
-        let routes = collect_axum_routes(&source);
-        let paths = collect_openapi_paths(&openapi);
+        let routes = collect_axum_route_methods(&source);
+        let paths = collect_openapi_path_methods(&openapi);
 
         assert!(
             !routes.is_empty(),
             "expected at least one axum route in build_app_router; \
-             collect_axum_routes may be misparsing",
+             collect_axum_route_methods may be misparsing",
         );
         assert!(
             !paths.is_empty(),
             "expected at least one path in openapi/voicelayerd.v1.yaml; \
-             collect_openapi_paths may be misparsing",
+             collect_openapi_path_methods may be misparsing",
         );
 
-        for route in &routes {
-            assert!(
-                paths.contains(route),
-                "axum route `{route}` is missing from openapi `paths:`. \
-                 Either add the path entry or drop the route.",
-            );
+        for (path, methods) in &routes {
+            let yaml_methods = paths
+                .get(path)
+                .unwrap_or_else(|| panic!("axum route `{path}` is missing from openapi `paths:`"));
+            for method in methods {
+                assert!(
+                    yaml_methods.contains(method),
+                    "axum route `{method} {path}` has no matching openapi method declaration. \
+                     Add `{method}:` under `paths.{path}` (or drop the route).",
+                );
+            }
         }
-        for path in &paths {
-            assert!(
-                routes.contains(path),
-                "openapi path `{path}` has no matching `.route(...)` call in \
-                 build_app_router. Either add the route or drop the path entry.",
-            );
+        for (path, methods) in &paths {
+            let axum_methods = routes
+                .get(path)
+                .unwrap_or_else(|| panic!("openapi path `{path}` has no matching axum route"));
+            for method in methods {
+                assert!(
+                    axum_methods.contains(method),
+                    "openapi `{method} {path}` has no matching `.route(...)` call. \
+                     Add `.route(\"{path}\", {method}(handler))` (or drop the openapi entry).",
+                );
+            }
         }
     }
 }
