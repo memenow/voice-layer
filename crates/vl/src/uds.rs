@@ -126,11 +126,19 @@ pub(crate) fn cli_socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonOutcome, try_daemon_post};
+    use super::{DaemonOutcome, cli_socket_path, try_daemon_post};
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
+    use voicelayerd::default_socket_path;
+
+    /// Serialises any test that mutates `VOICELAYER_SOCKET_PATH`.
+    /// Cargo runs unit tests concurrently and Rust 2024 made
+    /// `env::set_var` `unsafe` precisely because a concurrent reader
+    /// in another thread is UB.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Minimal HTTP/1.1 responder on a UDS path. Reads the client's
     /// request bytes (discarded — the test doesn't care what hyper
@@ -242,5 +250,55 @@ mod tests {
             "non-HTTP response must produce Rejected so the CLI warns the operator",
         );
         let _ = server.await;
+    }
+
+    /// Pins the env-set branch of `cli_socket_path`. The CLI honours
+    /// `VOICELAYER_SOCKET_PATH` so contributors can point `vl` at a
+    /// non-default socket without rebuilding; a regression that
+    /// always returned `default_socket_path()` would silently ignore
+    /// the override and the operator would have no obvious failure
+    /// to diagnose.
+    #[test]
+    fn cli_socket_path_uses_voicelayer_socket_path_when_set() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("VOICELAYER_SOCKET_PATH");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::set_var("VOICELAYER_SOCKET_PATH", "/run/test-vl/daemon.sock");
+        }
+        let path = cli_socket_path();
+        assert_eq!(path, PathBuf::from("/run/test-vl/daemon.sock"));
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("VOICELAYER_SOCKET_PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("VOICELAYER_SOCKET_PATH");
+            },
+        }
+    }
+
+    /// Pins the unset branch: with no override, `cli_socket_path`
+    /// must delegate to `default_socket_path()`. The exact path is
+    /// XDG-driven (already pinned in voicelayerd #38), so this
+    /// asserts equality with the live default rather than a literal.
+    #[test]
+    fn cli_socket_path_falls_back_to_default_socket_path_when_env_unset() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("VOICELAYER_SOCKET_PATH");
+        // SAFETY: ENV_LOCK serialises every mutation of this variable.
+        unsafe {
+            std::env::remove_var("VOICELAYER_SOCKET_PATH");
+        }
+        assert_eq!(cli_socket_path(), default_socket_path());
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("VOICELAYER_SOCKET_PATH", value);
+            }
+        }
     }
 }
