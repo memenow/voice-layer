@@ -171,6 +171,18 @@ cargo run -p vl -- dictation start \
 cargo run -p vl -- dictation stop <session-id-from-start>
 ```
 
+Smoke / benchmark loop: pass `--duration-seconds N` to record-and-stop in
+one command. The CLI sleeps `N` seconds after the daemon confirms the
+session is listening, issues stop, and prints the final
+`DictationCaptureResult` (with the stitched transcript) instead of the
+listening session.
+
+```bash
+cargo run -p vl -- dictation start \
+  --mode vad-gated --probe-secs 2 --max-segment-secs 30 \
+  --duration-seconds 12 --language auto
+```
+
 While a VAD-gated session is live the daemon streams these per-probe / per-unit events on
 `GET /v1/events/stream` alongside the existing lifecycle events:
 
