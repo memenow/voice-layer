@@ -203,6 +203,9 @@ mod tests {
         assert!(state.detected_language.is_none());
         assert!(state.last_notes.is_empty());
         assert!(state.error.is_none());
+        // The embedded `HotkeyStatus` is exercised in detail by
+        // `hotkey_status_default_marks_portal_unprobed`; here we only
+        // confirm the default propagates by checking the boolean side.
         assert!(
             !state.hotkey.portal_available,
             "the embedded HotkeyStatus must default to unprobed",
