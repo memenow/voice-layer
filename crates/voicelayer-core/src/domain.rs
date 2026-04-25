@@ -3888,4 +3888,52 @@ serde.workspace = true
             violations.join("\n  - "),
         );
     }
+
+    /// MSRV must be declared identically in three files: the
+    /// workspace `Cargo.toml` (`rust-version`), `rust-toolchain.toml`
+    /// (`channel`), and `.github/workflows/ci.yml` (the
+    /// `dtolnay/rust-toolchain@master` step's `toolchain:` input).
+    /// The comment in `rust-toolchain.toml` already names this
+    /// triangle but does not enforce it; this test does.
+    ///
+    /// A bump to one without the others is the failure mode: a local
+    /// `cargo` invocation succeeds with the toolchain-file pin while
+    /// CI silently continues to verify against the older `rust-version`
+    /// in `Cargo.toml`, masking a feature that requires the newer
+    /// floor (e.g. iced 0.14 / ashpd 0.13 needing >= 1.88).
+    #[test]
+    fn msrv_is_pinned_consistently_across_cargo_rust_toolchain_and_ci() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let cargo_toml = std::fs::read_to_string(repo_root.join("Cargo.toml"))
+            .expect("read workspace Cargo.toml");
+        let toolchain_toml = std::fs::read_to_string(repo_root.join("rust-toolchain.toml"))
+            .expect("read rust-toolchain.toml");
+        let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml"))
+            .expect("read .github/workflows/ci.yml");
+
+        let cargo_msrv = extract_toml_string_value(&cargo_toml, "rust-version")
+            .expect("Cargo.toml workspace.package.rust-version not found — field may have moved");
+        let toolchain_channel = extract_toml_string_value(&toolchain_toml, "channel")
+            .expect("rust-toolchain.toml channel not found — field may have moved");
+        let ci_toolchain = extract_yaml_string_value(&ci_yaml, "toolchain").expect(
+            "ci.yml step input `toolchain:` not found — workflow may have moved off \
+             dtolnay/rust-toolchain@master",
+        );
+
+        assert_eq!(
+            cargo_msrv, toolchain_channel,
+            "MSRV drift: Cargo.toml workspace.package.rust-version is `{cargo_msrv}` \
+             but rust-toolchain.toml channel is `{toolchain_channel}`. \
+             Bump both together — keeping them in sync is what the comment \
+             in rust-toolchain.toml asks for.",
+        );
+        assert_eq!(
+            cargo_msrv, ci_toolchain,
+            "MSRV drift: Cargo.toml workspace.package.rust-version is `{cargo_msrv}` \
+             but .github/workflows/ci.yml `toolchain:` pin is `{ci_toolchain}`. \
+             Bump the CI pin so the verify job builds against the same floor \
+             contributors hit locally.",
+        );
+    }
 }
