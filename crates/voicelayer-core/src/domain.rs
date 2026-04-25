@@ -2831,4 +2831,54 @@ components:
             );
         }
     }
+
+    /// Pin the SPDX `license` identifier in `Cargo.toml` against the
+    /// actual content of `LICENSE`. The most plausible drift is a
+    /// SPDX bump (e.g. `Apache-2.0` → `MIT`) that forgets to swap
+    /// the file — `cargo publish` would reject the package against
+    /// crates.io's policy, but only at release time. The repo is
+    /// internal-first, so no `cargo publish` runs in CI; without
+    /// this guard the discrepancy would only surface during the
+    /// first publish attempt long after the change shipped.
+    ///
+    /// Today we ship Apache-2.0; the check looks for the canonical
+    /// `Apache License` + `Version 2.0` header lines. Adding a
+    /// future SPDX-to-signature row here is the right place to
+    /// extend coverage when the licence changes.
+    #[test]
+    fn cargo_license_spdx_matches_license_file_signature() {
+        let repo_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml = std::fs::read_to_string(format!("{repo_root}/Cargo.toml"))
+            .expect("read root Cargo.toml");
+        let license_file =
+            std::fs::read_to_string(format!("{repo_root}/LICENSE")).expect("read LICENSE file");
+
+        let spdx = extract_toml_string_value(&cargo_toml, "license").expect(
+            "Cargo.toml must declare `license = \"...\"`; \
+             extract_toml_string_value may be misparsing",
+        );
+
+        match spdx.as_str() {
+            "Apache-2.0" => {
+                assert!(
+                    license_file.contains("Apache License"),
+                    "Cargo.toml claims `Apache-2.0` but LICENSE file is missing \
+                     the canonical `Apache License` header. Either fix the SPDX \
+                     identifier or restore the correct LICENSE.",
+                );
+                assert!(
+                    license_file.contains("Version 2.0"),
+                    "Cargo.toml claims `Apache-2.0` but LICENSE file is missing \
+                     the `Version 2.0` line. Confirm the file is the right \
+                     Apache release.",
+                );
+            }
+            other => panic!(
+                "Cargo.toml `license = \"{other}\"` is not covered by this drift \
+                 guard. Add a match arm here pinning the SPDX identifier to a \
+                 signature line in LICENSE — silently letting the SPDX float free \
+                 of the file would defeat the point of the check.",
+            ),
+        }
+    }
 }
