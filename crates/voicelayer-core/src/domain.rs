@@ -773,6 +773,68 @@ mod tests {
         values
     }
 
+    /// Parse a property-scoped string enum out of an isolated schema
+    /// section. Targets a single property at eight-space indent
+    /// (`        <property_name>:`) and recovers either the inline form
+    /// (`          enum: [a, b]`) or the block form (`          enum:`
+    /// followed by `            - value` lines), in source order.
+    ///
+    /// Block form may include `- null` to model a nullable field; the
+    /// parser returns `null` verbatim and leaves filtering to the
+    /// caller — the rust side models nullability via `Option<_>`, not a
+    /// separate variant, so the caller must drop `null` before
+    /// cross-checking against rust variants.
+    ///
+    /// Returns an empty vec when the property has no enum (or the
+    /// property itself is not present).
+    fn parse_property_string_enum(section: &str, property_name: &str) -> Vec<String> {
+        let property_heading = format!("        {property_name}:");
+        let mut in_property = false;
+        let mut in_block = false;
+        let mut block: Vec<String> = Vec::new();
+
+        for line in section.lines() {
+            if !in_property {
+                if line == property_heading {
+                    in_property = true;
+                }
+                continue;
+            }
+            // Sibling property at the same eight-space indent ends the
+            // property scope. Lines with deeper indent (10/12 spaces)
+            // and blank lines stay within the body.
+            if line.starts_with("        ")
+                && !line.starts_with("         ")
+                && !line.trim().is_empty()
+            {
+                break;
+            }
+            // Inline form wins as soon as we see it; matches the
+            // resolution order the existing top-level scanner uses.
+            if let Some(rest) = line.strip_prefix("          enum: [")
+                && let Some(end) = rest.find(']')
+            {
+                return rest[..end]
+                    .split(',')
+                    .map(|entry| entry.trim().to_owned())
+                    .filter(|entry| !entry.is_empty())
+                    .collect();
+            }
+            if line == "          enum:" {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if let Some(name) = line.strip_prefix("            - ") {
+                    block.push(name.trim().to_owned());
+                } else {
+                    in_block = false;
+                }
+            }
+        }
+        block
+    }
+
     /// Cross-check every variant of a Rust string enum against an
     /// openapi top-level enum schema. Each variant must serialize to a
     /// JSON string that appears in the openapi list, and every openapi
@@ -896,6 +958,75 @@ mod tests {
                 rust_values.iter().any(|value| value == openapi_value),
                 "openapi {schema_name} oneOf has `{discriminator}: {openapi_value}` but the \
                  rust enum has no matching variant. Either add the variant or drop the branch.",
+            );
+        }
+    }
+
+    /// Cross-check every variant of a Rust string enum against the
+    /// openapi enum list embedded inside a single property of a
+    /// composite schema (e.g. `RewriteRequest.style`,
+    /// `DictationCaptureResult.failure_kind`). The rust side is
+    /// modeled as a separate enum but the openapi side inlines the
+    /// enum under one property — drift would be invisible to the
+    /// struct-shape and top-level enum guards.
+    ///
+    /// `null` entries in the openapi list are filtered before the
+    /// cross-check: rust models nullability with `Option<_>`, not a
+    /// separate variant, so the caller's enumerator never produces
+    /// `null` and the openapi list legitimately includes it for
+    /// nullable fields.
+    fn assert_openapi_documents_every_property_enum_variant<T: serde::Serialize>(
+        schema_name: &str,
+        property_name: &str,
+        rust_variants: &[T],
+    ) {
+        let openapi_path = format!(
+            "{}/../../openapi/voicelayerd.v1.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let contents =
+            std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
+        let section = isolate_schema_section(&contents, schema_name);
+        assert!(
+            !section.is_empty(),
+            "schema component {schema_name} not found in openapi file",
+        );
+
+        let openapi_values: Vec<String> = parse_property_string_enum(&section, property_name)
+            .into_iter()
+            .filter(|value| value != "null")
+            .collect();
+        assert!(
+            !openapi_values.is_empty(),
+            "openapi {schema_name}.{property_name} has no string enum values \
+             (after filtering `null`); use a different drift guard if the field is not enum-typed",
+        );
+
+        let rust_serialized: Vec<String> = rust_variants
+            .iter()
+            .map(|variant| match serde_json::to_value(variant) {
+                Ok(serde_json::Value::String(s)) => s,
+                Ok(other) => panic!(
+                    "{schema_name}.{property_name} variant must serialize to a JSON string; \
+                     got {other:?}",
+                ),
+                Err(err) => panic!("{schema_name}.{property_name} variant must serialize: {err}"),
+            })
+            .collect();
+
+        for serialized in &rust_serialized {
+            assert!(
+                openapi_values.iter().any(|value| value == serialized),
+                "openapi {schema_name}.{property_name} enum is missing `{serialized}` \
+                 (rust enum has it). Update openapi/voicelayerd.v1.yaml.",
+            );
+        }
+        for openapi_value in &openapi_values {
+            assert!(
+                rust_serialized.iter().any(|value| value == openapi_value),
+                "openapi {schema_name}.{property_name} enum lists `{openapi_value}` but the \
+                 rust enum has no matching variant. Either add the variant or drop it from \
+                 the openapi list.",
             );
         }
     }
@@ -1091,6 +1222,75 @@ mod tests {
         assert!(parse_oneof_discriminator_values(section).is_empty());
     }
 
+    #[test]
+    fn parse_property_string_enum_handles_inline_form() {
+        let section = "\
+    Foo:
+      properties:
+        style:
+          type: string
+          enum: [a, b, c]
+        other:
+          type: string
+";
+        let values = parse_property_string_enum(section, "style");
+        assert_eq!(values, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_property_string_enum_handles_block_form_with_null() {
+        // Block form including the openapi-style nullable marker. The
+        // parser keeps `null` verbatim; the assert helper filters it
+        // before cross-checking against the rust variants. A trailing
+        // sibling property at eight-space indent must end the scan
+        // without falling into its body.
+        let section = "\
+    Foo:
+      properties:
+        kind:
+          type:
+            - string
+            - \"null\"
+          enum:
+            - first
+            - second
+            - null
+        other:
+          type: string
+";
+        let values = parse_property_string_enum(section, "kind");
+        assert_eq!(values, vec!["first", "second", "null"]);
+    }
+
+    #[test]
+    fn parse_property_string_enum_returns_empty_for_unknown_property() {
+        let section = "\
+    Foo:
+      properties:
+        style:
+          type: string
+          enum: [a]
+";
+        assert!(parse_property_string_enum(section, "kind").is_empty());
+    }
+
+    #[test]
+    fn parse_property_string_enum_returns_empty_when_property_has_no_enum() {
+        // Catches the regression where a property exists but only
+        // declares `type:` — the helper must report an empty enum
+        // (not silently pick up enum lines from an adjacent property).
+        let section = "\
+    Foo:
+      properties:
+        style:
+          type: string
+        kind:
+          type: string
+          enum: [a, b]
+";
+        assert!(parse_property_string_enum(section, "style").is_empty());
+    }
+
     /// Pins both directions of the soft-list override:
     /// 1. With `flag` listed in `serde_default_fields`, the cross-check
     ///    returns `Ok(())` even though `flag` is non-null and missing
@@ -1233,6 +1433,43 @@ mod tests {
                 max_segment_secs: 0,
                 silence_gap_probes: 0,
             },
+        ]
+    }
+
+    /// Materialise every `DictationFailureKind` variant. The
+    /// exhaustiveness closure pins the wire labels alongside the
+    /// openapi `failure_kind` enum entries; `null` is the absence of a
+    /// variant and is contributed by `Option<_>`, not the enum itself.
+    fn enumerate_dictation_failure_kind_variants() -> Vec<DictationFailureKind> {
+        let _exhaustive: fn(DictationFailureKind) -> &'static str = |variant| match variant {
+            DictationFailureKind::RecordingFailed => "recording_failed",
+            DictationFailureKind::AsrFailed => "asr_failed",
+            DictationFailureKind::InjectionFailed => "injection_failed",
+        };
+        vec![
+            DictationFailureKind::RecordingFailed,
+            DictationFailureKind::AsrFailed,
+            DictationFailureKind::InjectionFailed,
+        ]
+    }
+
+    /// Materialise every `RewriteStyle` variant. Same exhaustiveness
+    /// pattern as the other enumerators — adding a future style fails
+    /// compile until both this list and the openapi schema are updated.
+    fn enumerate_rewrite_style_variants() -> Vec<RewriteStyle> {
+        let _exhaustive: fn(RewriteStyle) -> &'static str = |variant| match variant {
+            RewriteStyle::MoreFormal => "more_formal",
+            RewriteStyle::Shorter => "shorter",
+            RewriteStyle::Politer => "politer",
+            RewriteStyle::MoreTechnical => "more_technical",
+            RewriteStyle::Translate => "translate",
+        };
+        vec![
+            RewriteStyle::MoreFormal,
+            RewriteStyle::Shorter,
+            RewriteStyle::Politer,
+            RewriteStyle::MoreTechnical,
+            RewriteStyle::Translate,
         ]
     }
 
@@ -1428,6 +1665,30 @@ mod tests {
             "SegmentationMode",
             "mode",
             &enumerate_segmentation_mode_variants(),
+        );
+    }
+
+    // Property-scoped enum drift guards. Pin enums that live inside
+    // a parent schema's `properties` block instead of as a top-level
+    // component. The struct-shape and top-level-enum guards above do
+    // not cover this case, so a forgotten `failure_kind` variant
+    // (rust adds, openapi doesn't, or vice versa) would slip through.
+
+    #[test]
+    fn openapi_dictation_capture_result_failure_kind_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "DictationCaptureResult",
+            "failure_kind",
+            &enumerate_dictation_failure_kind_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_rewrite_request_style_documents_every_variant() {
+        assert_openapi_documents_every_property_enum_variant(
+            "RewriteRequest",
+            "style",
+            &enumerate_rewrite_style_variants(),
         );
     }
 }
