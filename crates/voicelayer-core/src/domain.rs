@@ -1581,6 +1581,134 @@ mod tests {
         Some((name.to_owned(), kind))
     }
 
+    /// Pull every package name declared under
+    /// `[project.optional-dependencies].<group>` in pyproject. Handles
+    /// the canonical multi-line array form (`<group> = [` opens, each
+    /// `"<spec>"` row contributes one entry, `]` on its own line
+    /// closes) and single-line arrays. The version specifier (`>=`,
+    /// `<=`, `==`, `~=`, `!=`, etc.) is stripped from each entry so
+    /// callers compare bare PyPI package names.
+    ///
+    /// Returns an empty set if the group is absent — that is a valid
+    /// pyproject (the group has not been declared) and is the same
+    /// shape as a group declared with no entries.
+    fn extract_pyproject_optional_deps(
+        contents: &str,
+        group: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut in_section = false;
+        let mut in_array = false;
+        let array_open = format!("{group} = [");
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_section = trimmed.starts_with("[project.optional-dependencies]");
+                in_array = false;
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            if !in_array {
+                if let Some(rest) = trimmed.strip_prefix(&array_open) {
+                    in_array = true;
+                    extract_pep508_names_from_inline(rest, &mut names);
+                    if rest.contains(']') {
+                        in_array = false;
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with(']') {
+                in_array = false;
+                continue;
+            }
+            extract_pep508_names_from_inline(trimmed, &mut names);
+        }
+        names
+    }
+
+    /// Pull every quoted PEP 508 entry on a single line, strip the
+    /// version specifier, and insert the bare name into `out`. Used
+    /// by `extract_pyproject_optional_deps` for both single-line
+    /// arrays and one-entry-per-line continuation rows.
+    fn extract_pep508_names_from_inline(line: &str, out: &mut std::collections::BTreeSet<String>) {
+        let mut search = line;
+        while let Some(idx) = search.find('"') {
+            let after = &search[idx + 1..];
+            let Some(close) = after.find('"') else {
+                break;
+            };
+            let spec = &after[..close];
+            search = &after[close + 1..];
+            let stop = ['<', '>', '=', '!', '~', '[', '(', ' ', ';'];
+            let end = spec.find(stop).unwrap_or(spec.len());
+            let name = spec[..end].trim();
+            if !name.is_empty() {
+                out.insert(name.to_owned());
+            }
+        }
+    }
+
+    /// Walk every `.py` file under `start` recursively and collect the
+    /// root package name of each `import X` and `from X import Y`
+    /// statement. The root is the leftmost dotted segment, so
+    /// `from foo.bar import baz` contributes `foo`. `import a, b`
+    /// (comma-separated form) contributes both `a` and `b`. Aliases
+    /// (`import numpy as np`) are stripped down to the package name.
+    ///
+    /// Comment-only lines are skipped; inline trailing comments are
+    /// trimmed before parsing (so `import numpy  # noqa` parses
+    /// cleanly). Indented imports inside function bodies, try/except
+    /// blocks, or class definitions are still captured — what matters
+    /// is that the package is referenced anywhere the interpreter
+    /// could execute.
+    fn collect_python_imports_under(
+        start: &std::path::Path,
+        names: &mut std::collections::BTreeSet<String>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(start)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect_python_imports_under(&path, names)?;
+            } else if path.extension().and_then(|s| s.to_str()) == Some("py") {
+                let contents = std::fs::read_to_string(&path)?;
+                gather_python_imports_from_source(&contents, names);
+            }
+        }
+        Ok(())
+    }
+
+    fn gather_python_imports_from_source(
+        source: &str,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let no_comment = trimmed.split('#').next().unwrap_or(trimmed).trim_end();
+            if let Some(rest) = no_comment.strip_prefix("import ") {
+                for part in rest.split(',') {
+                    let pkg = part.split_whitespace().next().unwrap_or("");
+                    let root = pkg.split('.').next().unwrap_or(pkg);
+                    if !root.is_empty() {
+                        out.insert(root.to_owned());
+                    }
+                }
+            } else if let Some(rest) = no_comment.strip_prefix("from ") {
+                let pkg = rest.split_whitespace().next().unwrap_or("");
+                let root = pkg.split('.').next().unwrap_or(pkg);
+                if !root.is_empty() {
+                    out.insert(root.to_owned());
+                }
+            }
+        }
+    }
+
     /// Walk a Markdown doc string and pull out every backtick-quoted
     /// `voicelayer.<word>` literal. Excludes `dictation.*` SSE event
     /// names (different prefix) and any other non-shortcut content.
@@ -3886,6 +4014,156 @@ serde.workspace = true
              set, etc.), drop the dep from `[workspace.dependencies]` \
              so the centralised pin no longer claims to govern it.",
             violations.join("\n  - "),
+        );
+    }
+
+    #[test]
+    fn extract_pyproject_optional_deps_handles_multiline_array_form() {
+        let pyproject = "\
+[project]
+name = \"foo\"
+
+[project.optional-dependencies]
+vad = [
+    \"numpy>=2.0\",
+    \"onnxruntime>=1.18\",
+]
+";
+        let names = extract_pyproject_optional_deps(pyproject, "vad");
+        assert_eq!(
+            names,
+            ["numpy", "onnxruntime"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_pyproject_optional_deps_strips_pep508_specifiers_and_extras() {
+        // The stripper has to drop `>=`, `<`, `==`, `~=`, `!=`, plus
+        // extras (`[ssl]`), env markers (`; python_version < \"3.12\"`),
+        // and trailing whitespace. All survive as a bare name.
+        let pyproject = "\
+[project.optional-dependencies]
+mixed = [
+    \"requests[ssl]>=2.31\",
+    \"urllib3==1.26.0\",
+    \"pytest>=8 ; python_version < '3.12'\",
+    \"trio~=0.23\",
+]
+";
+        let names = extract_pyproject_optional_deps(pyproject, "mixed");
+        assert_eq!(
+            names,
+            ["pytest", "requests", "trio", "urllib3"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_pyproject_optional_deps_returns_empty_when_group_absent() {
+        let pyproject = "\
+[project.optional-dependencies]
+other = [\"foo\"]
+";
+        let names = extract_pyproject_optional_deps(pyproject, "vad");
+        assert!(
+            names.is_empty(),
+            "expected empty set for missing group, got {names:?}",
+        );
+    }
+
+    #[test]
+    fn gather_python_imports_from_source_handles_indented_lazy_imports() {
+        // The exact shape used in
+        // `python/voicelayer_orchestrator/providers/vad_segmenter.py`:
+        // `try: <indent> import X as Y  # noqa: PLC0415`. The trim and
+        // alias-strip both have to fire, plus the inline comment must
+        // not pollute the captured name.
+        let source = "\
+from __future__ import annotations
+
+def lazy():
+    try:
+        import numpy as np  # noqa: PLC0415
+    except ImportError:
+        raise
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        raise
+    return np, ort
+";
+        let mut names = std::collections::BTreeSet::new();
+        gather_python_imports_from_source(source, &mut names);
+        assert!(names.contains("numpy"));
+        assert!(names.contains("onnxruntime"));
+        assert!(names.contains("__future__"));
+    }
+
+    #[test]
+    fn gather_python_imports_from_source_handles_comma_separated_and_dotted_forms() {
+        let source = "\
+import os, sys
+from pathlib import Path
+from typing import Any
+from voicelayer_orchestrator.providers import whisper_cli
+";
+        let mut names = std::collections::BTreeSet::new();
+        gather_python_imports_from_source(source, &mut names);
+        // `from voicelayer_orchestrator.providers` collapses to its
+        // root segment.
+        for expected in ["os", "sys", "pathlib", "typing", "voicelayer_orchestrator"] {
+            assert!(
+                names.contains(expected),
+                "expected `{expected}` in {names:?}",
+            );
+        }
+    }
+
+    /// Every package declared in `[project.optional-dependencies].vad`
+    /// must actually be imported somewhere under
+    /// `python/voicelayer_orchestrator/`. A dep listed in pyproject
+    /// but never imported is dead documentation: an operator who runs
+    /// `uv sync --extra vad` installs it for nothing, and the next
+    /// dependabot bump touches a package the codebase no longer cares
+    /// about.
+    ///
+    /// Reverse direction (every imported third-party package is in
+    /// the optional-deps group) requires a stdlib reference list that
+    /// would drift with each Python release; not enforced here.
+    #[test]
+    fn vad_optional_deps_are_all_imported_under_python_orchestrator() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let pyproject =
+            std::fs::read_to_string(repo_root.join("pyproject.toml")).expect("read pyproject.toml");
+        let vad_deps = extract_pyproject_optional_deps(&pyproject, "vad");
+        assert!(
+            !vad_deps.is_empty(),
+            "expected `[project.optional-dependencies].vad` to declare at least one \
+             package — pyproject may have been refactored away from optional-deps",
+        );
+
+        let mut imports = std::collections::BTreeSet::new();
+        collect_python_imports_under(
+            &repo_root.join("python").join("voicelayer_orchestrator"),
+            &mut imports,
+        )
+        .expect("walk python/voicelayer_orchestrator/");
+
+        let missing: Vec<&String> = vad_deps.difference(&imports).collect();
+        assert!(
+            missing.is_empty(),
+            "vad optional-deps are not imported anywhere under \
+             python/voicelayer_orchestrator/: {missing:?}\n\n\
+             Either drop the dead entries from `[project.optional-dependencies].vad` \
+             in pyproject.toml or wire the import in the provider that needs them. \
+             A dead extra installs cost without effect when an operator runs \
+             `uv sync --extra vad`.",
         );
     }
 }
