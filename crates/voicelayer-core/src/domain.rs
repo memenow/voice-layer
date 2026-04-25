@@ -479,10 +479,10 @@ mod tests {
     use super::{
         CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
         DictationCaptureResult, DictationFailureKind, HealthResponse, InjectRequest, InjectTarget,
-        InjectionPlan, LanguageProfile, PreviewArtifact, PreviewStatus, RewriteRequest,
-        RewriteStyle, SegmentationMode, SessionMode, SessionState, StartDictationRequest,
-        StopDictationRequest, TranscribeRequest, TranscriptionResult, TranslateRequest,
-        TriggerKind, WorkerHealthSummary,
+        InjectionPlan, LanguageProfile, PreviewArtifact, PreviewStatus, RecorderBackend,
+        RewriteRequest, RewriteStyle, SegmentationMode, SessionMode, SessionState,
+        StartDictationRequest, StopDictationRequest, TranscribeRequest, TranscriptionResult,
+        TranslateRequest, TriggerKind, WorkerHealthSummary,
     };
     use uuid::Uuid;
 
@@ -719,6 +719,187 @@ mod tests {
         inline
     }
 
+    /// Parse a top-level string-enum schema's `enum: [...]` line.
+    ///
+    /// Targets schemas like `RecorderBackend` whose entire body is a
+    /// `type: string` plus an inline `enum: [...]` at the schema's own
+    /// property indent (six spaces). Returns the enum values in source
+    /// order, or an empty vec when no top-level enum is declared.
+    /// The `]` slice mirrors `parse_required_set`'s inline form so a
+    /// future trailing comment cannot leak into the last entry.
+    fn parse_top_level_string_enum(section: &str) -> Vec<String> {
+        for line in section.lines() {
+            if let Some(rest) = line.strip_prefix("      enum: [") {
+                let inner = match rest.find(']') {
+                    Some(end) => &rest[..end],
+                    None => continue,
+                };
+                return inner
+                    .split(',')
+                    .map(|entry| entry.trim().to_owned())
+                    .filter(|entry| !entry.is_empty())
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Collect every discriminator value declared inside a `oneOf`
+    /// schema's branches.
+    ///
+    /// Targets schemas like `SegmentationMode` whose body is
+    /// `oneOf: [{properties: {mode: {enum: [<value>]}}}, ...]`. Each
+    /// branch's discriminator enum sits at fourteen-space indent
+    /// (`              enum: [<value>]`); collecting these in source
+    /// order yields the full discriminator set without needing a real
+    /// YAML parser. Trailing-comment defense matches the other inline
+    /// scanners.
+    fn parse_oneof_discriminator_values(section: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        for line in section.lines() {
+            if let Some(rest) = line.strip_prefix("              enum: [") {
+                let inner = match rest.find(']') {
+                    Some(end) => &rest[..end],
+                    None => continue,
+                };
+                for entry in inner.split(',') {
+                    let name = entry.trim();
+                    if !name.is_empty() {
+                        values.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        values
+    }
+
+    /// Cross-check every variant of a Rust string enum against an
+    /// openapi top-level enum schema. Each variant must serialize to a
+    /// JSON string that appears in the openapi list, and every openapi
+    /// value must correspond to a Rust variant — drift in either
+    /// direction trips the test.
+    ///
+    /// Pair this with an `enumerate_*_variants` helper whose body
+    /// matches every variant exhaustively, so adding a new Rust
+    /// variant fails compile until the helper is updated.
+    fn assert_openapi_documents_every_string_enum_variant<T: serde::Serialize>(
+        schema_name: &str,
+        rust_variants: &[T],
+    ) {
+        let openapi_path = format!(
+            "{}/../../openapi/voicelayerd.v1.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let contents =
+            std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
+        let section = isolate_schema_section(&contents, schema_name);
+        assert!(
+            !section.is_empty(),
+            "schema component {schema_name} not found in openapi file",
+        );
+
+        let openapi_variants = parse_top_level_string_enum(&section);
+        assert!(
+            !openapi_variants.is_empty(),
+            "openapi {schema_name} schema has no top-level `enum:` list — \
+             use the struct drift guard instead, this helper is for pure enums",
+        );
+
+        let rust_serialized: Vec<String> = rust_variants
+            .iter()
+            .map(|variant| match serde_json::to_value(variant) {
+                Ok(serde_json::Value::String(s)) => s,
+                Ok(other) => {
+                    panic!("{schema_name} variant must serialize to a JSON string; got {other:?}",)
+                }
+                Err(err) => panic!("{schema_name} variant must serialize: {err}"),
+            })
+            .collect();
+
+        for serialized in &rust_serialized {
+            assert!(
+                openapi_variants.iter().any(|value| value == serialized),
+                "openapi {schema_name} enum is missing `{serialized}` (rust enum has it). \
+                 Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
+            );
+        }
+        for openapi_variant in &openapi_variants {
+            assert!(
+                rust_serialized.iter().any(|value| value == openapi_variant),
+                "openapi {schema_name} enum lists `{openapi_variant}` but the rust enum does not. \
+                 Either add the variant to the rust enum or drop it from the openapi list.",
+            );
+        }
+    }
+
+    /// Cross-check every variant of a Rust `#[serde(tag = "...")]`
+    /// enum against an openapi `oneOf` schema's discriminator values.
+    /// Each Rust variant must serialize to a JSON object that contains
+    /// `discriminator` as a string; every such string must appear in
+    /// the openapi `oneOf` branches, and every openapi discriminator
+    /// must correspond to a Rust variant.
+    fn assert_openapi_documents_every_oneof_discriminator<T: serde::Serialize>(
+        schema_name: &str,
+        discriminator: &str,
+        rust_variants: &[T],
+    ) {
+        let openapi_path = format!(
+            "{}/../../openapi/voicelayerd.v1.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let contents =
+            std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
+        let section = isolate_schema_section(&contents, schema_name);
+        assert!(
+            !section.is_empty(),
+            "schema component {schema_name} not found in openapi file",
+        );
+
+        let openapi_values = parse_oneof_discriminator_values(&section);
+        assert!(
+            !openapi_values.is_empty(),
+            "openapi {schema_name} schema has no oneOf discriminator enums — \
+             this helper expects each branch to declare `enum: [<value>]`",
+        );
+
+        let rust_values: Vec<String> = rust_variants
+            .iter()
+            .map(|variant| {
+                let value = serde_json::to_value(variant)
+                    .unwrap_or_else(|err| panic!("{schema_name} variant must serialize: {err}"));
+                let object = value.as_object().unwrap_or_else(|| {
+                    panic!("{schema_name} variant must serialize to a JSON object; got {value:?}")
+                });
+                let raw = object.get(discriminator).unwrap_or_else(|| {
+                    panic!(
+                        "{schema_name} variant must contain `{discriminator}` field; got {object:?}",
+                    )
+                });
+                match raw {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => panic!(
+                        "{schema_name}.{discriminator} must serialize as string; got {other:?}",
+                    ),
+                }
+            })
+            .collect();
+
+        for serialized in &rust_values {
+            assert!(
+                openapi_values.iter().any(|value| value == serialized),
+                "openapi {schema_name} oneOf is missing the `{discriminator}: {serialized}` \
+                 branch (rust variant exists). Update openapi/voicelayerd.v1.yaml.",
+            );
+        }
+        for openapi_value in &openapi_values {
+            assert!(
+                rust_values.iter().any(|value| value == openapi_value),
+                "openapi {schema_name} oneOf has `{discriminator}: {openapi_value}` but the \
+                 rust enum has no matching variant. Either add the variant or drop the branch.",
+            );
+        }
+    }
+
     #[test]
     fn isolate_schema_section_returns_empty_for_unknown_schema() {
         let yaml = "    components:\n    Foo:\n      type: object\n";
@@ -843,6 +1024,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_top_level_string_enum_returns_values_in_source_order() {
+        let section = "\
+    Foo:
+      type: string
+      enum: [first, second, third]
+";
+        let values = parse_top_level_string_enum(section);
+        assert_eq!(values, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn parse_top_level_string_enum_returns_empty_when_no_enum_declared() {
+        let section = "\
+    Foo:
+      type: object
+      properties:
+        a:
+          type: string
+";
+        assert!(parse_top_level_string_enum(section).is_empty());
+    }
+
+    #[test]
+    fn parse_top_level_string_enum_drops_trailing_yaml_comment() {
+        // Same defense as the inline `parse_required_set` scanner: slice
+        // at the first `]` so a `# ...` comment after the closing
+        // bracket cannot leak into the last entry.
+        let section = "\
+    Foo:
+      type: string
+      enum: [a, b]  # trailing note
+";
+        let values = parse_top_level_string_enum(section);
+        assert_eq!(values, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_oneof_discriminator_values_collects_each_branch_in_source_order() {
+        let section = "\
+    Foo:
+      oneOf:
+        - type: object
+          properties:
+            mode:
+              type: string
+              enum: [alpha]
+        - type: object
+          properties:
+            mode:
+              type: string
+              enum: [beta]
+";
+        let values = parse_oneof_discriminator_values(section);
+        assert_eq!(values, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn parse_oneof_discriminator_values_returns_empty_when_no_branches_declared() {
+        let section = "\
+    Foo:
+      type: string
+      enum: [single]
+";
+        assert!(parse_oneof_discriminator_values(section).is_empty());
+    }
+
     /// Pins both directions of the soft-list override:
     /// 1. With `flag` listed in `serde_default_fields`, the cross-check
     ///    returns `Ok(())` even though `flag` is non-null and missing
@@ -943,6 +1191,49 @@ mod tests {
             detected_language: None,
             notes: Vec::new(),
         }
+    }
+
+    /// Materialise every `RecorderBackend` variant with a compile-time
+    /// exhaustiveness guard. The unused closure forces a missing-arm
+    /// error if a future variant is added without updating the list,
+    /// so the openapi drift guard cannot silently fall behind the rust
+    /// enum.
+    fn enumerate_recorder_backend_variants() -> Vec<RecorderBackend> {
+        let _exhaustive: fn(RecorderBackend) -> &'static str = |variant| match variant {
+            RecorderBackend::Auto => "auto",
+            RecorderBackend::Pipewire => "pipewire",
+            RecorderBackend::Alsa => "alsa",
+        };
+        vec![
+            RecorderBackend::Auto,
+            RecorderBackend::Pipewire,
+            RecorderBackend::Alsa,
+        ]
+    }
+
+    /// Materialise every `SegmentationMode` variant. The exhaustiveness
+    /// closure pins the discriminator labels every new variant must
+    /// add to the openapi `oneOf` schema. The numeric payload values
+    /// are placeholders — only the discriminator field feeds into the
+    /// drift guard.
+    fn enumerate_segmentation_mode_variants() -> Vec<SegmentationMode> {
+        let _exhaustive: fn(SegmentationMode) -> &'static str = |variant| match variant {
+            SegmentationMode::OneShot => "one_shot",
+            SegmentationMode::Fixed { .. } => "fixed",
+            SegmentationMode::VadGated { .. } => "vad_gated",
+        };
+        vec![
+            SegmentationMode::OneShot,
+            SegmentationMode::Fixed {
+                segment_secs: 0,
+                overlap_secs: 0,
+            },
+            SegmentationMode::VadGated {
+                probe_secs: 0,
+                max_segment_secs: 0,
+                silence_gap_probes: 0,
+            },
+        ]
     }
 
     #[test]
@@ -1114,5 +1405,29 @@ mod tests {
             auto_submit: false,
         };
         assert_openapi_documents_every_field("InjectRequest", &sentinel, &["auto_submit"]);
+    }
+
+    // Enum-shape drift guards. Pair every top-level enum schema with
+    // its rust counterpart so adding a variant to one and forgetting
+    // the other (in either direction) trips the test instead of
+    // shipping silently. The struct-shape guards above only enforce
+    // property presence and the required-list contract; they do not
+    // pin the variant set of an embedded enum.
+
+    #[test]
+    fn openapi_recorder_backend_documents_every_variant() {
+        assert_openapi_documents_every_string_enum_variant(
+            "RecorderBackend",
+            &enumerate_recorder_backend_variants(),
+        );
+    }
+
+    #[test]
+    fn openapi_segmentation_mode_documents_every_discriminator() {
+        assert_openapi_documents_every_oneof_discriminator(
+            "SegmentationMode",
+            "mode",
+            &enumerate_segmentation_mode_variants(),
+        );
     }
 }
