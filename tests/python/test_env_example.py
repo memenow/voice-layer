@@ -140,6 +140,35 @@ class EnvExampleCoverageTest(unittest.TestCase):
             ),
         )
 
+    def test_every_env_example_key_is_referenced_by_python_or_rust_daemon(self) -> None:
+        # The reverse direction of the two tests above: a key that
+        # lives in `voicelayerd.env.example` but no daemon-side code
+        # path actually reads is dead documentation. Operators who
+        # uncomment such a line silently set an ineffective value
+        # and have no way to discover the key was retired.
+        #
+        # Allowed exceptions are kept in CLIENT_ONLY_ENV_VARS — the
+        # forward checks already exclude these from the daemon's
+        # literal set, so the reverse check excludes them too. The
+        # invariant is symmetric: a name that is neither read by the
+        # daemon nor on the client-only allowlist has no business
+        # in `voicelayerd.env.example`.
+        env_vars = _extract_env_example_keys(ENV_EXAMPLE.read_text(encoding="utf-8"))
+        python_vars = _collect_literal_references(_list_python_sources())
+        rust_vars = _collect_literal_references(_list_rust_daemon_sources())
+        referenced = python_vars | rust_vars | CLIENT_ONLY_ENV_VARS
+        unreferenced = sorted(env_vars - referenced)
+        self.assertFalse(
+            unreferenced,
+            (
+                "env example declares vars that no daemon-side code reads: "
+                f"{unreferenced}. Either drop the `KEY=` line from "
+                "systemd/voicelayerd.env.example or wire the variable up in "
+                "the Rust daemon / Python worker. A dead entry misleads "
+                "operators into setting an ineffective override."
+            ),
+        )
+
 
 class EnvVarLiteralPatternTest(unittest.TestCase):
     """Proves the literal scanner only counts quoted string literals."""
