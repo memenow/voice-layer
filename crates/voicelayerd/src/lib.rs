@@ -4391,6 +4391,213 @@ mod openapi_route_alignment_tests {
 }
 
 #[cfg(test)]
+mod doc_v1_endpoint_alignment_tests {
+    //! Cross-check that every `/v1/<path>` URL mentioned in any
+    //! operator-facing markdown (the project README plus everything
+    //! under `docs/`) resolves to either a real axum route in
+    //! `build_app_router` or an external OpenAI-compatible LLM
+    //! endpoint the daemon talks *to* (`/v1/chat/completions`,
+    //! `/v1/models`).
+    //!
+    //! The drift mode is silent and operator-facing: a doc claims
+    //! `POST /v1/sessions/dictation/start` is the right entrypoint
+    //! after the route was renamed from `/start` to bare
+    //! `/sessions/dictation`, the operator copy-pastes the URL into
+    //! curl, the daemon returns 404, and the only fix is to read
+    //! the actual router source.
+    //!
+    //! Reverse direction (every axum route is mentioned in some
+    //! doc) is intentionally not enforced — the openapi document
+    //! is the canonical surface contract (see
+    //! `openapi_route_alignment_tests`); markdown prose is merely
+    //! a guide.
+    use std::collections::BTreeSet;
+
+    /// Walk a Markdown body and pull every `/v1/<path>` URL token.
+    /// Anchors on the literal `/v1/` prefix and walks forward
+    /// taking lowercase letters, digits, hyphens, underscores, and
+    /// internal `/` separators. Stops at any other character (a
+    /// space, punctuation, backtick, etc.) so trailing prose like
+    /// `/v1/health.` (sentence-final period) yields the bare path.
+    fn extract_doc_v1_endpoint_paths(contents: &str) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        let mut search = contents;
+        while let Some(idx) = search.find("/v1/") {
+            let after = &search[idx + 1..];
+            let token: String = after
+                .chars()
+                .take_while(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '/')
+                })
+                .collect();
+            search = after;
+            if token.len() <= "v1/".len() {
+                continue;
+            }
+            // Trim a trailing `/` so `POST /v1/sessions/dictation/`
+            // (markdown-prose form) collapses onto the bare path.
+            let cleaned = token.trim_end_matches('/');
+            if cleaned.is_empty() {
+                continue;
+            }
+            paths.insert(format!("/{cleaned}"));
+        }
+        paths
+    }
+
+    /// Walk this file's source and pull the first-argument path of
+    /// every `.route("PATH", ...)` call. Stops at the first
+    /// `#[cfg(test)]` line so synthetic fixtures and helper strings
+    /// inside test modules do not pollute the production route set
+    /// (the same truncation pattern as
+    /// `collect_axum_route_methods` in
+    /// `openapi_route_alignment_tests`).
+    fn collect_axum_route_paths(source: &str) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        for line in source.lines() {
+            if line.trim() == "#[cfg(test)]" {
+                break;
+            }
+            let trimmed = line.trim_start();
+            let Some(after) = trimmed.strip_prefix(".route(\"") else {
+                continue;
+            };
+            let Some(end) = after.find('"') else {
+                continue;
+            };
+            paths.insert(after[..end].to_owned());
+        }
+        paths
+    }
+
+    #[test]
+    fn extract_doc_v1_endpoint_paths_handles_method_prefix_and_trailing_punctuation() {
+        let md = "\
+- `POST /v1/sessions/dictation` starts recording.
+- The `GET /v1/events/stream` channel emits SSE.
+- See `/v1/health.` for liveness — note the trailing period must drop.
+- `/v1/path/with/multiple/segments` should resolve as one entry.
+- The string `/v1/` alone (no segment) must not be captured.
+";
+        let paths = extract_doc_v1_endpoint_paths(md);
+        assert_eq!(
+            paths,
+            [
+                "/v1/events/stream",
+                "/v1/health",
+                "/v1/path/with/multiple/segments",
+                "/v1/sessions/dictation",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+            "the bare `/v1/` prefix without a path segment must NOT be captured",
+        );
+    }
+
+    #[test]
+    fn collect_axum_route_paths_strips_method_builder_and_skips_test_module() {
+        let source = "\
+fn build_app_router() -> Router {
+    Router::new()
+        .route(\"/v1/health\", get(get_health))
+        .route(\"/v1/sessions\", get(list_sessions))
+}
+
+#[cfg(test)]
+mod tests {
+    let _ = router.route(\"/v1/synthetic\", get(handler));
+}
+";
+        let paths = collect_axum_route_paths(source);
+        assert_eq!(
+            paths,
+            ["/v1/health", "/v1/sessions"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "the test-module fixture path must be excluded by #[cfg(test)] truncation",
+        );
+    }
+
+    /// Every `/v1/<path>` URL the README or any doc mentions must
+    /// be either a real daemon route or a known external
+    /// OpenAI-compatible endpoint. The allowlist captures the two
+    /// LLM-side URLs the daemon talks *to* — they live on the
+    /// configured `VOICELAYER_LLM_ENDPOINT` host, not on the
+    /// daemon's UDS, and are documented in
+    /// `docs/guides/local-llm-provider.md`.
+    #[test]
+    fn every_doc_v1_endpoint_mention_resolves_to_an_axum_route_or_llm_allowlist() {
+        const LLM_EXTERNAL_ENDPOINTS: &[&str] = &["/v1/chat/completions", "/v1/models"];
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let lib_source = std::fs::read_to_string(format!("{manifest}/src/lib.rs"))
+            .expect("read voicelayerd lib.rs");
+        let routes = collect_axum_route_paths(&lib_source);
+        assert!(
+            !routes.is_empty(),
+            "expected at least one .route() call in voicelayerd lib.rs",
+        );
+
+        let repo_root = std::path::PathBuf::from(format!("{manifest}/../.."));
+        let mut docs = vec![repo_root.join("README.md")];
+        // Inline mini-walker mirroring the one in
+        // voicelayer-core::domain::tests; that helper is
+        // pub(super) and not reachable from this crate.
+        fn collect_md(
+            start: &std::path::Path,
+            out: &mut Vec<std::path::PathBuf>,
+        ) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(start)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    collect_md(&path, out)?;
+                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    out.push(path);
+                }
+            }
+            Ok(())
+        }
+        collect_md(&repo_root.join("docs"), &mut docs).expect("walk docs/");
+
+        let mut allowed: BTreeSet<String> = routes;
+        allowed.extend(LLM_EXTERNAL_ENDPOINTS.iter().map(|s| (*s).to_owned()));
+
+        let mut violations: Vec<String> = Vec::new();
+        for doc_path in &docs {
+            let contents = match std::fs::read_to_string(doc_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for mention in extract_doc_v1_endpoint_paths(&contents) {
+                if allowed.contains(&mention) {
+                    continue;
+                }
+                violations.push(format!(
+                    "{}: `{mention}`",
+                    doc_path
+                        .strip_prefix(&repo_root)
+                        .unwrap_or(doc_path)
+                        .display(),
+                ));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "docs reference `/v1/...` endpoints that are neither real daemon \
+             routes nor on the LLM external-endpoint allowlist:\n  - {}\n\n\
+             Either fix the doc URL to match an actual `.route(...)` call in \
+             crates/voicelayerd/src/lib.rs, drop the mention, or add the URL \
+             to LLM_EXTERNAL_ENDPOINTS in this test if it is a known \
+             OpenAI-compatible endpoint the daemon talks *to*.",
+            violations.join("\n  - "),
+        );
+    }
+}
+
+#[cfg(test)]
 mod sse_event_doc_alignment_tests {
     //! Cross-check that every backtick-quoted SSE event name in
     //! `docs/architecture/overview.md` corresponds to an
