@@ -429,4 +429,201 @@ mod tests {
         assert!(config.foreground_ptt.wezterm_target_pane_id.is_none());
         assert!(config.foreground_ptt.kitty_match.is_none());
     }
+
+    mod readme_config_key_alignment {
+        //! Cross-check that every backtick-quoted
+        //! `foreground_ptt.<key>` mention in any operator-facing doc
+        //! (the project README plus everything under `docs/`)
+        //! resolves to an entry in `SUPPORTED_CONFIG_KEYS`.
+        //!
+        //! The drift mode is silent and operator-facing: a doc
+        //! invites a contributor to run
+        //! `vl config set foreground_ptt.default_stop_acction inject`
+        //! (typo), the user copy-pastes, `vl config set` returns
+        //! `error: unsupported key`, and the only fix is to
+        //! reverse-engineer the real spelling from `vl config show`.
+        //!
+        //! Reverse direction (every supported key is documented in
+        //! at least one place) is intentionally not enforced — the
+        //! architecture overview already enumerates the full set
+        //! today, but breaking the test on every internal-only knob
+        //! would be too aggressive.
+        use std::collections::BTreeSet;
+
+        /// Walk a Markdown body and pull every backtick-quoted
+        /// `foreground_ptt.<key>` literal where `<key>` is lowercase
+        /// letters and underscores. Rejects whitespace-bearing
+        /// tokens (prose) and shapes with an extra `.` (deeper
+        /// nesting), keeping the captured set aligned with what
+        /// `vl config set` actually accepts.
+        pub(super) fn extract_doc_foreground_ptt_config_key_mentions(
+            contents: &str,
+        ) -> BTreeSet<String> {
+            let mut mentions = BTreeSet::new();
+            let mut search = contents;
+            while let Some(idx) = search.find('`') {
+                let after = &search[idx + 1..];
+                let Some(close) = after.find('`') else {
+                    break;
+                };
+                let inner = &after[..close];
+                search = &after[close + 1..];
+                if inner.chars().any(char::is_whitespace) {
+                    continue;
+                }
+                let Some(rest) = inner.strip_prefix("foreground_ptt.") else {
+                    continue;
+                };
+                if rest.is_empty() || rest.contains('.') {
+                    continue;
+                }
+                if !rest.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    continue;
+                }
+                mentions.insert(format!("foreground_ptt.{rest}"));
+            }
+            mentions
+        }
+
+        /// Walk this file and pull every entry from
+        /// `const SUPPORTED_CONFIG_KEYS: &[&str] = &[ ... ]`. Each
+        /// element is a quoted string literal on its own line; the
+        /// scanner exits on the first `];` after entering the array
+        /// so an unrelated `&[...]` later in the file does not leak.
+        pub(super) fn extract_supported_config_keys(source: &str) -> BTreeSet<String> {
+            let mut keys = BTreeSet::new();
+            let mut in_array = false;
+            for line in source.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("const SUPPORTED_CONFIG_KEYS") {
+                    in_array = true;
+                    continue;
+                }
+                if !in_array {
+                    continue;
+                }
+                if trimmed.starts_with("];") {
+                    break;
+                }
+                if let Some(start) = trimmed.find('"') {
+                    let after = &trimmed[start + 1..];
+                    if let Some(end) = after.find('"') {
+                        keys.insert(after[..end].to_owned());
+                    }
+                }
+            }
+            keys
+        }
+
+        fn collect_markdown_files(
+            start: &std::path::Path,
+            out: &mut Vec<std::path::PathBuf>,
+        ) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(start)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    collect_markdown_files(&path, out)?;
+                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    out.push(path);
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn extract_doc_foreground_ptt_config_key_mentions_filters_to_single_segment_keys() {
+            let md = "\
+- `foreground_ptt.default_stop_action` is the canonical name.
+- `foreground_ptt.nested.too.deep` is not a real config key shape.
+- `foreground_ptt.has spaces` is prose, not a key.
+- The `foreground_ptt.copy_on_stop` knob copies on stop.
+";
+            let mentions = extract_doc_foreground_ptt_config_key_mentions(md);
+            assert_eq!(
+                mentions,
+                [
+                    "foreground_ptt.copy_on_stop",
+                    "foreground_ptt.default_stop_action"
+                ]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+                "deeper-nested and whitespace-bearing tokens must be rejected",
+            );
+        }
+
+        #[test]
+        fn extract_supported_config_keys_collects_array_literal_entries() {
+            let source = "\
+const OTHER: &[&str] = &[\"unused\"];
+
+const SUPPORTED_CONFIG_KEYS: &[&str] = &[
+    \"foreground_ptt.language\",
+    \"foreground_ptt.backend\",
+];
+
+fn elsewhere() {
+    let _ = &[\"not.a.key\"];
+}
+";
+            let keys = extract_supported_config_keys(source);
+            assert_eq!(
+                keys,
+                ["foreground_ptt.backend", "foreground_ptt.language"]
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                "the post-array `&[\"not.a.key\"]` must not leak in",
+            );
+        }
+
+        #[test]
+        fn every_doc_foreground_ptt_config_key_resolves_to_supported_config_keys() {
+            let manifest = env!("CARGO_MANIFEST_DIR");
+            let repo_root = std::path::PathBuf::from(format!("{manifest}/../.."));
+
+            let config_rs = std::fs::read_to_string(format!("{manifest}/src/config.rs"))
+                .expect("read crates/vl/src/config.rs");
+            let supported = extract_supported_config_keys(&config_rs);
+            assert!(
+                !supported.is_empty(),
+                "expected at least one entry in `SUPPORTED_CONFIG_KEYS` — \
+                 the array may have moved",
+            );
+
+            let mut docs = vec![repo_root.join("README.md")];
+            collect_markdown_files(&repo_root.join("docs"), &mut docs)
+                .expect("walk docs/ directory");
+
+            let mut violations: Vec<String> = Vec::new();
+            for doc_path in &docs {
+                let contents = match std::fs::read_to_string(doc_path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for mention in extract_doc_foreground_ptt_config_key_mentions(&contents) {
+                    if supported.contains(&mention) {
+                        continue;
+                    }
+                    violations.push(format!(
+                        "{}: `{mention}`",
+                        doc_path
+                            .strip_prefix(&repo_root)
+                            .unwrap_or(doc_path)
+                            .display(),
+                    ));
+                }
+            }
+            assert!(
+                violations.is_empty(),
+                "docs reference foreground_ptt config keys not declared in \
+                 `SUPPORTED_CONFIG_KEYS`:\n  - {}\n\n\
+                 Either fix the typo in the doc, drop the mention, or add the \
+                 key to `SUPPORTED_CONFIG_KEYS` in crates/vl/src/config.rs and \
+                 wire it up in `set_config_value`.",
+                violations.join("\n  - "),
+            );
+        }
+    }
 }
