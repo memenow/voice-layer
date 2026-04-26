@@ -4521,41 +4521,57 @@ mod tests {
         );
     }
 
-    /// Every dictation-namespace SSE event name the architecture
-    /// overview enumerates must correspond to a real
-    /// `EventEnvelope::new(...)` emission in the daemon. The
-    /// reverse direction (every emitted event is documented) is
+    /// Every dictation-namespace SSE event name a public-facing doc
+    /// enumerates must correspond to a real `EventEnvelope::new(...)`
+    /// emission in the daemon. Scans the architecture overview AND
+    /// the project README, since both are operator-facing and either
+    /// can drift independently — a contributor renaming an event
+    /// might fix overview.md but forget the README example, or vice
+    /// versa.
+    ///
+    /// Reverse direction (every emitted event is documented) is
     /// intentionally not enforced — the daemon emits several
-    /// non-dictation events the doc does not promise to list.
+    /// non-dictation events (`compose.job_created`,
+    /// `transcription.completed`, `worker.providers_unavailable`)
+    /// the docs do not promise to list.
     #[test]
     fn every_doc_dictation_event_resolves_to_an_event_envelope_emission() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let lib_source = std::fs::read_to_string(format!("{manifest}/src/lib.rs"))
             .expect("read voicelayerd lib.rs");
-        let overview =
-            std::fs::read_to_string(format!("{manifest}/../../docs/architecture/overview.md"))
-                .expect("read docs/architecture/overview.md");
-
         let emitted = collect_event_envelope_names(&lib_source);
-        let doc_events = collect_doc_dictation_event_names(&overview);
-
         assert!(
             !emitted.is_empty(),
             "expected at least one EventEnvelope::new emission in lib.rs",
         );
-        assert!(
-            !doc_events.is_empty(),
-            "expected at least one dictation event reference in overview.md",
-        );
 
-        let undocumented_in_code: Vec<&String> = doc_events.difference(&emitted).collect();
+        let doc_paths: &[&str] = &["../../docs/architecture/overview.md", "../../README.md"];
+        let mut total_doc_events = 0usize;
+        let mut undocumented_in_code: Vec<String> = Vec::new();
+        for rel in doc_paths {
+            let abs = format!("{manifest}/{rel}");
+            let contents =
+                std::fs::read_to_string(&abs).unwrap_or_else(|err| panic!("read {abs}: {err}"));
+            let doc_events = collect_doc_dictation_event_names(&contents);
+            total_doc_events += doc_events.len();
+            for event in doc_events.difference(&emitted) {
+                undocumented_in_code.push(format!("{rel}: `{event}`"));
+            }
+        }
+
+        assert!(
+            total_doc_events > 0,
+            "expected at least one dictation event reference across the scanned docs \
+             (overview.md, README.md) — `collect_doc_dictation_event_names` may have \
+             lost its anchor",
+        );
         assert!(
             undocumented_in_code.is_empty(),
-            "docs/architecture/overview.md mentions dictation events the daemon \
-             does not emit: {undocumented_in_code:?}\n\nEither rename the doc \
-             reference to match the actual event, drop the mention, or wire up \
-             an `EventEnvelope::new(\"<name>\", ...)` emission in \
-             crates/voicelayerd/src/lib.rs.",
+            "scanned docs mention dictation events the daemon does not emit:\n  - {}\n\n\
+             Either rename the doc reference to match the actual event, drop the \
+             mention, or wire up an `EventEnvelope::new(\"<name>\", ...)` emission \
+             in crates/voicelayerd/src/lib.rs.",
+            undocumented_in_code.join("\n  - "),
         );
     }
 }
