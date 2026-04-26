@@ -1751,6 +1751,74 @@ mod tests {
         keys
     }
 
+    /// Walk `CLAUDE.md` and pull out every backtick-quoted
+    /// PascalCase identifier inside the `## Domain Vocabulary`
+    /// section. Stops at the next `## ` heading so prose mentions
+    /// of types elsewhere in the file (e.g. examples in
+    /// `## Architecture Defaults`) do not leak into the captured
+    /// set.
+    fn extract_claude_md_domain_vocabulary_types(
+        contents: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let mut types = std::collections::BTreeSet::new();
+        let mut in_section = false;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("## ") {
+                in_section = trimmed == "## Domain Vocabulary";
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            let mut search = line;
+            while let Some(idx) = search.find('`') {
+                let after = &search[idx + 1..];
+                let Some(close) = after.find('`') else {
+                    break;
+                };
+                let inner = &after[..close];
+                search = &after[close + 1..];
+                if inner.is_empty() {
+                    continue;
+                }
+                if !inner.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    continue;
+                }
+                if !inner.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    continue;
+                }
+                types.insert(inner.to_owned());
+            }
+        }
+        types
+    }
+
+    /// Walk a Rust source string and pull every `pub struct <Name>`
+    /// and `pub enum <Name>` declaration. The token after the
+    /// keyword is the type name; trailing generic parameters
+    /// (`<T>`), where-clauses, and brace bodies are stripped by
+    /// taking only alphanumeric/underscore characters until the
+    /// first delimiter.
+    fn extract_voicelayer_core_pub_type_names(source: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            for prefix in ["pub struct ", "pub enum "] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() && name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        names
+    }
+
     /// Walk a Markdown body and pull out every backtick-quoted
     /// `crates/<name>` literal where `<name>` is a single segment
     /// (no further `/`), composed of alphanumerics, hyphens, or
@@ -5326,6 +5394,107 @@ VOICELAYER_LIVE_KNOB=hello
              outside the daemon's env file (vl-desktop client-side or \
              install-script-only).",
             violations.join("\n  - "),
+        );
+    }
+
+    #[test]
+    fn extract_claude_md_domain_vocabulary_types_terminates_at_next_section() {
+        let md = "\
+# VoiceLayer
+
+## Domain Vocabulary
+
+Public types use the domain terms `CaptureSession` and `InjectionPlan`.
+
+## Architecture Defaults
+
+The `axum::Router` here is not a domain type and must not leak in.
+";
+        let types = extract_claude_md_domain_vocabulary_types(md);
+        assert_eq!(
+            types,
+            ["CaptureSession", "InjectionPlan"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "the post-section `axum::Router` must not be captured",
+        );
+    }
+
+    #[test]
+    fn extract_voicelayer_core_pub_type_names_collects_struct_and_enum_declarations() {
+        let source = "\
+pub struct CaptureSession {}
+pub enum DictationFailureKind { Foo, Bar }
+struct PrivateThing;
+pub(crate) struct CrateLocal;
+pub struct GenericThing<T> { _phantom: std::marker::PhantomData<T> }
+";
+        let names = extract_voicelayer_core_pub_type_names(source);
+        assert_eq!(
+            names,
+            ["CaptureSession", "DictationFailureKind", "GenericThing"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "private and pub(crate) types must be excluded; generic params \
+             must be stripped from `GenericThing<T>`",
+        );
+    }
+
+    /// Every PascalCase type the `## Domain Vocabulary` section of
+    /// `CLAUDE.md` claims is a public type must actually appear as
+    /// a `pub struct` or `pub enum` declaration in some file under
+    /// `crates/voicelayer-core/src/`. The drift mode is silent doc
+    /// rot: a refactor renames `CaptureSession` to
+    /// `RecordingSession`, `CLAUDE.md` lags behind, and a future
+    /// agent reading the contributor guide reaches for the wrong
+    /// name when generating new code.
+    ///
+    /// Reverse direction (every `pub struct` is named in the doc)
+    /// is intentionally not enforced — the doc lists the *core*
+    /// vocabulary, not every internal helper type.
+    #[test]
+    fn every_claude_md_domain_vocabulary_type_exists_as_a_voicelayer_core_pub_type() {
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let claude_md =
+            std::fs::read_to_string(repo_root.join("CLAUDE.md")).expect("read CLAUDE.md");
+        let vocab = extract_claude_md_domain_vocabulary_types(&claude_md);
+        assert!(
+            !vocab.is_empty(),
+            "expected at least one PascalCase type in CLAUDE.md `## Domain Vocabulary` — \
+             the section may have moved or the parser may be misparsing",
+        );
+
+        let core_src = repo_root.join("crates/voicelayer-core/src");
+        let mut pub_types = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&core_src).expect("read voicelayer-core/src") {
+            let entry = entry.expect("read_dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            for name in extract_voicelayer_core_pub_type_names(&contents) {
+                pub_types.insert(name);
+            }
+        }
+        assert!(
+            !pub_types.is_empty(),
+            "expected at least one `pub struct`/`pub enum` declaration in \
+             voicelayer-core — extract_voicelayer_core_pub_type_names may be \
+             misparsing",
+        );
+
+        let missing: Vec<&String> = vocab.difference(&pub_types).collect();
+        assert!(
+            missing.is_empty(),
+            "CLAUDE.md `## Domain Vocabulary` claims these types are public \
+             but voicelayer-core does not declare them: {missing:?}\n\n\
+             Either rename the doc reference to match the current code, \
+             promote the type to `pub`, or drop the mention.",
         );
     }
 }
