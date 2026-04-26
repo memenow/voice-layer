@@ -1581,4 +1581,248 @@ enum Command {
             );
         }
     }
+
+    mod readme_flag_alignment {
+        //! Cross-check that every `--<flag>` token appearing in a
+        //! `cargo run -p vl -- ...` invocation in `README.md`
+        //! corresponds to a real `#[arg(long, ...)]` declaration on
+        //! some Command variant in this file.
+        //!
+        //! Flags from non-vl tools (`kitten @ send-text --match ... --stdin`,
+        //! `cargo build --all-features`) are not in scope: the
+        //! extractor anchors at `cargo run -p vl --` and only collects
+        //! flags from the tail of that line (and its `\` continuations),
+        //! so external-tool flag mentions elsewhere in the README do
+        //! not pollute the captured set.
+        //!
+        //! Reverse direction (every CLI flag is mentioned in README) is
+        //! intentionally not enforced — the README documents
+        //! operator-facing usage paths, not every internal knob.
+        use std::collections::BTreeSet;
+
+        /// Walk `README.md` and pull every `--<flag>` token that
+        /// appears after `cargo run -p vl -- ` on the same logical
+        /// line. `\<newline>` continuations are collapsed into a
+        /// space first so multi-line invocations parse as a single
+        /// command. Captured flag names are kebab-case and exclude
+        /// the leading `--`.
+        pub(super) fn extract_readme_vl_invocation_flags(contents: &str) -> BTreeSet<String> {
+            let mut collapsed = String::new();
+            for line in contents.lines() {
+                let trimmed_end = line.trim_end_matches([' ', '\t']);
+                if let Some(stripped) = trimmed_end.strip_suffix('\\') {
+                    collapsed.push_str(stripped);
+                    collapsed.push(' ');
+                } else {
+                    collapsed.push_str(trimmed_end);
+                    collapsed.push('\n');
+                }
+            }
+
+            let mut flags = BTreeSet::new();
+            for line in collapsed.lines() {
+                let Some(idx) = line.find("cargo run -p vl --") else {
+                    continue;
+                };
+                let tail = &line[idx + "cargo run -p vl --".len()..];
+                let mut search = tail;
+                while let Some(idx) = search.find(" --") {
+                    let after = &search[idx + 3..];
+                    let token: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-' || c.is_ascii_digit())
+                        .collect();
+                    if !token.is_empty() && !token.starts_with('-') {
+                        flags.insert(token);
+                    }
+                    search = after;
+                }
+            }
+            flags
+        }
+
+        /// Walk this file (`crates/vl/src/cli.rs`) and pull every
+        /// `--<flag>` clap exposes, derived from `#[arg(long, ...)]`
+        /// (and `#[arg(long = "name", ...)]` for explicit overrides)
+        /// followed by a field declaration. Multi-line attributes
+        /// like
+        ///
+        /// ```ignore
+        /// #[arg(
+        ///     long,
+        ///     value_parser = clap::value_parser!(u32).range(1..)
+        /// )]
+        /// segment_secs: Option<u32>,
+        /// ```
+        ///
+        /// are handled by tracking the `#[arg(...)]` block boundaries
+        /// (entered on a line starting with `#[arg(`, exited when a
+        /// line ends with `)]`). Field names auto-convert from
+        /// snake_case to kebab-case to match clap's derive behaviour.
+        pub(super) fn extract_clap_long_flag_names(source: &str) -> BTreeSet<String> {
+            let mut flags = BTreeSet::new();
+            let mut in_arg_attr = false;
+            let mut long_seen = false;
+            let mut explicit_name: Option<String> = None;
+
+            for line in source.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("#[arg(") {
+                    in_arg_attr = true;
+                    long_seen = false;
+                    explicit_name = None;
+                }
+                if in_arg_attr {
+                    if has_word_long(trimmed) {
+                        long_seen = true;
+                        if let Some(name) = parse_explicit_long_name(trimmed) {
+                            explicit_name = Some(name);
+                        }
+                    }
+                    if trimmed.ends_with(")]") {
+                        in_arg_attr = false;
+                    }
+                    continue;
+                }
+                if !long_seen {
+                    continue;
+                }
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(colon) = trimmed.find(':') {
+                    let name = trimmed[..colon].trim();
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        let final_name = explicit_name
+                            .take()
+                            .unwrap_or_else(|| name.replace('_', "-"));
+                        flags.insert(final_name);
+                    }
+                }
+                long_seen = false;
+                explicit_name = None;
+            }
+            flags
+        }
+
+        fn has_word_long(text: &str) -> bool {
+            text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == "long")
+        }
+
+        fn parse_explicit_long_name(text: &str) -> Option<String> {
+            let idx = text.find("long = \"")?;
+            let after = &text[idx + "long = \"".len()..];
+            let end = after.find('"')?;
+            Some(after[..end].to_owned())
+        }
+
+        #[test]
+        fn extract_readme_vl_invocation_flags_picks_up_continuation_and_skips_external_tools() {
+            let md = "\
+The kitten line uses an external tool:
+
+```
+kitten @ send-text --match title:Foo --stdin --bracketed-paste auto
+cargo run -p vl -- dictation foreground-ptt \\
+  --backend pipewire --copy-on-stop \\
+  --tmux-target-pane %2
+```
+
+Inline `vl --help` is not in scope (no cargo run prefix).
+";
+            let flags = extract_readme_vl_invocation_flags(md);
+            assert_eq!(
+                flags,
+                ["backend", "copy-on-stop", "tmux-target-pane"]
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                "external-tool flags (`--match`, `--stdin`, `--bracketed-paste`) \
+                 must not leak into the vl-flag set",
+            );
+        }
+
+        #[test]
+        fn extract_clap_long_flag_names_handles_multiline_attributes_and_explicit_overrides() {
+            let source = "\
+struct Foo {
+    #[arg(long)]
+    plain_field: bool,
+
+    #[arg(long = \"renamed\")]
+    underlying_name: String,
+
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    multi_line_field: u32,
+
+    #[arg(short)]
+    no_long: bool,
+}
+";
+            let flags = extract_clap_long_flag_names(source);
+            assert_eq!(
+                flags,
+                ["multi-line-field", "plain-field", "renamed"]
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                "fields without `long` must be excluded; explicit-name fields \
+                 must use the override; multi-line attribute must still attach \
+                 to its field",
+            );
+        }
+
+        #[test]
+        fn extract_clap_long_flag_names_does_not_capture_long_lookalike_identifiers() {
+            // A struct field literally named `long_term` and an
+            // attribute that doesn't include the `long` directive
+            // must not contribute a flag. The word-boundary check
+            // in `has_word_long` is what prevents this.
+            let source = "\
+struct Foo {
+    #[arg(short)]
+    long_term: bool,
+    #[arg(env = \"belongs\")]
+    plain: bool,
+}
+";
+            let flags = extract_clap_long_flag_names(source);
+            assert!(flags.is_empty(), "got {flags:?}");
+        }
+
+        #[test]
+        fn every_readme_vl_invocation_flag_resolves_to_a_clap_long_flag() {
+            let manifest = env!("CARGO_MANIFEST_DIR");
+            let cli_rs = std::fs::read_to_string(format!("{manifest}/src/cli.rs"))
+                .expect("read crates/vl/src/cli.rs");
+            let readme = std::fs::read_to_string(format!("{manifest}/../../README.md"))
+                .expect("read README.md");
+
+            let mentions = extract_readme_vl_invocation_flags(&readme);
+            let flags = extract_clap_long_flag_names(&cli_rs);
+            assert!(
+                !mentions.is_empty(),
+                "expected at least one `--<flag>` after `cargo run -p vl -- ` in README",
+            );
+            assert!(
+                !flags.is_empty(),
+                "expected at least one `#[arg(long, ...)]` declaration in cli.rs",
+            );
+
+            let invalid: Vec<&String> = mentions.difference(&flags).collect();
+            assert!(
+                invalid.is_empty(),
+                "README references vl flags that do not exist in any \
+                 `#[arg(long, ...)]` declaration: {invalid:?}\n\n\
+                 Fix the typo, drop the mention, or wire up the flag in \
+                 the matching Command variant in crates/vl/src/cli.rs.",
+            );
+        }
+    }
 }
