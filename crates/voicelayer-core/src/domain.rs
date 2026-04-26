@@ -1680,6 +1680,78 @@ mod tests {
     }
 
     /// Walk a Markdown body and pull out every backtick-quoted
+    /// `VOICELAYER_<NAME>` literal where `<NAME>` is uppercase
+    /// letters, digits, and underscores. Rejects two prose
+    /// patterns the docs use today:
+    /// - `` `VOICELAYER_FOO_*` `` — wildcard mentions where the
+    ///   trailing `*` is dropped during scan and the captured text
+    ///   ends in `_`.
+    /// - Any literal containing whitespace, which is prose, not a
+    ///   real env var name.
+    fn extract_doc_voicelayer_env_var_mentions(
+        contents: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let mut mentions = std::collections::BTreeSet::new();
+        let mut search = contents;
+        while let Some(idx) = search.find('`') {
+            let after = &search[idx + 1..];
+            let Some(close) = after.find('`') else {
+                break;
+            };
+            let inner = &after[..close];
+            search = &after[close + 1..];
+            if inner.chars().any(char::is_whitespace) {
+                continue;
+            }
+            let Some(rest) = inner.strip_prefix("VOICELAYER_") else {
+                continue;
+            };
+            if rest.is_empty() || rest.ends_with('_') {
+                continue;
+            }
+            if !rest
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                continue;
+            }
+            mentions.insert(format!("VOICELAYER_{rest}"));
+        }
+        mentions
+    }
+
+    /// Walk an env example file and pull every `VOICELAYER_<NAME>`
+    /// key on an assignment-shaped line: optional leading `#` (for
+    /// commented overrides), the key, an `=` (with the value
+    /// optional). Returns the bare key. Mirrors the parsing in
+    /// `tests/python/test_env_example.py`'s
+    /// `ENV_EXAMPLE_ASSIGNMENT_PATTERN` so callers compare against
+    /// the same key set the python-side guard sees.
+    fn extract_env_example_voicelayer_keys(contents: &str) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let after_hash = trimmed.trim_start_matches('#').trim_start();
+            let Some(rest) = after_hash.strip_prefix("VOICELAYER_") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let after_name = &rest[name.len()..];
+            if !after_name.starts_with('=') {
+                continue;
+            }
+            keys.insert(format!("VOICELAYER_{name}"));
+        }
+        keys
+    }
+
+    /// Walk a Markdown body and pull out every backtick-quoted
     /// `crates/<name>` literal where `<name>` is a single segment
     /// (no further `/`), composed of alphanumerics, hyphens, or
     /// underscores. Designed for the README's Architecture section
@@ -5124,6 +5196,136 @@ dev = [\"pytest>=9.0.3,<10\"]
              invokes via `uv run`: {unused:?}\n\nEither drop the dep from \
              pyproject.toml or add a `uv run <package> ...` step to the \
              verify job in .github/workflows/ci.yml.",
+        );
+    }
+
+    #[test]
+    fn extract_doc_voicelayer_env_var_mentions_drops_wildcard_and_prose_forms() {
+        let md = "\
+- `VOICELAYER_LLM_ENDPOINT` is the chat completion URL.
+- `VOICELAYER_WHISPER_SERVER_*` is shorthand for several knobs.
+- `VOICELAYER_FOO BAR` looks like prose, not a real var.
+- The `VOICELAYER_LLM_TIMEOUT_SECONDS` knob bounds requests.
+";
+        let mentions = extract_doc_voicelayer_env_var_mentions(md);
+        assert_eq!(
+            mentions,
+            ["VOICELAYER_LLM_ENDPOINT", "VOICELAYER_LLM_TIMEOUT_SECONDS"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn extract_env_example_voicelayer_keys_handles_live_and_commented_assignments() {
+        let env = "\
+# header comment
+
+VOICELAYER_LIVE_KNOB=hello
+#VOICELAYER_COMMENTED_KNOB=world
+#  VOICELAYER_PADDED_KNOB=42
+
+# VOICELAYER_PROSE_ONLY is documented but not declared as KEY=
+";
+        let keys = extract_env_example_voicelayer_keys(env);
+        assert_eq!(
+            keys,
+            [
+                "VOICELAYER_COMMENTED_KNOB",
+                "VOICELAYER_LIVE_KNOB",
+                "VOICELAYER_PADDED_KNOB",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+            "prose mentions without `=` must not be captured",
+        );
+    }
+
+    /// Every backtick-quoted `VOICELAYER_<NAME>` mention in any
+    /// `docs/**/*.md` file must either:
+    ///
+    /// - Appear as a `KEY=` (or `#KEY=`) line in
+    ///   `systemd/voicelayerd.env.example`, OR
+    /// - Sit on the explicit allow-list for vars that legitimately
+    ///   live outside the daemon's env file (vl-desktop client-side
+    ///   knobs and install-script-only knobs).
+    ///
+    /// The drift mode is silent and operator-facing: a doc claims
+    /// `VOICELAYER_FANCY_NEW_KNOB` is configurable, but the env
+    /// example never declares it, so an operator copying the env
+    /// file as a starting template never sees the knob and has no
+    /// way to know they should add it themselves.
+    ///
+    /// Companion to the python-side
+    /// `tests/python/test_env_example.py::test_every_env_example_key_is_referenced_by_python_or_rust_daemon`,
+    /// which closes the env-example ↔ code loop. Together the two
+    /// tests pin docs ↔ env example ↔ code in a single chain.
+    #[test]
+    fn every_doc_voicelayer_env_var_mention_is_declared_in_env_example_or_allowlisted() {
+        const ALLOWLIST: &[&str] = &[
+            // vl-desktop client-side knobs — read by the GUI
+            // process, not the daemon. Documented in
+            // docs/guides/desktop.md.
+            "VOICELAYER_LOG",
+            "VOICELAYER_VL_BIN",
+            // scripts/install.sh internal overrides — read by the
+            // installer, not the daemon. Documented in
+            // docs/guides/systemd.md.
+            "VOICELAYER_INSTALL_BIN_DIR",
+            "VOICELAYER_INSTALL_ENV_DIR",
+            "VOICELAYER_INSTALL_UNIT_DIR",
+        ];
+
+        let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+
+        let env_example =
+            std::fs::read_to_string(repo_root.join("systemd/voicelayerd.env.example"))
+                .expect("read systemd/voicelayerd.env.example");
+        let env_keys = extract_env_example_voicelayer_keys(&env_example);
+        let allowed: std::collections::BTreeSet<String> = env_keys
+            .iter()
+            .cloned()
+            .chain(ALLOWLIST.iter().map(|s| (*s).to_owned()))
+            .collect();
+        assert!(
+            !env_keys.is_empty(),
+            "expected at least one VOICELAYER_KEY= entry in env example",
+        );
+
+        let mut docs = Vec::new();
+        collect_markdown_files(&repo_root.join("docs"), &mut docs).expect("walk docs/ directory");
+
+        let mut violations: Vec<String> = Vec::new();
+        for doc_path in &docs {
+            let contents = match std::fs::read_to_string(doc_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for mention in extract_doc_voicelayer_env_var_mentions(&contents) {
+                if allowed.contains(&mention) {
+                    continue;
+                }
+                violations.push(format!(
+                    "{}: `{mention}`",
+                    doc_path
+                        .strip_prefix(&repo_root)
+                        .unwrap_or(doc_path)
+                        .display(),
+                ));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "docs reference VOICELAYER env vars not declared in \
+             systemd/voicelayerd.env.example and not on the allowlist:\n  - {}\n\n\
+             Either add the var to the env example as a `KEY=` or `#KEY=` \
+             line so operators can override it, drop the doc mention, or \
+             extend the in-test ALLOWLIST if the var legitimately lives \
+             outside the daemon's env file (vl-desktop client-side or \
+             install-script-only).",
+            violations.join("\n  - "),
         );
     }
 }
