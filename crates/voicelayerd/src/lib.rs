@@ -4542,25 +4542,8 @@ mod tests {
 
         let repo_root = std::path::PathBuf::from(format!("{manifest}/../.."));
         let mut docs = vec![repo_root.join("README.md")];
-        // Inline mini-walker mirroring the one in
-        // voicelayer-core::domain::tests; that helper is
-        // pub(super) and not reachable from this crate.
-        fn collect_md(
-            start: &std::path::Path,
-            out: &mut Vec<std::path::PathBuf>,
-        ) -> std::io::Result<()> {
-            for entry in std::fs::read_dir(start)? {
-                let entry = entry?;
-                let path = entry.path();
-                if entry.file_type()?.is_dir() {
-                    collect_md(&path, out)?;
-                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    out.push(path);
-                }
-            }
-            Ok(())
-        }
-        collect_md(&repo_root.join("docs"), &mut docs).expect("walk docs/");
+        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
+            .expect("walk docs/");
 
         let mut allowed: BTreeSet<String> = routes;
         allowed.extend(LLM_EXTERNAL_ENDPOINTS.iter().map(|s| (*s).to_owned()));

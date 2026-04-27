@@ -3963,6 +3963,7 @@ dependencies = [
  "toml",
  "uuid",
  "voicelayer-core",
+ "voicelayer-doc-test-utils",
  "voicelayerd",
 ]
 
@@ -3997,6 +3998,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+ "voicelayer-doc-test-utils",
+]
+
+[[package]]
+name = "voicelayer-doc-test-utils"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -4018,6 +4027,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "voicelayer-core",
+ "voicelayer-doc-test-utils",
  "zbus",
 ]
 
