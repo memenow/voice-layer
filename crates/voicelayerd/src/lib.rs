@@ -4518,25 +4518,27 @@ mod doc_v1_endpoint_alignment_tests {
             }
             let mut search = line;
             while let Some(idx) = search.find("/v1/") {
-                let after = &search[idx + 1..];
-                let mut chars = after.chars();
-                // Skip the literal `v1/` prefix that we just
-                // matched, then walk the suffix segment.
-                let _ = chars.next(); // 'v'
-                let _ = chars.next(); // '1'
-                let _ = chars.next(); // '/'
-                let first = chars.clone().next();
-                let suffix: String = chars
+                // `/v1/` is 4 ASCII bytes, so slicing past the
+                // matched prefix is safe.
+                let after_v1_slash = &search[idx + 4..];
+                let suffix: String = after_v1_slash
+                    .chars()
                     .take_while(|c| {
                         c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '/')
                     })
                     .collect();
-                search = after;
+                // Step past the full captured token (`/v1/` plus
+                // the suffix we just consumed) so pathological
+                // inputs like `/v1/v1/foo` are not double-counted
+                // by a re-scan of the same suffix. Mirrors the
+                // advancement strategy in
+                // `extract_doc_v1_endpoint_paths` above.
+                search = &after_v1_slash[suffix.len()..];
                 // Require a real first segment that starts with a
                 // lowercase ASCII letter, mirroring how the worker
                 // names its OpenAI-compatible paths
                 // (`chat/completions`, `models`, ...).
-                let Some(first_char) = first else {
+                let Some(first_char) = suffix.chars().next() else {
                     continue;
                 };
                 if !first_char.is_ascii_lowercase() {
@@ -4585,6 +4587,20 @@ def resolve_models_url(endpoint: str) -> str:
              comment line `/v1/should-not-be-captured` must be skipped, and the \
              `removesuffix(\"/chat/completions\") + \"/models\"` branch must not \
              produce a spurious capture",
+        );
+    }
+
+    #[test]
+    fn extract_llm_external_endpoints_from_python_worker_does_not_double_count_overlapping_v1_segments()
+     {
+        let fixture = "return f\"{normalized}/v1/v1/foo\"\n";
+        let paths = extract_llm_external_endpoints_from_python_worker(fixture);
+        assert_eq!(
+            paths,
+            ["/v1/v1/foo"].iter().map(|s| (*s).to_owned()).collect(),
+            "the loop must step past the full captured token so a \
+             pathological worker URL like `/v1/v1/foo` yields one entry, \
+             not a second `/v1/foo` re-discovered inside the suffix",
         );
     }
 
