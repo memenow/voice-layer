@@ -1374,25 +1374,6 @@ mod tests {
         links
     }
 
-    /// Recursively collect every `.md` file under `start`. Used by
-    /// the cross-reference resolution test to walk the docs tree
-    /// without pulling in `walkdir`.
-    fn collect_markdown_files(
-        start: &std::path::Path,
-        out: &mut Vec<std::path::PathBuf>,
-    ) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(start)? {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                collect_markdown_files(&path, out)?;
-            } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-
     /// Walk an `install.sh` shell script and pull out every basename
     /// it copies into `${BIN_DIR}/`. Targets the canonical line
     /// shape `install -m 0755 "..." "${BIN_DIR}/<name>"` (the form
@@ -4152,7 +4133,7 @@ components:
         let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
 
         let mut md_files = vec![repo_root.join("README.md")];
-        collect_markdown_files(&repo_root.join("docs"), &mut md_files)
+        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut md_files)
             .expect("walk docs/ directory");
         assert!(
             md_files.len() > 1,
@@ -4210,7 +4191,7 @@ components:
         let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
 
         let mut md_files = vec![repo_root.join("README.md")];
-        collect_markdown_files(&repo_root.join("docs"), &mut md_files)
+        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut md_files)
             .expect("walk docs/ directory");
 
         let mut broken: Vec<String> = Vec::new();
@@ -5363,7 +5344,8 @@ VOICELAYER_LIVE_KNOB=hello
         );
 
         let mut docs = Vec::new();
-        collect_markdown_files(&repo_root.join("docs"), &mut docs).expect("walk docs/ directory");
+        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
+            .expect("walk docs/ directory");
 
         let mut violations: Vec<String> = Vec::new();
         for doc_path in &docs {

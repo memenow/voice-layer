@@ -22,6 +22,7 @@ VoiceLayer is not designed as:
 ## Architecture
 
 - `crates/voicelayer-core`: shared domain types and injection planning
+- `crates/voicelayer-doc-test-utils`: dev-only helpers shared by the workspace's repository-wide markdown guard tests
 - `crates/voicelayerd`: Unix-socket daemon and `/v1` control API
 - `crates/vl`: CLI/TUI entry point and operator tooling
 - `crates/vl-desktop`: interactive GUI shell that talks to the daemon over the same socket

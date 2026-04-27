@@ -11,3 +11,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+voicelayer-doc-test-utils.workspace = true

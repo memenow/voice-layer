@@ -4396,8 +4396,8 @@ mod doc_v1_endpoint_alignment_tests {
     //! operator-facing markdown (the project README plus everything
     //! under `docs/`) resolves to either a real axum route in
     //! `build_app_router` or an external OpenAI-compatible LLM
-    //! endpoint the daemon talks *to* (`/v1/chat/completions`,
-    //! `/v1/models`).
+    //! endpoint the daemon talks *to* (e.g.
+    //! `/v1/chat/completions`, `/v1/models`).
     //!
     //! The drift mode is silent and operator-facing: a doc claims
     //! `POST /v1/sessions/dictation/start` is the right entrypoint
@@ -4405,6 +4405,15 @@ mod doc_v1_endpoint_alignment_tests {
     //! `/sessions/dictation`, the operator copy-pastes the URL into
     //! curl, the daemon returns 404, and the only fix is to read
     //! the actual router source.
+    //!
+    //! The LLM allowlist is no longer a hard-coded const inside
+    //! this test. It is derived at test time from the Python worker
+    //! module
+    //! `python/voicelayer_orchestrator/providers/llm_openai_compatible.py`,
+    //! which is the single source of truth for the OpenAI-compatible
+    //! suffixes the daemon dials. If that worker migrates to a new
+    //! suffix (e.g. `/v1/responses`), the allowlist tracks
+    //! automatically without a parallel edit here.
     //!
     //! Reverse direction (every axum route is mentioned in some
     //! doc) is intentionally not enforced — the openapi document
@@ -4415,10 +4424,16 @@ mod doc_v1_endpoint_alignment_tests {
 
     /// Walk a Markdown body and pull every `/v1/<path>` URL token.
     /// Anchors on the literal `/v1/` prefix and walks forward
-    /// taking lowercase letters, digits, hyphens, underscores, and
+    /// taking ASCII alphanumerics, hyphens, underscores, and
     /// internal `/` separators. Stops at any other character (a
     /// space, punctuation, backtick, etc.) so trailing prose like
     /// `/v1/health.` (sentence-final period) yields the bare path.
+    ///
+    /// Uppercase letters are intentionally captured (not folded to
+    /// lowercase) so that operator-facing typos such as
+    /// `/v1/Sessions/Dictation` survive extraction and surface as
+    /// allowlist violations downstream, instead of being silently
+    /// truncated at the first uppercase character.
     fn extract_doc_v1_endpoint_paths(contents: &str) -> BTreeSet<String> {
         let mut paths = BTreeSet::new();
         let mut search = contents;
@@ -4426,11 +4441,12 @@ mod doc_v1_endpoint_alignment_tests {
             let after = &search[idx + 1..];
             let token: String = after
                 .chars()
-                .take_while(|c| {
-                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '/')
-                })
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'))
                 .collect();
-            search = after;
+            // Step past the full captured token so pathological
+            // inputs like `/v1/v1/foo` are not double-counted by a
+            // re-scan of the same suffix.
+            search = &after[token.len()..];
             if token.len() <= "v1/".len() {
                 continue;
             }
@@ -4452,6 +4468,13 @@ mod doc_v1_endpoint_alignment_tests {
     /// (the same truncation pattern as
     /// `collect_axum_route_methods` in
     /// `openapi_route_alignment_tests`).
+    ///
+    /// Assumption: in this file, `#[cfg(test)]` is only used as the
+    /// test-module boundary, never to gate individual production
+    /// `.route(...)` calls (e.g. a debug-only handler). If that ever
+    /// changes, this scanner needs a smarter delimiter, otherwise it
+    /// will silently truncate the production route set at the first
+    /// such guard.
     fn collect_axum_route_paths(source: &str) -> BTreeSet<String> {
         let mut paths = BTreeSet::new();
         for line in source.lines() {
@@ -4468,6 +4491,117 @@ mod doc_v1_endpoint_alignment_tests {
             paths.insert(after[..end].to_owned());
         }
         paths
+    }
+
+    /// Walk the Python OpenAI-compatible worker source and pull
+    /// every `/v1/<segment>` literal it mentions. The worker is the
+    /// single source of truth for the OpenAI-compatible suffixes the
+    /// daemon dials, so this extractor lets the doc-alignment guard
+    /// follow the worker without a parallel const edit here.
+    ///
+    /// Matching rule:
+    ///
+    /// - Anchor on the literal `/v1/` prefix.
+    /// - Walk forward taking lowercase ASCII letters, digits,
+    ///   hyphens, underscores, and internal `/` separators (the same
+    ///   character set the worker uses for its f-string suffixes).
+    /// - Trim a trailing `/` so a stray `/v1/foo/` collapses onto
+    ///   the bare path.
+    /// - Skip any line whose first non-whitespace character is `#`
+    ///   so commented-out URLs (e.g. `# /v1/should-not-be-captured`)
+    ///   never reach the allowlist.
+    fn extract_llm_external_endpoints_from_python_worker(source: &str) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        for line in source.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let mut search = line;
+            while let Some(idx) = search.find("/v1/") {
+                // `/v1/` is 4 ASCII bytes, so slicing past the
+                // matched prefix is safe.
+                let after_v1_slash = &search[idx + 4..];
+                let suffix: String = after_v1_slash
+                    .chars()
+                    .take_while(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '/')
+                    })
+                    .collect();
+                // Step past the full captured token (`/v1/` plus
+                // the suffix we just consumed) so pathological
+                // inputs like `/v1/v1/foo` are not double-counted
+                // by a re-scan of the same suffix. Mirrors the
+                // advancement strategy in
+                // `extract_doc_v1_endpoint_paths` above.
+                search = &after_v1_slash[suffix.len()..];
+                // Require a real first segment that starts with a
+                // lowercase ASCII letter, mirroring how the worker
+                // names its OpenAI-compatible paths
+                // (`chat/completions`, `models`, ...).
+                let Some(first_char) = suffix.chars().next() else {
+                    continue;
+                };
+                if !first_char.is_ascii_lowercase() {
+                    continue;
+                }
+                let cleaned = suffix.trim_end_matches('/');
+                if cleaned.is_empty() {
+                    continue;
+                }
+                paths.insert(format!("/v1/{cleaned}"));
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn extract_llm_external_endpoints_from_python_worker_captures_chat_completions_and_models() {
+        let fixture = "\
+\"\"\"OpenAI-compatible chat completion provider fixture.\"\"\"
+
+
+def resolve_chat_completions_url(endpoint: str) -> str:
+    normalized = endpoint.rstrip(\"/\")
+    if normalized.endswith(\"/v1\"):
+        return f\"{normalized}/chat/completions\"
+    return f\"{normalized}/v1/chat/completions\"
+
+
+def resolve_models_url(endpoint: str) -> str:
+    normalized = endpoint.rstrip(\"/\")
+    if normalized.endswith(\"/v1/chat/completions\"):
+        return normalized.removesuffix(\"/chat/completions\") + \"/models\"
+    return f\"{normalized}/v1/models\"
+
+
+# /v1/should-not-be-captured  -- comment line must be filtered out
+";
+        let paths = extract_llm_external_endpoints_from_python_worker(fixture);
+        assert_eq!(
+            paths,
+            ["/v1/chat/completions", "/v1/models"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "expected only the two real OpenAI-compatible URLs; the `#`-prefixed \
+             comment line `/v1/should-not-be-captured` must be skipped, and the \
+             `removesuffix(\"/chat/completions\") + \"/models\"` branch must not \
+             produce a spurious capture",
+        );
+    }
+
+    #[test]
+    fn extract_llm_external_endpoints_from_python_worker_does_not_double_count_overlapping_v1_segments()
+     {
+        let fixture = "return f\"{normalized}/v1/v1/foo\"\n";
+        let paths = extract_llm_external_endpoints_from_python_worker(fixture);
+        assert_eq!(
+            paths,
+            ["/v1/v1/foo"].iter().map(|s| (*s).to_owned()).collect(),
+            "the loop must step past the full captured token so a \
+             pathological worker URL like `/v1/v1/foo` yields one entry, \
+             not a second `/v1/foo` re-discovered inside the suffix",
+        );
     }
 
     #[test]
@@ -4492,6 +4626,37 @@ mod doc_v1_endpoint_alignment_tests {
             .map(|s| (*s).to_owned())
             .collect(),
             "the bare `/v1/` prefix without a path segment must NOT be captured",
+        );
+    }
+
+    #[test]
+    fn extract_doc_v1_endpoint_paths_captures_uppercase_so_doc_typos_surface_as_violations() {
+        let md = "- See `/v1/Sessions/Dictation` for the live entry.";
+        let paths = extract_doc_v1_endpoint_paths(md);
+        assert_eq!(
+            paths,
+            ["/v1/Sessions/Dictation"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "uppercase characters must be captured verbatim so an \
+             operator-facing typo like `/v1/Sessions/Dictation` \
+             reaches the allowlist comparison and surfaces as a \
+             violation, instead of being silently truncated to \
+             `/v1/` and dropped",
+        );
+    }
+
+    #[test]
+    fn extract_doc_v1_endpoint_paths_does_not_double_count_overlapping_v1_segments() {
+        let md = "`/v1/v1/foo` is a degenerate but legal substring.";
+        let paths = extract_doc_v1_endpoint_paths(md);
+        assert_eq!(
+            paths,
+            ["/v1/v1/foo"].iter().map(|s| (*s).to_owned()).collect(),
+            "the loop must step past the full captured token so a \
+             pathological input like `/v1/v1/foo` yields one entry, \
+             not a second `/v1/foo` re-discovered inside the suffix",
         );
     }
 
@@ -4522,15 +4687,15 @@ mod tests {
 
     /// Every `/v1/<path>` URL the README or any doc mentions must
     /// be either a real daemon route or a known external
-    /// OpenAI-compatible endpoint. The allowlist captures the two
-    /// LLM-side URLs the daemon talks *to* — they live on the
-    /// configured `VOICELAYER_LLM_ENDPOINT` host, not on the
-    /// daemon's UDS, and are documented in
+    /// OpenAI-compatible endpoint. The LLM-side allowlist is
+    /// derived at test time from the Python worker module
+    /// `python/voicelayer_orchestrator/providers/llm_openai_compatible.py`,
+    /// which is the single source of truth for the suffixes the
+    /// daemon dials on the configured `VOICELAYER_LLM_ENDPOINT`
+    /// host. The same URLs are operator-documented in
     /// `docs/guides/local-llm-provider.md`.
     #[test]
     fn every_doc_v1_endpoint_mention_resolves_to_an_axum_route_or_llm_allowlist() {
-        const LLM_EXTERNAL_ENDPOINTS: &[&str] = &["/v1/chat/completions", "/v1/models"];
-
         let manifest = env!("CARGO_MANIFEST_DIR");
         let lib_source = std::fs::read_to_string(format!("{manifest}/src/lib.rs"))
             .expect("read voicelayerd lib.rs");
@@ -4541,29 +4706,25 @@ mod tests {
         );
 
         let repo_root = std::path::PathBuf::from(format!("{manifest}/../.."));
+        let python_worker_path =
+            repo_root.join("python/voicelayer_orchestrator/providers/llm_openai_compatible.py");
+        let python_source = std::fs::read_to_string(&python_worker_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", python_worker_path.display()));
+        let llm_external_endpoints =
+            extract_llm_external_endpoints_from_python_worker(&python_source);
+        assert!(
+            !llm_external_endpoints.is_empty(),
+            "expected at least one /v1/<path> literal in the python worker — \
+             extract_llm_external_endpoints_from_python_worker may be misparsing, \
+             or the worker may have moved to a different file path",
+        );
+
         let mut docs = vec![repo_root.join("README.md")];
-        // Inline mini-walker mirroring the one in
-        // voicelayer-core::domain::tests; that helper is
-        // pub(super) and not reachable from this crate.
-        fn collect_md(
-            start: &std::path::Path,
-            out: &mut Vec<std::path::PathBuf>,
-        ) -> std::io::Result<()> {
-            for entry in std::fs::read_dir(start)? {
-                let entry = entry?;
-                let path = entry.path();
-                if entry.file_type()?.is_dir() {
-                    collect_md(&path, out)?;
-                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    out.push(path);
-                }
-            }
-            Ok(())
-        }
-        collect_md(&repo_root.join("docs"), &mut docs).expect("walk docs/");
+        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
+            .expect("walk docs/");
 
         let mut allowed: BTreeSet<String> = routes;
-        allowed.extend(LLM_EXTERNAL_ENDPOINTS.iter().map(|s| (*s).to_owned()));
+        allowed.extend(llm_external_endpoints);
 
         let mut violations: Vec<String> = Vec::new();
         for doc_path in &docs {
@@ -4590,8 +4751,9 @@ mod tests {
              routes nor on the LLM external-endpoint allowlist:\n  - {}\n\n\
              Either fix the doc URL to match an actual `.route(...)` call in \
              crates/voicelayerd/src/lib.rs, drop the mention, or add the URL \
-             to LLM_EXTERNAL_ENDPOINTS in this test if it is a known \
-             OpenAI-compatible endpoint the daemon talks *to*.",
+             as a `/v1/...` literal in \
+             `python/voicelayer_orchestrator/providers/llm_openai_compatible.py`, \
+             since that file is the single source of truth scanned by this guard.",
             violations.join("\n  - "),
         );
     }

@@ -515,22 +515,6 @@ mod tests {
             keys
         }
 
-        fn collect_markdown_files(
-            start: &std::path::Path,
-            out: &mut Vec<std::path::PathBuf>,
-        ) -> std::io::Result<()> {
-            for entry in std::fs::read_dir(start)? {
-                let entry = entry?;
-                let path = entry.path();
-                if entry.file_type()?.is_dir() {
-                    collect_markdown_files(&path, out)?;
-                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    out.push(path);
-                }
-            }
-            Ok(())
-        }
-
         #[test]
         fn extract_doc_foreground_ptt_config_key_mentions_filters_to_single_segment_keys() {
             let md = "\
@@ -593,7 +577,7 @@ fn elsewhere() {
             );
 
             let mut docs = vec![repo_root.join("README.md")];
-            collect_markdown_files(&repo_root.join("docs"), &mut docs)
+            voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
                 .expect("walk docs/ directory");
 
             let mut violations: Vec<String> = Vec::new();
