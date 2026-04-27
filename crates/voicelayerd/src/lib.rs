@@ -4396,8 +4396,8 @@ mod doc_v1_endpoint_alignment_tests {
     //! operator-facing markdown (the project README plus everything
     //! under `docs/`) resolves to either a real axum route in
     //! `build_app_router` or an external OpenAI-compatible LLM
-    //! endpoint the daemon talks *to* (`/v1/chat/completions`,
-    //! `/v1/models`).
+    //! endpoint the daemon talks *to* (e.g.
+    //! `/v1/chat/completions`, `/v1/models`).
     //!
     //! The drift mode is silent and operator-facing: a doc claims
     //! `POST /v1/sessions/dictation/start` is the right entrypoint
@@ -4405,6 +4405,15 @@ mod doc_v1_endpoint_alignment_tests {
     //! `/sessions/dictation`, the operator copy-pastes the URL into
     //! curl, the daemon returns 404, and the only fix is to read
     //! the actual router source.
+    //!
+    //! The LLM allowlist is no longer a hard-coded const inside
+    //! this test. It is derived at test time from the Python worker
+    //! module
+    //! `python/voicelayer_orchestrator/providers/llm_openai_compatible.py`,
+    //! which is the single source of truth for the OpenAI-compatible
+    //! suffixes the daemon dials. If that worker migrates to a new
+    //! suffix (e.g. `/v1/responses`), the allowlist tracks
+    //! automatically without a parallel edit here.
     //!
     //! Reverse direction (every axum route is mentioned in some
     //! doc) is intentionally not enforced — the openapi document
@@ -4482,6 +4491,101 @@ mod doc_v1_endpoint_alignment_tests {
             paths.insert(after[..end].to_owned());
         }
         paths
+    }
+
+    /// Walk the Python OpenAI-compatible worker source and pull
+    /// every `/v1/<segment>` literal it mentions. The worker is the
+    /// single source of truth for the OpenAI-compatible suffixes the
+    /// daemon dials, so this extractor lets the doc-alignment guard
+    /// follow the worker without a parallel const edit here.
+    ///
+    /// Matching rule:
+    ///
+    /// - Anchor on the literal `/v1/` prefix.
+    /// - Walk forward taking lowercase ASCII letters, digits,
+    ///   hyphens, underscores, and internal `/` separators (the same
+    ///   character set the worker uses for its f-string suffixes).
+    /// - Trim a trailing `/` so a stray `/v1/foo/` collapses onto
+    ///   the bare path.
+    /// - Skip any line whose first non-whitespace character is `#`
+    ///   so commented-out URLs (e.g. `# /v1/should-not-be-captured`)
+    ///   never reach the allowlist.
+    fn extract_llm_external_endpoints_from_python_worker(source: &str) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        for line in source.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let mut search = line;
+            while let Some(idx) = search.find("/v1/") {
+                let after = &search[idx + 1..];
+                let mut chars = after.chars();
+                // Skip the literal `v1/` prefix that we just
+                // matched, then walk the suffix segment.
+                let _ = chars.next(); // 'v'
+                let _ = chars.next(); // '1'
+                let _ = chars.next(); // '/'
+                let first = chars.clone().next();
+                let suffix: String = chars
+                    .take_while(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '/')
+                    })
+                    .collect();
+                search = after;
+                // Require a real first segment that starts with a
+                // lowercase ASCII letter, mirroring how the worker
+                // names its OpenAI-compatible paths
+                // (`chat/completions`, `models`, ...).
+                let Some(first_char) = first else {
+                    continue;
+                };
+                if !first_char.is_ascii_lowercase() {
+                    continue;
+                }
+                let cleaned = suffix.trim_end_matches('/');
+                if cleaned.is_empty() {
+                    continue;
+                }
+                paths.insert(format!("/v1/{cleaned}"));
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn extract_llm_external_endpoints_from_python_worker_captures_chat_completions_and_models() {
+        let fixture = "\
+\"\"\"OpenAI-compatible chat completion provider fixture.\"\"\"
+
+
+def resolve_chat_completions_url(endpoint: str) -> str:
+    normalized = endpoint.rstrip(\"/\")
+    if normalized.endswith(\"/v1\"):
+        return f\"{normalized}/chat/completions\"
+    return f\"{normalized}/v1/chat/completions\"
+
+
+def resolve_models_url(endpoint: str) -> str:
+    normalized = endpoint.rstrip(\"/\")
+    if normalized.endswith(\"/v1/chat/completions\"):
+        return normalized.removesuffix(\"/chat/completions\") + \"/models\"
+    return f\"{normalized}/v1/models\"
+
+
+# /v1/should-not-be-captured  -- comment line must be filtered out
+";
+        let paths = extract_llm_external_endpoints_from_python_worker(fixture);
+        assert_eq!(
+            paths,
+            ["/v1/chat/completions", "/v1/models"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "expected only the two real OpenAI-compatible URLs; the `#`-prefixed \
+             comment line `/v1/should-not-be-captured` must be skipped, and the \
+             `removesuffix(\"/chat/completions\") + \"/models\"` branch must not \
+             produce a spurious capture",
+        );
     }
 
     #[test]
@@ -4567,15 +4671,15 @@ mod tests {
 
     /// Every `/v1/<path>` URL the README or any doc mentions must
     /// be either a real daemon route or a known external
-    /// OpenAI-compatible endpoint. The allowlist captures the two
-    /// LLM-side URLs the daemon talks *to* — they live on the
-    /// configured `VOICELAYER_LLM_ENDPOINT` host, not on the
-    /// daemon's UDS, and are documented in
+    /// OpenAI-compatible endpoint. The LLM-side allowlist is
+    /// derived at test time from the Python worker module
+    /// `python/voicelayer_orchestrator/providers/llm_openai_compatible.py`,
+    /// which is the single source of truth for the suffixes the
+    /// daemon dials on the configured `VOICELAYER_LLM_ENDPOINT`
+    /// host. The same URLs are operator-documented in
     /// `docs/guides/local-llm-provider.md`.
     #[test]
     fn every_doc_v1_endpoint_mention_resolves_to_an_axum_route_or_llm_allowlist() {
-        const LLM_EXTERNAL_ENDPOINTS: &[&str] = &["/v1/chat/completions", "/v1/models"];
-
         let manifest = env!("CARGO_MANIFEST_DIR");
         let lib_source = std::fs::read_to_string(format!("{manifest}/src/lib.rs"))
             .expect("read voicelayerd lib.rs");
@@ -4586,12 +4690,25 @@ mod tests {
         );
 
         let repo_root = std::path::PathBuf::from(format!("{manifest}/../.."));
+        let python_worker_path =
+            repo_root.join("python/voicelayer_orchestrator/providers/llm_openai_compatible.py");
+        let python_source = std::fs::read_to_string(&python_worker_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", python_worker_path.display()));
+        let llm_external_endpoints =
+            extract_llm_external_endpoints_from_python_worker(&python_source);
+        assert!(
+            !llm_external_endpoints.is_empty(),
+            "expected at least one /v1/<path> literal in the python worker — \
+             extract_llm_external_endpoints_from_python_worker may be misparsing, \
+             or the worker may have moved to a different file path",
+        );
+
         let mut docs = vec![repo_root.join("README.md")];
         voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
             .expect("walk docs/");
 
         let mut allowed: BTreeSet<String> = routes;
-        allowed.extend(LLM_EXTERNAL_ENDPOINTS.iter().map(|s| (*s).to_owned()));
+        allowed.extend(llm_external_endpoints);
 
         let mut violations: Vec<String> = Vec::new();
         for doc_path in &docs {
@@ -4618,8 +4735,9 @@ mod tests {
              routes nor on the LLM external-endpoint allowlist:\n  - {}\n\n\
              Either fix the doc URL to match an actual `.route(...)` call in \
              crates/voicelayerd/src/lib.rs, drop the mention, or add the URL \
-             to LLM_EXTERNAL_ENDPOINTS in this test if it is a known \
-             OpenAI-compatible endpoint the daemon talks *to*.",
+             as a `/v1/...` literal in \
+             `python/voicelayer_orchestrator/providers/llm_openai_compatible.py`, \
+             since that file is the single source of truth scanned by this guard.",
             violations.join("\n  - "),
         );
     }
