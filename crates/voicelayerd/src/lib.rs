@@ -4415,10 +4415,16 @@ mod doc_v1_endpoint_alignment_tests {
 
     /// Walk a Markdown body and pull every `/v1/<path>` URL token.
     /// Anchors on the literal `/v1/` prefix and walks forward
-    /// taking lowercase letters, digits, hyphens, underscores, and
+    /// taking ASCII alphanumerics, hyphens, underscores, and
     /// internal `/` separators. Stops at any other character (a
     /// space, punctuation, backtick, etc.) so trailing prose like
     /// `/v1/health.` (sentence-final period) yields the bare path.
+    ///
+    /// Uppercase letters are intentionally captured (not folded to
+    /// lowercase) so that operator-facing typos such as
+    /// `/v1/Sessions/Dictation` survive extraction and surface as
+    /// allowlist violations downstream, instead of being silently
+    /// truncated at the first uppercase character.
     fn extract_doc_v1_endpoint_paths(contents: &str) -> BTreeSet<String> {
         let mut paths = BTreeSet::new();
         let mut search = contents;
@@ -4426,11 +4432,12 @@ mod doc_v1_endpoint_alignment_tests {
             let after = &search[idx + 1..];
             let token: String = after
                 .chars()
-                .take_while(|c| {
-                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '/')
-                })
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'))
                 .collect();
-            search = after;
+            // Step past the full captured token so pathological
+            // inputs like `/v1/v1/foo` are not double-counted by a
+            // re-scan of the same suffix.
+            search = &after[token.len()..];
             if token.len() <= "v1/".len() {
                 continue;
             }
@@ -4452,6 +4459,13 @@ mod doc_v1_endpoint_alignment_tests {
     /// (the same truncation pattern as
     /// `collect_axum_route_methods` in
     /// `openapi_route_alignment_tests`).
+    ///
+    /// Assumption: in this file, `#[cfg(test)]` is only used as the
+    /// test-module boundary, never to gate individual production
+    /// `.route(...)` calls (e.g. a debug-only handler). If that ever
+    /// changes, this scanner needs a smarter delimiter, otherwise it
+    /// will silently truncate the production route set at the first
+    /// such guard.
     fn collect_axum_route_paths(source: &str) -> BTreeSet<String> {
         let mut paths = BTreeSet::new();
         for line in source.lines() {
@@ -4492,6 +4506,37 @@ mod doc_v1_endpoint_alignment_tests {
             .map(|s| (*s).to_owned())
             .collect(),
             "the bare `/v1/` prefix without a path segment must NOT be captured",
+        );
+    }
+
+    #[test]
+    fn extract_doc_v1_endpoint_paths_captures_uppercase_so_doc_typos_surface_as_violations() {
+        let md = "- See `/v1/Sessions/Dictation` for the live entry.";
+        let paths = extract_doc_v1_endpoint_paths(md);
+        assert_eq!(
+            paths,
+            ["/v1/Sessions/Dictation"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "uppercase characters must be captured verbatim so an \
+             operator-facing typo like `/v1/Sessions/Dictation` \
+             reaches the allowlist comparison and surfaces as a \
+             violation, instead of being silently truncated to \
+             `/v1/` and dropped",
+        );
+    }
+
+    #[test]
+    fn extract_doc_v1_endpoint_paths_does_not_double_count_overlapping_v1_segments() {
+        let md = "`/v1/v1/foo` is a degenerate but legal substring.";
+        let paths = extract_doc_v1_endpoint_paths(md);
+        assert_eq!(
+            paths,
+            ["/v1/v1/foo"].iter().map(|s| (*s).to_owned()).collect(),
+            "the loop must step past the full captured token so a \
+             pathological input like `/v1/v1/foo` yields one entry, \
+             not a second `/v1/foo` re-discovered inside the suffix",
         );
     }
 
