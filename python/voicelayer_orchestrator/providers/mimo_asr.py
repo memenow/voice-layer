@@ -33,12 +33,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from voicelayer_orchestrator.config import MimoAsrConfig
+from voicelayer_orchestrator.config import MimoAsrConfig, load_whisper_vad_config
 from voicelayer_orchestrator.providers import (
     ProviderInvocationError,
     collapse_nonspeech_transcript,
     provider_runtime_dir,
 )
+from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
 
 # Model cache + lock. Keyed by the configuration tuple that determines
 # weight identity (model + tokenizer paths) and inference target
@@ -366,6 +367,33 @@ def transcribe_with_mimo(
             "follow-up `translate` request through the LLM workflow."
         )
 
+    # Optional silero-vad pre-pass. Shares the `VOICELAYER_WHISPER_VAD_*`
+    # env vars with the whisper chain because silero-vad is ASR-backend
+    # agnostic — operators configure it once and both transcribe paths
+    # honor it. Behavior matches the whisper wiring exactly:
+    #
+    # - VAD unconfigured: pass the raw WAV to the model unchanged.
+    # - VAD detects no speech: short-circuit to an empty transcript.
+    #   Skips the (expensive) MiMo cold load and the per-segment
+    #   inference loop, which is the whole reason VAD-on-MiMo is worth
+    #   doing — MiMo can hallucinate transcripts on pure silence.
+    # - VAD raises: log the failure note and fall back to the raw WAV
+    #   so a transient VAD error never makes the transcribe path go
+    #   dark.
+    extra_notes, prepass_audio_path = _apply_vad_prepass_for_mimo(audio_file, environ)
+    if prepass_audio_path is _VAD_EMPTY_SPEECH:
+        return {
+            "text": "",
+            "detected_language": None,
+            "notes": [
+                "VAD detected no speech; MiMo inference was skipped.",
+                *extra_notes,
+            ],
+        }
+    if prepass_audio_path is not None:
+        audio_path = prepass_audio_path
+        audio_file = str(prepass_audio_path)
+
     runtime_dir = provider_runtime_dir(environ) / "mimo"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     duration = _wav_duration_seconds(audio_path)
@@ -412,6 +440,7 @@ def transcribe_with_mimo(
             "Audio was split to mitigate MiMo issue #6 (decoder repetition past "
             "~3 minutes); transcripts were concatenated with a single space."
         )
+    notes.extend(extra_notes)
     if not text:
         notes.append("MiMo-V2.5-ASR returned no speech for this audio.")
 
@@ -428,6 +457,56 @@ def transcribe_with_mimo(
         "detected_language": detected_language,
         "notes": notes,
     }
+
+
+# Module-level sentinel so callers can distinguish "VAD found no speech"
+# from "VAD was not configured". A bare `None` already means "no
+# trimmed file, run on the original audio"; the empty-speech case
+# additionally requires short-circuiting before the MiMo cold load.
+_VAD_EMPTY_SPEECH: Any = object()
+
+
+def _apply_vad_prepass_for_mimo(
+    audio_file: str,
+    environ: Mapping[str, str] | None,
+) -> tuple[list[str], Any]:
+    """Run silero-vad on ``audio_file`` ahead of MiMo inference.
+
+    Returns ``(extra_notes, replacement_audio_path)`` where the second
+    member is one of:
+
+    - ``None`` when VAD is unconfigured or fails (transcribe the raw WAV).
+    - ``_VAD_EMPTY_SPEECH`` when VAD detected no speech (short-circuit).
+    - A :class:`Path` pointing at the trimmed WAV that the caller should
+      hand to MiMo in place of the original.
+
+    Mirrors the whisper-side ``_apply_vad_prepass_if_configured`` so
+    operators see identical pre-pass behavior regardless of which
+    backend they routed to.
+    """
+
+    vad_config = load_whisper_vad_config(environ)
+    if vad_config is None:
+        return [], None
+
+    try:
+        vad_dir = provider_runtime_dir(environ) / "vad"
+        trimmed_path, regions = apply_vad_prepass(audio_file, vad_config, vad_dir)
+    except ProviderInvocationError as exc:
+        return (
+            [f"VAD pre-pass failed, transcribing raw audio with MiMo: {exc}"],
+            None,
+        )
+
+    if not regions:
+        return [], _VAD_EMPTY_SPEECH
+
+    total_sec = sum(end - start for start, end in regions)
+    note = (
+        f"VAD pre-pass kept {len(regions)} speech region(s) "
+        f"({total_sec:.2f}s total) before MiMo inference."
+    )
+    return [note], Path(trimmed_path)
 
 
 def _load_wav_as_tensor(segment_path: Path) -> tuple[Any, int]:
