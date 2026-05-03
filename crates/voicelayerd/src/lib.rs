@@ -3883,61 +3883,20 @@ mod http_api_tests {
         );
     }
 
-    /// Mirror the previous pin for the ad-hoc capture path. POST
-    /// `/v1/dictation/capture` with a non-`None` `provider_id` and
-    /// verify the resulting transcribe call carried the same value.
-    /// `capture_dictation_with_state` is the path the desktop overlay
-    /// and `vl record-transcribe` reach when no live session is in
-    /// flight, so dropping the field here would silently strand the
-    /// operator on whisper for every one-command capture.
-    #[tokio::test]
-    async fn capture_dictation_http_threads_provider_id_into_worker_transcribe() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let log_path = tempdir.path().join("transcribe_calls.jsonl");
-        let worker = mock_worker_command(
-            tempdir.path(),
-            serde_json::json!({
-                "transcribe_map": {},
-                "fail_stems": [],
-                "default_transcribe_text": " capture reply",
-                "transcribe_log_path": log_path.display().to_string(),
-            }),
-        );
-        let state = build_app_state(test_config(worker), fake_successful_spawner);
-        let router = build_app_router(state);
-
-        let request = serde_json::json!({
-            "trigger": "cli",
-            "duration_seconds": 1,
-            "recorder_backend": "pipewire",
-            "translate_to_english": false,
-            "keep_audio": false,
-            "provider_id": "mimo_v2_5_asr",
-        });
-        let (status, _result): (StatusCode, DictationCaptureResult) =
-            post_json(router, "/v1/dictation/capture", request).await;
-        assert_eq!(status, StatusCode::OK);
-
-        let log_contents =
-            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
-        let lines: Vec<&str> = log_contents
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "POST /v1/dictation/capture must drive exactly one transcribe call; \
-             got log: {log_contents:?}",
-        );
-        let entry: serde_json::Value =
-            serde_json::from_str(lines[0]).expect("the single log line is valid json");
-        assert_eq!(
-            entry.get("provider_id").and_then(serde_json::Value::as_str),
-            Some("mimo_v2_5_asr"),
-            "ad-hoc capture must thread provider_id through to the worker; entry: {entry}",
-        );
-    }
+    // The ad-hoc capture happy path (`POST /v1/dictation/capture` with
+    // a non-`None` `provider_id`) is intentionally not pinned with a
+    // mock-worker log here. `capture_dictation_with_state` reaches a
+    // real `pw-record` / `arecord` subprocess via
+    // `recording::record_audio_file`, which is not present on the CI
+    // runner. The provider_id transport itself is a one-line
+    // `request.provider_id.clone()` into `TranscribeRequest` (see
+    // crates/voicelayerd/src/lib.rs around line 985), structurally
+    // identical to the OneShot path that
+    // `oneshot_dictation_http_threads_provider_id_into_worker_transcribe`
+    // already pins end-to-end. The negative pin
+    // `capture_dictation_rejects_unknown_provider_id_before_recording`
+    // covers this endpoint's validation contract without spawning a
+    // real recorder.
 
     /// Pre-flight provider validation: an unknown `provider_id` on
     /// `POST /v1/sessions/dictation` must be rejected with 400 before
