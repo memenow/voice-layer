@@ -53,7 +53,12 @@ The worker implements every required method with real providers:
   `POST /v1/dictation/capture`) and forwards it on every fixed-segment,
   vad-gated speech-unit, and one-shot stop transcribe call, so a
   caller that selects MiMo at session start never silently falls back
-  to whisper for a subset of segments.
+  to whisper for a subset of segments. The silero-vad pre-pass also
+  applies on the MiMo path: when `VOICELAYER_WHISPER_VAD_ENABLED=true`
+  the same trim/short-circuit/fall-back-to-raw-WAV behavior runs
+  before MiMo inference, which avoids paying the cold-load cost on
+  pure-silence captures and prevents MiMo's causal LM from
+  hallucinating transcripts on detected-silence audio.
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.

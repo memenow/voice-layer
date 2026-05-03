@@ -116,10 +116,17 @@ The same path is now exposed through the daemon-side `dictation capture` flow, s
 
 ### Optional silero-vad Pre-pass (Phase 3D)
 
-The Python worker can run a silero-vad pre-pass before handing audio to whisper. When enabled it
-detects speech regions in the captured WAV, concatenates them into a trimmed 16-bit mono WAV, and
-feeds that file to the configured transcription provider. The JSON-RPC `transcribe` contract is
-unchanged — VAD is invisible to the daemon.
+The Python worker can run a silero-vad pre-pass before handing audio to the configured ASR
+backend. When enabled it detects speech regions in the captured WAV, concatenates them into a
+trimmed 16-bit mono WAV, and feeds that file to the transcription provider. The JSON-RPC
+`transcribe` contract is unchanged — VAD is invisible to the daemon.
+
+The pre-pass applies to **both** the default whisper.cpp chain and the optional MiMo-V2.5-ASR
+provider. Silero-vad is ASR-backend agnostic, so the same `VOICELAYER_WHISPER_VAD_*` variables
+control both paths — the `WHISPER_` prefix is a historical artefact from the whisper-only days.
+On the MiMo side the pre-pass also short-circuits inference when no speech is detected, which
+matters more than on whisper because MiMo's causal LM can hallucinate plausible-looking
+transcripts on pure silence.
 
 VAD pulls in `onnxruntime` and `numpy`, which are shipped as the optional `vad` extra to keep the
 default worker stdlib-only. Install the extra once and download a silero-vad ONNX model:

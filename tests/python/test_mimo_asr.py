@@ -26,6 +26,7 @@ if str(PYTHON_ROOT) not in sys.path:
 
 from voicelayer_orchestrator.config import (  # noqa: E402
     MimoAsrConfig,
+    WhisperVadConfig,
     load_mimo_asr_config,
 )
 from voicelayer_orchestrator.providers import (  # noqa: E402
@@ -377,6 +378,204 @@ class TranscribeWithMimoTest(unittest.TestCase):
             self.assertIn("<chinese>", joined_notes)
             self.assertIn("segments processed: 3", joined_notes)
             self.assertIn("issue #6", joined_notes)
+
+
+def _vad_config_sentinel() -> WhisperVadConfig:
+    # `WhisperVadConfig` is a frozen dataclass; populate every required
+    # field with the documented defaults so the sentinel survives the
+    # frozen-dataclass `__init__` validation.
+    return WhisperVadConfig(
+        model_path="/abs/silero.onnx",
+        threshold=0.5,
+        min_speech_ms=250,
+        min_silence_ms=100,
+        speech_pad_ms=30,
+        max_segment_secs=30.0,
+        sample_rate=16_000,
+    )
+
+
+class VadPrepassForMimoTest(unittest.TestCase):
+    """Pin the silero-vad pre-pass wiring on the MiMo path.
+
+    The whisper chain has applied silero-vad before transcribe since
+    `VOICELAYER_WHISPER_VAD_ENABLED=1` was introduced; MiMo now
+    honors the same configuration so an operator who turned the
+    pre-pass on once gets it on both backends. Without these pins,
+    a regression that bypassed `_apply_vad_prepass_for_mimo` would
+    surface only as silent hallucinations on a silent recording —
+    exactly the failure mode VAD-on-MiMo was added to prevent.
+    """
+
+    def _config(self, tmp: pathlib.Path) -> MimoAsrConfig:
+        model = tmp / "model"
+        tokenizer = tmp / "tokenizer"
+        model.mkdir()
+        tokenizer.mkdir()
+        return MimoAsrConfig(
+            model_path=str(model),
+            tokenizer_path=str(tokenizer),
+            repo_path=None,
+            device="cuda:0",
+            audio_tag=None,
+            timeout_seconds=600.0,
+            long_audio_split_seconds=180.0,
+            extra_args=(),
+        )
+
+    def test_vad_unconfigured_passes_raw_audio_to_mimo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            audio = tmp_path / "raw.wav"
+            _write_silent_wav(audio, 1.0)
+            config = self._config(tmp_path)
+
+            inferred: list[pathlib.Path] = []
+
+            def fake_inference(
+                _model: object,
+                segment_path: pathlib.Path,
+                _audio_tag: str | None,
+            ) -> str:
+                inferred.append(segment_path)
+                return "raw transcript"
+
+            with (
+                patch.object(mimo_asr, "load_whisper_vad_config", return_value=None),
+                patch.object(mimo_asr, "_load_mimo_model", return_value=object()),
+                patch.object(mimo_asr, "_run_segment_inference", side_effect=fake_inference),
+            ):
+                result = mimo_asr.transcribe_with_mimo({"audio_file": str(audio)}, config)
+
+            # No VAD config → no trimmed file, no pre-pass note, MiMo
+            # sees the original audio.
+            self.assertEqual(inferred, [audio])
+            self.assertEqual(result["text"], "raw transcript")
+            joined_notes = " | ".join(result["notes"])
+            self.assertNotIn("VAD pre-pass", joined_notes)
+            self.assertNotIn("VAD detected no speech", joined_notes)
+
+    def test_vad_short_circuits_when_no_speech_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            audio = tmp_path / "silent.wav"
+            _write_silent_wav(audio, 1.0)
+            config = self._config(tmp_path)
+
+            with (
+                patch.object(
+                    mimo_asr,
+                    "load_whisper_vad_config",
+                    return_value=_vad_config_sentinel(),
+                ),
+                patch.object(
+                    mimo_asr,
+                    "apply_vad_prepass",
+                    return_value=("/tmp/should-not-be-read.wav", []),
+                ),
+                patch.object(mimo_asr, "_load_mimo_model") as load_model,
+                patch.object(mimo_asr, "_run_segment_inference") as run_inference,
+            ):
+                result = mimo_asr.transcribe_with_mimo({"audio_file": str(audio)}, config)
+
+                # The whole point of the short-circuit is to skip the
+                # MiMo cold load and the per-segment loop. Pin both.
+                load_model.assert_not_called()
+                run_inference.assert_not_called()
+
+            self.assertEqual(result["text"], "")
+            self.assertIsNone(result["detected_language"])
+            joined_notes = " | ".join(result["notes"])
+            self.assertIn("VAD detected no speech", joined_notes)
+            self.assertIn("MiMo inference was skipped", joined_notes)
+
+    def test_vad_trimmed_audio_replaces_input_for_mimo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            raw_audio = tmp_path / "raw.wav"
+            _write_silent_wav(raw_audio, 5.0)
+            trimmed_audio = tmp_path / "raw.vad-trimmed.wav"
+            _write_silent_wav(trimmed_audio, 2.0)
+            config = self._config(tmp_path)
+
+            inferred: list[pathlib.Path] = []
+
+            def fake_inference(
+                _model: object,
+                segment_path: pathlib.Path,
+                _audio_tag: str | None,
+            ) -> str:
+                inferred.append(segment_path)
+                return "trimmed transcript"
+
+            with (
+                patch.object(
+                    mimo_asr,
+                    "load_whisper_vad_config",
+                    return_value=_vad_config_sentinel(),
+                ),
+                patch.object(
+                    mimo_asr,
+                    "apply_vad_prepass",
+                    return_value=(str(trimmed_audio), [(0.5, 1.5), (3.0, 4.5)]),
+                ),
+                patch.object(mimo_asr, "_load_mimo_model", return_value=object()),
+                patch.object(mimo_asr, "_run_segment_inference", side_effect=fake_inference),
+            ):
+                result = mimo_asr.transcribe_with_mimo({"audio_file": str(raw_audio)}, config)
+
+            # The model is invoked on the trimmed audio, not the
+            # original capture; long-audio split runs over the
+            # post-VAD WAV so the segments live under runtime_dir.
+            self.assertEqual(len(inferred), 1)
+            self.assertEqual(inferred[0], trimmed_audio)
+            self.assertEqual(result["text"], "trimmed transcript")
+            joined_notes = " | ".join(result["notes"])
+            self.assertIn("VAD pre-pass kept 2 speech region(s)", joined_notes)
+            # Two regions of 1.0 s + 1.5 s = 2.50 s of detected speech.
+            self.assertIn("2.50s total", joined_notes)
+
+    def test_vad_failure_falls_back_to_raw_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            raw_audio = tmp_path / "raw.wav"
+            _write_silent_wav(raw_audio, 1.0)
+            config = self._config(tmp_path)
+
+            inferred: list[pathlib.Path] = []
+
+            def fake_inference(
+                _model: object,
+                segment_path: pathlib.Path,
+                _audio_tag: str | None,
+            ) -> str:
+                inferred.append(segment_path)
+                return "raw transcript after vad failure"
+
+            with (
+                patch.object(
+                    mimo_asr,
+                    "load_whisper_vad_config",
+                    return_value=_vad_config_sentinel(),
+                ),
+                patch.object(
+                    mimo_asr,
+                    "apply_vad_prepass",
+                    side_effect=ProviderInvocationError("silero-vad onnx import failed"),
+                ),
+                patch.object(mimo_asr, "_load_mimo_model", return_value=object()),
+                patch.object(mimo_asr, "_run_segment_inference", side_effect=fake_inference),
+            ):
+                result = mimo_asr.transcribe_with_mimo({"audio_file": str(raw_audio)}, config)
+
+            # A VAD failure must not make transcribe go dark — the raw
+            # WAV still reaches MiMo, and the failure is preserved as
+            # a transparent note so the operator sees what happened.
+            self.assertEqual(inferred, [raw_audio])
+            self.assertEqual(result["text"], "raw transcript after vad failure")
+            joined_notes = " | ".join(result["notes"])
+            self.assertIn("VAD pre-pass failed", joined_notes)
+            self.assertIn("silero-vad onnx import failed", joined_notes)
 
 
 if __name__ == "__main__":
