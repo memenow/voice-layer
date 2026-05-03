@@ -24,6 +24,7 @@ Callers select MiMo by setting `TranscribeRequest.provider_id =
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 import time
@@ -373,10 +374,27 @@ def transcribe_with_mimo(
 
     model = _load_mimo_model(config)
 
-    transcripts: list[str] = []
-    for segment_path in segments:
-        text = _run_segment_inference(model, segment_path, audio_tag)
-        transcripts.append(text)
+    try:
+        transcripts: list[str] = []
+        for segment_path in segments:
+            text = _run_segment_inference(model, segment_path, audio_tag)
+            transcripts.append(text)
+    finally:
+        # `_split_wav_into_segments` writes per-chunk WAVs into
+        # `runtime_dir/mimo/` to dodge upstream issue #6. The original
+        # audio file is owned by the caller (the dictation pipeline
+        # cleans it up via `keep_audio`), so only delete chunks we
+        # created ourselves. Skipping the cleanup leaks 16 kHz mono
+        # PCM at ~32 KB/s × split-window-secs per long-audio call,
+        # which adds up across a long-running daemon.
+        for segment_path in segments:
+            if segment_path == audio_path:
+                continue
+            # Best-effort cleanup. A leftover chunk in `runtime_dir` is
+            # not worth surfacing as a transcribe failure; the daemon's
+            # restart will sweep the runtime dir anyway.
+            with contextlib.suppress(OSError):
+                segment_path.unlink()
 
     raw_text = " ".join(part for part in transcripts if part).strip()
     text = collapse_nonspeech_transcript(raw_text)
@@ -470,15 +488,30 @@ def _run_segment_inference(
         kwargs["audio_tag"] = audio_tag
     try:
         result = model.asr_sft(wav_tensor, **kwargs)
-    except TypeError:
-        # Older wrapper releases do not accept the audio_tag kwarg;
-        # retry without so the call still goes through.
-        try:
-            result = model.asr_sft(wav_tensor)
-        except Exception as exc:
+    except TypeError as exc:
+        # Older wrapper releases do not accept the `audio_tag` kwarg
+        # and raise `TypeError: ... unexpected keyword argument
+        # 'audio_tag'`. Retry without the kwarg so the call still
+        # goes through. A `TypeError` from anywhere else (e.g., a
+        # tensor-shape mismatch inside the wrapper) is real and must
+        # surface as a provider failure rather than getting silently
+        # swapped for a second untagged retry.
+        message = str(exc)
+        is_audio_tag_arity_error = (
+            audio_tag is not None
+            and "audio_tag" in message
+            and ("unexpected keyword argument" in message or "got an unexpected" in message)
+        )
+        if not is_audio_tag_arity_error:
             raise ProviderInvocationError(
                 f"MiMo-V2.5-ASR inference failed on segment {segment_path.name}: {exc}"
             ) from exc
+        try:
+            result = model.asr_sft(wav_tensor)
+        except Exception as inner_exc:
+            raise ProviderInvocationError(
+                f"MiMo-V2.5-ASR inference failed on segment {segment_path.name}: {inner_exc}"
+            ) from inner_exc
     except Exception as exc:
         raise ProviderInvocationError(
             f"MiMo-V2.5-ASR inference failed on segment {segment_path.name}: {exc}"

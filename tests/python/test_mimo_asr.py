@@ -309,12 +309,19 @@ class TranscribeWithMimoTest(unittest.TestCase):
                 )
 
     def test_dispatches_each_segment_through_loaded_model(self) -> None:
-        # Mock `_load_mimo_model` so we never actually import torch /
-        # flash-attn / Xiaomi's wrapper at test time. The mock returns
-        # a stub whose `asr_sft` records the segment paths and returns
-        # canned text. The transcribe function must concatenate the
-        # per-segment outputs with a single space and surface the
-        # segment count on the notes list.
+        # Mock `_run_segment_inference` so we never actually import
+        # torch / soundfile / Xiaomi's wrapper at test time. The
+        # transcribe function must split the long audio, call the
+        # inference fn once per segment with the correct audio_tag,
+        # concatenate the per-segment outputs with a single space, and
+        # surface the segment count on the notes list.
+        #
+        # The original draft of this test patched `_load_mimo_model`
+        # only and let `_run_segment_inference` execute, which silently
+        # required the `mimo` extra (torch + soundfile) to be installed
+        # in the test environment. Patching at the inference boundary
+        # keeps the default verification chain reliable on a fresh
+        # `uv sync --group dev` install.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
             audio = tmp_path / "long.wav"
@@ -332,24 +339,31 @@ class TranscribeWithMimoTest(unittest.TestCase):
             (tmp_path / "model").mkdir()
             (tmp_path / "tokenizer").mkdir()
 
-            calls: list[tuple[str, dict[str, str]]] = []
+            calls: list[tuple[pathlib.Path, str | None]] = []
 
-            class StubModel:
-                def asr_sft(self, audio_path: str, **kwargs: str) -> str:
-                    calls.append((audio_path, dict(kwargs)))
-                    return f"chunk-{len(calls)}"
+            def fake_inference(
+                _model: object,
+                segment_path: pathlib.Path,
+                audio_tag: str | None,
+            ) -> str:
+                calls.append((segment_path, audio_tag))
+                return f"chunk-{len(calls)}"
 
-            with patch.object(mimo_asr, "_load_mimo_model", return_value=StubModel()):
+            sentinel_model = object()
+            with (
+                patch.object(mimo_asr, "_load_mimo_model", return_value=sentinel_model),
+                patch.object(mimo_asr, "_run_segment_inference", side_effect=fake_inference),
+            ):
                 result = mimo_asr.transcribe_with_mimo(
                     {"audio_file": str(audio), "language": "zh"},
                     config,
                 )
 
             self.assertEqual(len(calls), 3)
-            for _audio_path, kwargs in calls:
+            for _segment_path, audio_tag in calls:
                 # `language=zh` must translate into the wrapper's
                 # `<chinese>` audio_tag.
-                self.assertEqual(kwargs.get("audio_tag"), "<chinese>")
+                self.assertEqual(audio_tag, "<chinese>")
             # The concatenated text uses a single space between
             # chunks and is normalized through the shared decorative
             # transcript collapser.

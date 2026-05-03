@@ -10,8 +10,9 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
+    http::StatusCode,
     response::{
-        IntoResponse, Sse,
+        IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
     routing::{get, post},
@@ -30,9 +31,10 @@ use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
     DictationCaptureResult, DictationFailureKind, EventEnvelope, HealthResponse, InjectRequest,
     InjectionPlan, PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest,
-    SegmentProbeRequest, SegmentProbeResult, SegmentationMode, SessionMode, SessionState,
-    StartDictationRequest, StitchWavSegmentsRequest, StopDictationRequest, TranscribeRequest,
-    TranscriptionResult, TranslateRequest, WorkerHealthSummary, default_host_adapter_catalog,
+    SUPPORTED_TRANSCRIBE_PROVIDER_IDS, SegmentProbeRequest, SegmentProbeResult, SegmentationMode,
+    SessionMode, SessionState, StartDictationRequest, StitchWavSegmentsRequest,
+    StopDictationRequest, TranscribeRequest, TranscriptionResult, TranslateRequest,
+    WorkerHealthSummary, default_host_adapter_catalog, is_supported_transcribe_provider_id,
 };
 
 pub mod hotkeys;
@@ -194,6 +196,66 @@ fn build_app_state(
     })
 }
 
+/// Validate the ASR `provider_id` and the request flag combination
+/// before any audio capture starts. Returns the operator-facing
+/// rejection reason as `Some(detail)` when the id is unknown to the
+/// daemon (typo, advertised-only catalog entry, etc.) or when the
+/// requested combination is documented to fail at the worker
+/// (currently `mimo_v2_5_asr` + `translate_to_english`).
+///
+/// This is the moral equivalent of the worker-side check in
+/// `python/voicelayer_orchestrator/worker.py`'s `transcribe` dispatch,
+/// lifted to the dictation entry points so an operator who fat-fingers
+/// `--provider-id mimo_v2_5` does not waste a full recording before the
+/// stop call surfaces the error from the worker. The supported set
+/// itself lives on `voicelayer_core::SUPPORTED_TRANSCRIBE_PROVIDER_IDS`
+/// so daemon, worker, and OpenAPI all read from the same source.
+fn pre_capture_provider_rejection_detail(
+    provider_id: Option<&str>,
+    translate_to_english: bool,
+) -> Option<String> {
+    if !is_supported_transcribe_provider_id(provider_id) {
+        let id = provider_id.unwrap_or("");
+        return Some(format!(
+            "Unknown ASR provider id `{id}`. Supported ids: {}.",
+            SUPPORTED_TRANSCRIBE_PROVIDER_IDS.join(", "),
+        ));
+    }
+    if matches!(provider_id, Some("mimo_v2_5_asr")) && translate_to_english {
+        return Some(
+            "MiMo-V2.5-ASR does not support translate_to_english today; \
+             run translation through the LLM workflow or pick the default \
+             whisper.cpp provider."
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// HTTP wrapper over `pre_capture_provider_rejection_detail`. Returns
+/// `Some(Response)` when the request must be rejected with a 400 so
+/// the operator sees the same error class regardless of which
+/// dictation entry point they hit; returns `None` when validation
+/// passes. Modelled as `Option<Response>` rather than
+/// `Result<(), Response>` because clippy's `result_large_err` lint
+/// flags the latter (an axum `Response` is ~128 bytes).
+fn dictation_provider_request_rejection(
+    provider_id: Option<&str>,
+    translate_to_english: bool,
+) -> Option<Response> {
+    let message = pre_capture_provider_rejection_detail(provider_id, translate_to_english)?;
+    let error_code = if matches!(provider_id, Some("mimo_v2_5_asr")) && translate_to_english {
+        "translate_to_english_unsupported"
+    } else {
+        "invalid_provider_id"
+    };
+    let body = serde_json::json!({
+        "error": error_code,
+        "message": message,
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
 /// Build the axum router for the `/v1` control API. Shared by
 /// `run_daemon` (which binds it to a Unix listener) and the HTTP-level
 /// tests (which drive it in-process through `tower::ServiceExt`).
@@ -346,7 +408,13 @@ async fn stream_events(
 async fn create_dictation_session(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartDictationRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(rejection) = dictation_provider_request_rejection(
+        request.provider_id.as_deref(),
+        request.translate_to_english,
+    ) {
+        return rejection;
+    }
     let detected_language = request.language_profile.as_ref().and_then(|profile| {
         (profile.input_languages.len() == 1).then(|| profile.input_languages[0].clone())
     });
@@ -506,7 +574,7 @@ async fn create_dictation_session(
         },
     ));
 
-    Json(session)
+    Json(session).into_response()
 }
 
 async fn stop_dictation_session(
@@ -607,8 +675,14 @@ async fn create_transcription(
 async fn capture_dictation(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DictationCaptureRequest>,
-) -> impl IntoResponse {
-    Json(capture_dictation_with_state(state, request).await)
+) -> Response {
+    if let Some(rejection) = dictation_provider_request_rejection(
+        request.provider_id.as_deref(),
+        request.translate_to_english,
+    ) {
+        return rejection;
+    }
+    Json(capture_dictation_with_state(state, request).await).into_response()
 }
 
 async fn plan_injection(Json(request): Json<InjectRequest>) -> impl IntoResponse {
@@ -627,6 +701,29 @@ pub async fn capture_dictation_once(
         request.trigger.clone(),
         request.language_profile.clone().unwrap_or_default(),
     );
+
+    // In-process fallback used by `vl record-transcribe` when no daemon
+    // socket is reachable. The HTTP path returns 4xx for invalid
+    // provider requests via `validate_dictation_provider_request`; this
+    // call site has no HTTP envelope, so surface the same rejection by
+    // short-circuiting before the recorder spawns. Without this, a
+    // typo would still record a full duration and fail at the worker.
+    if let Some(detail) = pre_capture_provider_rejection_detail(
+        request.provider_id.as_deref(),
+        request.translate_to_english,
+    ) {
+        let session = transition_session_state(session, SessionState::Failed);
+        return DictationCaptureResult {
+            session,
+            transcription: TranscriptionResult {
+                text: String::new(),
+                detected_language: None,
+                notes: vec![detail],
+            },
+            audio_file: None,
+            failure_kind: Some(DictationFailureKind::AsrFailed),
+        };
+    }
 
     let mut session = transition_session_state(session, SessionState::Listening);
     let audio_file = temp_audio_path();
@@ -3839,6 +3936,142 @@ mod http_api_tests {
             entry.get("provider_id").and_then(serde_json::Value::as_str),
             Some("mimo_v2_5_asr"),
             "ad-hoc capture must thread provider_id through to the worker; entry: {entry}",
+        );
+    }
+
+    /// Pre-flight provider validation: an unknown `provider_id` on
+    /// `POST /v1/sessions/dictation` must be rejected with 400 before
+    /// the recorder spawns. Without this guard, an operator who
+    /// mistypes `--provider-id mimo_v2_5` (missing `_asr`) would
+    /// successfully start a listening session, record audio for the
+    /// full duration, and only see the failure when stop reaches the
+    /// worker — wasting the entire capture.
+    #[tokio::test]
+    async fn create_dictation_session_rejects_unknown_provider_id_before_recording() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "segmentation": {"mode": "one_shot"},
+            "provider_id": "mimo_v2_5",
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/sessions/dictation", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown provider_id must surface as 400 before recording starts; got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("invalid_provider_id"),
+            "rejection error code must classify the failure; got body: {body}",
+        );
+        // No transcribe call should have reached the worker — the
+        // request was rejected before any audio was captured.
+        assert!(
+            !log_path.exists()
+                || std::fs::read_to_string(&log_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "no transcribe call should fire when the request is rejected at the entry point",
+        );
+    }
+
+    /// Pre-flight provider validation: `mimo_v2_5_asr` does not
+    /// support `translate_to_english`. The worker would surface the
+    /// limitation, but only after recording — fail at request time
+    /// instead so the operator never wastes capture on a flag combo
+    /// that is documented to fail.
+    #[tokio::test]
+    async fn create_dictation_session_rejects_mimo_with_translate_to_english() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "segmentation": {"mode": "one_shot"},
+            "provider_id": "mimo_v2_5_asr",
+            "translate_to_english": true,
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/sessions/dictation", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "mimo_v2_5_asr + translate_to_english must surface as 400; got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("translate_to_english_unsupported"),
+            "rejection error code must classify the failure; got body: {body}",
+        );
+    }
+
+    /// Same pre-flight on the ad-hoc capture path: `POST
+    /// /v1/dictation/capture` rejects an unknown provider_id before
+    /// the recorder spawns. Mirrors the
+    /// `create_dictation_session_rejects_unknown_provider_id_before_recording`
+    /// pin one layer up, since the desktop overlay and `vl
+    /// record-transcribe` reach this endpoint when no live session is
+    /// in flight.
+    #[tokio::test]
+    async fn capture_dictation_rejects_unknown_provider_id_before_recording() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "duration_seconds": 1,
+            "recorder_backend": "pipewire",
+            "translate_to_english": false,
+            "keep_audio": false,
+            "provider_id": "voxtral_realtime",
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/dictation/capture", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "advertised-only catalog id (voxtral_realtime) must be rejected at the entry point; \
+             got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("invalid_provider_id"),
+        );
+        assert!(
+            !log_path.exists()
+                || std::fs::read_to_string(&log_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "no transcribe call should fire on a rejected capture request",
         );
     }
 
