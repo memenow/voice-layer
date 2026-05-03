@@ -20,6 +20,28 @@ pub struct ProviderDescriptor {
     pub license: String,
 }
 
+/// ASR provider ids the daemon and Python worker can actually dispatch
+/// at runtime. The catalog returned by `default_provider_catalog` may
+/// list additional advertised-only entries (e.g., `voxtral_realtime`)
+/// that lack a transcribe handler today; routing a session to one of
+/// those would surface as a worker-side `provider unavailable` only
+/// after audio capture, so the daemon's pre-flight validation is keyed
+/// off this narrower set instead of the catalog.
+///
+/// Keep in sync with `python/voicelayer_orchestrator/worker.py` and the
+/// `provider_id` enum in `openapi/voicelayerd.v1.yaml`.
+pub const SUPPORTED_TRANSCRIBE_PROVIDER_IDS: &[&str] = &["whisper_cpp", "mimo_v2_5_asr"];
+
+/// Return whether `provider_id` is a runtime-dispatchable ASR id.
+/// `None` (the default) is always accepted; the daemon falls back to
+/// the configured whisper.cpp chain.
+pub fn is_supported_transcribe_provider_id(provider_id: Option<&str>) -> bool {
+    match provider_id {
+        None => true,
+        Some(id) => SUPPORTED_TRANSCRIBE_PROVIDER_IDS.contains(&id),
+    }
+}
+
 pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
     vec![
         ProviderDescriptor {
@@ -39,6 +61,15 @@ pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
             default_enabled: false,
             experimental: true,
             license: "Apache-2.0".to_owned(),
+        },
+        ProviderDescriptor {
+            id: "mimo_v2_5_asr".to_owned(),
+            kind: ProviderKind::Asr,
+            transport: "stdio_worker".to_owned(),
+            local: true,
+            default_enabled: false,
+            experimental: true,
+            license: "MIT".to_owned(),
         },
         ProviderDescriptor {
             id: "gemma_4_local".to_owned(),
@@ -86,7 +117,10 @@ pub fn default_host_adapter_catalog() -> Vec<ProviderDescriptor> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderKind, default_host_adapter_catalog, default_provider_catalog};
+    use super::{
+        ProviderKind, SUPPORTED_TRANSCRIBE_PROVIDER_IDS, default_host_adapter_catalog,
+        default_provider_catalog, is_supported_transcribe_provider_id,
+    };
 
     #[test]
     fn catalog_contains_required_local_defaults() {
@@ -102,6 +136,25 @@ mod tests {
                 .iter()
                 .any(|provider| provider.kind == ProviderKind::Asr && provider.default_enabled)
         );
+    }
+
+    /// `mimo_v2_5_asr` is the optional GPU-only ASR provider (Xiaomi
+    /// MiMo-V2.5-ASR via the Python worker). It must be advertised in
+    /// the catalog so `vl providers` lists it, but with
+    /// `default_enabled: false` and `experimental: true` so the
+    /// whisper.cpp chain stays the default and operators have to
+    /// explicitly opt in via `TranscribeRequest.provider_id`.
+    #[test]
+    fn catalog_contains_mimo_v2_5_asr_descriptor_as_optional_experimental() {
+        let catalog = default_provider_catalog();
+        let mimo = catalog
+            .iter()
+            .find(|provider| provider.id == "mimo_v2_5_asr")
+            .expect("mimo_v2_5_asr must be present in the default provider catalog");
+        assert_eq!(mimo.kind, ProviderKind::Asr);
+        assert!(!mimo.default_enabled);
+        assert!(mimo.experimental);
+        assert_eq!(mimo.license, "MIT");
     }
 
     #[test]
@@ -194,5 +247,55 @@ mod tests {
                 provider.id,
             );
         }
+    }
+
+    /// `SUPPORTED_TRANSCRIBE_PROVIDER_IDS` is the runtime-dispatchable
+    /// subset of the catalog's ASR entries. Any id added to it must
+    /// show up in the catalog as an `Asr` provider so `vl providers`
+    /// stays in sync with what `transcribe` will actually route to;
+    /// catches a typo'd entry that would always fail validation.
+    #[test]
+    fn every_supported_transcribe_provider_id_appears_in_catalog_as_asr() {
+        let catalog = default_provider_catalog();
+        for id in SUPPORTED_TRANSCRIBE_PROVIDER_IDS {
+            let descriptor = catalog
+                .iter()
+                .find(|provider| provider.id == *id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "SUPPORTED_TRANSCRIBE_PROVIDER_IDS lists `{id}` but the catalog \
+                         does not advertise it; add the descriptor to \
+                         default_provider_catalog or remove the id"
+                    )
+                });
+            assert_eq!(
+                descriptor.kind,
+                ProviderKind::Asr,
+                "SUPPORTED_TRANSCRIBE_PROVIDER_IDS lists `{id}` but the catalog kind is \
+                 {:?}; only Asr providers belong in the transcribe whitelist",
+                descriptor.kind,
+            );
+        }
+    }
+
+    /// `is_supported_transcribe_provider_id` is the validation helper
+    /// the daemon's dictation entry points call to reject typos before
+    /// recording starts. Pin both directions: every supported id is
+    /// accepted, an unknown id is rejected, and `None` is accepted as
+    /// the documented "let the daemon fall back to whisper" default.
+    #[test]
+    fn is_supported_transcribe_provider_id_accepts_listed_ids_and_none() {
+        assert!(is_supported_transcribe_provider_id(None));
+        for id in SUPPORTED_TRANSCRIBE_PROVIDER_IDS {
+            assert!(
+                is_supported_transcribe_provider_id(Some(*id)),
+                "supported id `{id}` must be accepted",
+            );
+        }
+        assert!(!is_supported_transcribe_provider_id(Some("not_a_provider")));
+        assert!(
+            !is_supported_transcribe_provider_id(Some("mimo_v2_5")),
+            "typo-style id (missing `_asr`) must be rejected",
+        );
     }
 }

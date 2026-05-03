@@ -860,6 +860,123 @@ class WhisperServerProviderTest(unittest.TestCase):
         self.assertEqual(response["result"]["text"], "server path")
 
 
+class TranscribeProviderIdRoutingTest(unittest.TestCase):
+    """Pin the per-request `provider_id` selection on `transcribe`.
+
+    Default (no `provider_id`) walks the existing whisper-server →
+    whisper-cli chain; an explicit MiMo id routes to the MiMo backend
+    with no whisper fallback; an unknown id surfaces as
+    `provider unavailable` instead of silently routing anywhere.
+    """
+
+    def test_unknown_provider_id_returns_unavailable_error(self) -> None:
+        # The dispatch layer must not silently route to whisper when
+        # the operator typo'd the provider id; surfacing the error
+        # here is the only way they can discover the typo.
+        response = handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "transcribe",
+                "params": {
+                    "audio_file": "/tmp/whatever.wav",
+                    "provider_id": "definitely_not_a_real_provider",
+                },
+            }
+        )
+        assert response is not None
+        self.assertEqual(response["error"]["code"], PROVIDER_UNAVAILABLE_CODE)
+        self.assertIn("definitely_not_a_real_provider", response["error"]["message"])
+
+    def test_non_string_provider_id_returns_invalid_request(self) -> None:
+        # JSON-RPC 2.0 reserves -32600 for malformed request shapes.
+        # `provider_id` is documented as `Option<String>` on the wire;
+        # a numeric or array value belongs in this bucket so callers
+        # can tell the difference between a typo (-32004) and a
+        # contract violation.
+        from voicelayer_orchestrator.worker import INVALID_REQUEST_CODE
+
+        response = handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 201,
+                "method": "transcribe",
+                "params": {
+                    "audio_file": "/tmp/whatever.wav",
+                    "provider_id": 42,
+                },
+            }
+        )
+        assert response is not None
+        self.assertEqual(response["error"]["code"], INVALID_REQUEST_CODE)
+
+    def test_mimo_provider_id_without_config_returns_unavailable(self) -> None:
+        # `provider_id="mimo_v2_5_asr"` with neither
+        # VOICELAYER_MIMO_MODEL_PATH nor VOICELAYER_MIMO_TOKENIZER_PATH
+        # set must not fall back to whisper. The error message has to
+        # name the missing keys so the operator can fix their env.
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_MIMO_MODEL_PATH": "",
+                "VOICELAYER_MIMO_TOKENIZER_PATH": "",
+                # Guarantee the whisper chain *is* configured so a
+                # silent fallback would produce a result instead of an
+                # error and the test would catch the regression.
+                "VOICELAYER_WHISPER_BIN": "/bin/sh",
+                "VOICELAYER_WHISPER_MODEL_PATH": "/tmp/does-not-matter.bin",
+            },
+            clear=False,
+        ):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 202,
+                    "method": "transcribe",
+                    "params": {
+                        "audio_file": "/tmp/whatever.wav",
+                        "provider_id": "mimo_v2_5_asr",
+                    },
+                }
+            )
+        assert response is not None
+        self.assertEqual(response["error"]["code"], PROVIDER_UNAVAILABLE_CODE)
+        self.assertIn("VOICELAYER_MIMO_MODEL_PATH", response["error"]["message"])
+
+    def test_explicit_whisper_cpp_provider_id_still_routes_to_whisper(self) -> None:
+        # Explicit `provider_id="whisper_cpp"` is identical to the
+        # default in routing, since whisper is the existing
+        # production path. Validate end-to-end so a future regression
+        # that adds extra branching for the explicit case fails here.
+        script_path, model_path, audio_path = WorkerProtocolTest.create_fake_whisper_cli_script(
+            self
+        )  # type: ignore[arg-type]
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_WHISPER_BIN": script_path,
+                "VOICELAYER_WHISPER_MODEL_PATH": model_path,
+                "VOICELAYER_WHISPER_SERVER_HOST": "",
+                "VOICELAYER_WHISPER_SERVER_PORT": "",
+            },
+            clear=False,
+        ):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 203,
+                    "method": "transcribe",
+                    "params": {
+                        "audio_file": audio_path,
+                        "language": "auto",
+                        "provider_id": "whisper_cpp",
+                    },
+                }
+            )
+        assert response is not None
+        self.assertEqual(response["result"]["text"], "Recognized transcript.")
+
+
 class WhisperTranscribeFallbackTest(FakeOpenAIServerMixin, unittest.TestCase):
     """When whisper-server is unreachable, the dispatcher falls back to whisper-cli."""
 

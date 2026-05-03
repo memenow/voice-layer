@@ -43,6 +43,7 @@ Shipped today:
 - `vl-desktop` GUI overlay that shares the same socket, session state, and event stream as the CLI
 - Real ASR via `whisper.cpp`: one-shot `whisper-cli` plus an optional persistent `whisper-server` endpoint (with autostart) for warm-model reuse
 - Optional silero-vad pre-pass inside the Python worker that trims non-speech before whisper
+- Optional Xiaomi MiMo-V2.5-ASR backend (CUDA-only, opt-in via `provider_id`) for multilingual and quality-priority transcription, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id mimo_v2_5_asr`, `vl record-transcribe --provider-id ...`, `vl dictation foreground-ptt --provider-id ...`); see [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md)
 - Real LLM integration via OpenAI-compatible chat completions, with optional `llama-server` autostart for local endpoints
 - Live Rust↔Python stdio JSON-RPC bridge through the `uv`-managed project environment
 - systemd user units for `voicelayerd` and the optional `whisper-server`, plus `scripts/install.sh`

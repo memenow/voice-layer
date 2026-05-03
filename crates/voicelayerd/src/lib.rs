@@ -10,8 +10,9 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
+    http::StatusCode,
     response::{
-        IntoResponse, Sse,
+        IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
     routing::{get, post},
@@ -30,9 +31,10 @@ use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
     DictationCaptureResult, DictationFailureKind, EventEnvelope, HealthResponse, InjectRequest,
     InjectionPlan, PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest,
-    SegmentProbeRequest, SegmentProbeResult, SegmentationMode, SessionMode, SessionState,
-    StartDictationRequest, StitchWavSegmentsRequest, StopDictationRequest, TranscribeRequest,
-    TranscriptionResult, TranslateRequest, WorkerHealthSummary, default_host_adapter_catalog,
+    SUPPORTED_TRANSCRIBE_PROVIDER_IDS, SegmentProbeRequest, SegmentProbeResult, SegmentationMode,
+    SessionMode, SessionState, StartDictationRequest, StitchWavSegmentsRequest,
+    StopDictationRequest, TranscribeRequest, TranscriptionResult, TranslateRequest,
+    WorkerHealthSummary, default_host_adapter_catalog, is_supported_transcribe_provider_id,
 };
 
 pub mod hotkeys;
@@ -119,6 +121,7 @@ struct OneShotActive {
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+    provider_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -193,6 +196,66 @@ fn build_app_state(
     })
 }
 
+/// Validate the ASR `provider_id` and the request flag combination
+/// before any audio capture starts. Returns the operator-facing
+/// rejection reason as `Some(detail)` when the id is unknown to the
+/// daemon (typo, advertised-only catalog entry, etc.) or when the
+/// requested combination is documented to fail at the worker
+/// (currently `mimo_v2_5_asr` + `translate_to_english`).
+///
+/// This is the moral equivalent of the worker-side check in
+/// `python/voicelayer_orchestrator/worker.py`'s `transcribe` dispatch,
+/// lifted to the dictation entry points so an operator who fat-fingers
+/// `--provider-id mimo_v2_5` does not waste a full recording before the
+/// stop call surfaces the error from the worker. The supported set
+/// itself lives on `voicelayer_core::SUPPORTED_TRANSCRIBE_PROVIDER_IDS`
+/// so daemon, worker, and OpenAPI all read from the same source.
+fn pre_capture_provider_rejection_detail(
+    provider_id: Option<&str>,
+    translate_to_english: bool,
+) -> Option<String> {
+    if !is_supported_transcribe_provider_id(provider_id) {
+        let id = provider_id.unwrap_or("");
+        return Some(format!(
+            "Unknown ASR provider id `{id}`. Supported ids: {}.",
+            SUPPORTED_TRANSCRIBE_PROVIDER_IDS.join(", "),
+        ));
+    }
+    if matches!(provider_id, Some("mimo_v2_5_asr")) && translate_to_english {
+        return Some(
+            "MiMo-V2.5-ASR does not support translate_to_english today; \
+             run translation through the LLM workflow or pick the default \
+             whisper.cpp provider."
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// HTTP wrapper over `pre_capture_provider_rejection_detail`. Returns
+/// `Some(Response)` when the request must be rejected with a 400 so
+/// the operator sees the same error class regardless of which
+/// dictation entry point they hit; returns `None` when validation
+/// passes. Modelled as `Option<Response>` rather than
+/// `Result<(), Response>` because clippy's `result_large_err` lint
+/// flags the latter (an axum `Response` is ~128 bytes).
+fn dictation_provider_request_rejection(
+    provider_id: Option<&str>,
+    translate_to_english: bool,
+) -> Option<Response> {
+    let message = pre_capture_provider_rejection_detail(provider_id, translate_to_english)?;
+    let error_code = if matches!(provider_id, Some("mimo_v2_5_asr")) && translate_to_english {
+        "translate_to_english_unsupported"
+    } else {
+        "invalid_provider_id"
+    };
+    let body = serde_json::json!({
+        "error": error_code,
+        "message": message,
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
 /// Build the axum router for the `/v1` control API. Shared by
 /// `run_daemon` (which binds it to a Unix listener) and the HTTP-level
 /// tests (which drive it in-process through `tower::ServiceExt`).
@@ -231,6 +294,9 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             asr_error: health.asr_error,
             whisper_mode: health.whisper_mode,
             whisper_server_url: health.whisper_server_url,
+            mimo_configured: health.mimo_configured,
+            mimo_model_path: health.mimo_model_path,
+            mimo_error: health.mimo_error,
             llm_configured: health.llm_configured,
             llm_model: health.llm_model,
             llm_endpoint: health.llm_endpoint,
@@ -258,6 +324,9 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             asr_error: None,
             whisper_mode: None,
             whisper_server_url: None,
+            mimo_configured: false,
+            mimo_model_path: None,
+            mimo_error: None,
             message: Some(error.to_string()),
         },
     };
@@ -339,13 +408,20 @@ async fn stream_events(
 async fn create_dictation_session(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartDictationRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(rejection) = dictation_provider_request_rejection(
+        request.provider_id.as_deref(),
+        request.translate_to_english,
+    ) {
+        return rejection;
+    }
     let detected_language = request.language_profile.as_ref().and_then(|profile| {
         (profile.input_languages.len() == 1).then(|| profile.input_languages[0].clone())
     });
     let recorder_backend = request.recorder_backend.unwrap_or(RecorderBackend::Auto);
     let keep_audio = request.keep_audio;
     let translate_to_english = request.translate_to_english;
+    let provider_id = request.provider_id.clone();
     let base_session = CaptureSession::new(
         SessionMode::Dictation,
         request.trigger,
@@ -366,6 +442,7 @@ async fn create_dictation_session(
                             keep_audio,
                             translate_to_english,
                             language: detected_language,
+                            provider_id,
                         }),
                     );
                     session
@@ -394,6 +471,7 @@ async fn create_dictation_session(
                 let sessions = Arc::clone(&state.sessions);
                 let language = detected_language.clone();
                 let session_for_task = session.clone();
+                let provider_id_for_task = provider_id.clone();
                 tokio::spawn(async move {
                     let outcome = run_segmented_dictation_session(
                         session_for_task,
@@ -403,6 +481,7 @@ async fn create_dictation_session(
                         keep_audio,
                         translate_to_english,
                         language,
+                        provider_id_for_task,
                         worker_command,
                         events,
                         sessions,
@@ -449,6 +528,7 @@ async fn create_dictation_session(
                 let sessions = Arc::clone(&state.sessions);
                 let language = detected_language.clone();
                 let session_for_task = session.clone();
+                let provider_id_for_task = provider_id.clone();
                 tokio::spawn(async move {
                     let outcome = run_vad_gated_dictation_session(
                         session_for_task,
@@ -459,6 +539,7 @@ async fn create_dictation_session(
                         keep_audio,
                         translate_to_english,
                         language,
+                        provider_id_for_task,
                         worker_command,
                         events,
                         sessions,
@@ -493,7 +574,7 @@ async fn create_dictation_session(
         },
     ));
 
-    Json(session)
+    Json(session).into_response()
 }
 
 async fn stop_dictation_session(
@@ -594,8 +675,14 @@ async fn create_transcription(
 async fn capture_dictation(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DictationCaptureRequest>,
-) -> impl IntoResponse {
-    Json(capture_dictation_with_state(state, request).await)
+) -> Response {
+    if let Some(rejection) = dictation_provider_request_rejection(
+        request.provider_id.as_deref(),
+        request.translate_to_english,
+    ) {
+        return rejection;
+    }
+    Json(capture_dictation_with_state(state, request).await).into_response()
 }
 
 async fn plan_injection(Json(request): Json<InjectRequest>) -> impl IntoResponse {
@@ -615,6 +702,29 @@ pub async fn capture_dictation_once(
         request.language_profile.clone().unwrap_or_default(),
     );
 
+    // In-process fallback used by `vl record-transcribe` when no daemon
+    // socket is reachable. The HTTP path returns 4xx for invalid
+    // provider requests via `validate_dictation_provider_request`; this
+    // call site has no HTTP envelope, so surface the same rejection by
+    // short-circuiting before the recorder spawns. Without this, a
+    // typo would still record a full duration and fail at the worker.
+    if let Some(detail) = pre_capture_provider_rejection_detail(
+        request.provider_id.as_deref(),
+        request.translate_to_english,
+    ) {
+        let session = transition_session_state(session, SessionState::Failed);
+        return DictationCaptureResult {
+            session,
+            transcription: TranscriptionResult {
+                text: String::new(),
+                detected_language: None,
+                notes: vec![detail],
+            },
+            audio_file: None,
+            failure_kind: Some(DictationFailureKind::AsrFailed),
+        };
+    }
+
     let mut session = transition_session_state(session, SessionState::Listening);
     let audio_file = temp_audio_path();
     let mut failure_kind: Option<DictationFailureKind> = None;
@@ -631,6 +741,7 @@ pub async fn capture_dictation_once(
                     audio_file: audio_file.display().to_string(),
                     language: detected_language,
                     translate_to_english: request.translate_to_english,
+                    provider_id: request.provider_id.clone(),
                 })
                 .await
             {
@@ -758,6 +869,7 @@ async fn stop_oneshot_dictation(
             audio_file: audio_file.display().to_string(),
             language: active.language.clone(),
             translate_to_english: active.translate_to_english,
+            provider_id: active.provider_id.clone(),
         })
         .await
     {
@@ -874,6 +986,7 @@ async fn capture_dictation_with_state(
                     audio_file: audio_file.display().to_string(),
                     language: detected_language.clone(),
                     translate_to_english: request.translate_to_english,
+                    provider_id: request.provider_id.clone(),
                 })
                 .await
             {
@@ -951,6 +1064,7 @@ async fn run_segmented_dictation_session(
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+    provider_id: Option<String>,
     worker_command: worker::WorkerCommand,
     events: broadcast::Sender<EventEnvelope>,
     sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
@@ -1029,6 +1143,7 @@ async fn run_segmented_dictation_session(
                             path,
                             language.clone(),
                             translate_to_english,
+                            provider_id.clone(),
                         );
                     }
                     Ok(None) => {}
@@ -1072,6 +1187,7 @@ async fn run_segmented_dictation_session(
             path,
             language.clone(),
             translate_to_english,
+            provider_id.clone(),
         );
     }
 
@@ -1184,6 +1300,7 @@ async fn run_vad_gated_dictation_session(
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+    provider_id: Option<String>,
     worker_command: worker::WorkerCommand,
     events: broadcast::Sender<EventEnvelope>,
     sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
@@ -1274,6 +1391,7 @@ async fn run_vad_gated_dictation_session(
                                     session_id,
                                     &language,
                                     translate_to_english,
+                                    &provider_id,
                                 )
                                 .await
                                 {
@@ -1295,6 +1413,7 @@ async fn run_vad_gated_dictation_session(
                                     session_id,
                                     &language,
                                     translate_to_english,
+                                    &provider_id,
                                 )
                                 .await
                                 {
@@ -1356,6 +1475,7 @@ async fn run_vad_gated_dictation_session(
             session_id,
             &language,
             translate_to_english,
+            &provider_id,
         )
         .await
         {
@@ -1536,12 +1656,14 @@ fn spawn_segment_transcribe(
     audio_path: PathBuf,
     language: Option<String>,
     translate_to_english: bool,
+    provider_id: Option<String>,
 ) {
     transcribe_tasks.spawn(async move {
         let request = TranscribeRequest {
             audio_file: audio_path.display().to_string(),
             language,
             translate_to_english,
+            provider_id,
         };
         let result = worker_command.transcribe(&request).await;
         let message = match &result {
@@ -1628,6 +1750,7 @@ async fn flush_pending_speech_probes(
     session_id: Uuid,
     language: &Option<String>,
     translate_to_english: bool,
+    provider_id: &Option<String>,
 ) -> Result<(), String> {
     if pending_paths.is_empty() {
         return Ok(());
@@ -1692,6 +1815,7 @@ async fn flush_pending_speech_probes(
         unit_path,
         language.clone(),
         translate_to_english,
+        provider_id.clone(),
     );
 
     Ok(())
@@ -1707,12 +1831,14 @@ fn spawn_speech_unit_transcribe(
     audio_path: PathBuf,
     language: Option<String>,
     translate_to_english: bool,
+    provider_id: Option<String>,
 ) {
     transcribe_tasks.spawn(async move {
         let request = TranscribeRequest {
             audio_file: audio_path.display().to_string(),
             language,
             translate_to_english,
+            provider_id,
         };
         let result = worker_command.transcribe(&request).await;
         let message = match &result {
@@ -2222,6 +2348,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2304,6 +2431,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2363,6 +2491,7 @@ mod segmented_orchestration_tests {
             0,
             true,
             false,
+            None,
             None,
             worker,
             events_tx,
@@ -2435,6 +2564,7 @@ mod segmented_orchestration_tests {
             1,   // silence_gap_probes
             false,
             false,
+            None,
             None,
             worker,
             events_tx,
@@ -2516,6 +2646,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2590,6 +2721,7 @@ mod segmented_orchestration_tests {
             1,
             false,
             false,
+            None,
             None,
             worker,
             events_tx,
@@ -2682,6 +2814,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2769,6 +2902,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2805,6 +2939,162 @@ mod segmented_orchestration_tests {
             "the stitched speech unit must transcribe through to the result; got {:?}",
             result.transcription.text,
         );
+    }
+
+    /// Pin the dictation pipeline's session-level `provider_id` plumbing.
+    /// When the orchestrator is started with a non-`None` provider, every
+    /// fresh transcribe call it spawns — segments captured during the
+    /// session and segments reaped from the recorder's graceful stop —
+    /// must carry the same value into the worker. Without this guarantee
+    /// a session whose operator selected `mimo_v2_5_asr` could silently
+    /// fall back to whisper for any subset of its segments, which is
+    /// exactly the behavior the new flag is meant to rule out.
+    #[tokio::test]
+    async fn segmented_orchestrator_threads_session_provider_id_to_every_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " hello"},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, _events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_segmented_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            0,
+            false,
+            false,
+            None,
+            Some("mimo_v2_5_asr".to_owned()),
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let _result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let provider_ids: Vec<Option<String>> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("each log line is valid json");
+                value
+                    .get("provider_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            !provider_ids.is_empty(),
+            "the orchestrator must drive at least one transcribe call (segment-00000); got log: {log_contents:?}",
+        );
+        for provider_id in &provider_ids {
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "session-level provider_id must be threaded into every transcribe call; \
+                 saw {provider_id:?} in log: {log_contents:?}",
+            );
+        }
+    }
+
+    /// Mirror the segmented pin for the VAD-gated path: the speech-unit
+    /// transcribe spawned after a forced flush must carry the session's
+    /// `provider_id` exactly the same as a fixed-segment transcribe
+    /// would. Without this, an operator who picks `mimo_v2_5_asr` would
+    /// have only the OneShot/Fixed paths actually route to MiMo while
+    /// the VAD-gated path stayed on whisper.
+    #[tokio::test]
+    async fn vad_gated_orchestrator_threads_session_provider_id_to_every_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"unit-00000": " forced flush text"},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, _events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            1,  // probe_secs
+            2,  // max_segment_secs — flushes after two speech probes
+            99, // silence_gap_probes — large enough not to trigger
+            false,
+            false,
+            None,
+            Some("mimo_v2_5_asr".to_owned()),
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        // Let the orchestrator drive a couple of probe-tick cycles so a
+        // forced flush actually fires and the unit transcribe spawns.
+        sleep(Duration::from_millis(2_500)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let _result = timeout(Duration::from_secs(30), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let provider_ids: Vec<Option<String>> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("each log line is valid json");
+                value
+                    .get("provider_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            !provider_ids.is_empty(),
+            "the vad-gated orchestrator must drive at least one transcribe call after a flush; \
+             got log: {log_contents:?}",
+        );
+        for provider_id in &provider_ids {
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "session-level provider_id must be threaded into every speech-unit transcribe; \
+                 saw {provider_id:?} in log: {log_contents:?}",
+            );
+        }
     }
 }
 
@@ -2963,6 +3253,9 @@ mod http_api_tests {
             asr_error: Some(String::new()),
             whisper_mode: Some(String::new()),
             whisper_server_url: Some(String::new()),
+            mimo_configured: false,
+            mimo_model_path: Some(String::new()),
+            mimo_error: Some(String::new()),
             llm_configured: false,
             llm_model: Some(String::new()),
             llm_endpoint: Some(String::new()),
@@ -3068,6 +3361,7 @@ mod http_api_tests {
                 segment_secs: 60,
                 overlap_secs: 0,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3124,6 +3418,7 @@ mod http_api_tests {
                 segment_secs: 0,
                 overlap_secs: 0,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3190,6 +3485,7 @@ mod http_api_tests {
                 max_segment_secs: 120,
                 silence_gap_probes: 1,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3242,6 +3538,7 @@ mod http_api_tests {
                 max_segment_secs: 60,
                 silence_gap_probes: 1,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3317,6 +3614,7 @@ mod http_api_tests {
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         let (_, started): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3379,6 +3677,7 @@ mod http_api_tests {
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         let (post_status, started): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3474,6 +3773,7 @@ mod http_api_tests {
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3509,6 +3809,229 @@ mod http_api_tests {
             "one-shot returns the worker transcript verbatim — unlike the segmented path, no trim is applied because there is only one transcript and no stitching seam where leading whitespace could matter",
         );
         assert_eq!(result.failure_kind, None);
+    }
+
+    /// Pin the HTTP-level wiring for session-level provider selection on
+    /// the one-shot path. POST `/v1/sessions/dictation` with a non-`None`
+    /// `provider_id`, drive the recorder briefly, then POST stop and
+    /// confirm the worker observed the provider id on the resulting
+    /// transcribe call. Without this the operator could set the flag in
+    /// the request and the daemon could silently drop it on the way to
+    /// `stop_oneshot_dictation`'s `TranscribeRequest`, sending whisper
+    /// instead of MiMo.
+    #[tokio::test]
+    async fn oneshot_dictation_http_threads_provider_id_into_worker_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "default_transcribe_text": " oneshot reply",
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::OneShot,
+            provider_id: Some("mimo_v2_5_asr".to_owned()),
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let session_id = session.session_id;
+
+        sleep(Duration::from_millis(50)).await;
+
+        let (status, _result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest { session_id }).expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let lines: Vec<&str> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one-shot stop must drive exactly one transcribe call; got log: {log_contents:?}",
+        );
+        let entry: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("the single log line is valid json");
+        assert_eq!(
+            entry.get("provider_id").and_then(serde_json::Value::as_str),
+            Some("mimo_v2_5_asr"),
+            "session provider_id must reach the worker; entry: {entry}",
+        );
+    }
+
+    // The ad-hoc capture happy path (`POST /v1/dictation/capture` with
+    // a non-`None` `provider_id`) is intentionally not pinned with a
+    // mock-worker log here. `capture_dictation_with_state` reaches a
+    // real `pw-record` / `arecord` subprocess via
+    // `recording::record_audio_file`, which is not present on the CI
+    // runner. The provider_id transport itself is a one-line
+    // `request.provider_id.clone()` into `TranscribeRequest` (see
+    // crates/voicelayerd/src/lib.rs around line 985), structurally
+    // identical to the OneShot path that
+    // `oneshot_dictation_http_threads_provider_id_into_worker_transcribe`
+    // already pins end-to-end. The negative pin
+    // `capture_dictation_rejects_unknown_provider_id_before_recording`
+    // covers this endpoint's validation contract without spawning a
+    // real recorder.
+
+    /// Pre-flight provider validation: an unknown `provider_id` on
+    /// `POST /v1/sessions/dictation` must be rejected with 400 before
+    /// the recorder spawns. Without this guard, an operator who
+    /// mistypes `--provider-id mimo_v2_5` (missing `_asr`) would
+    /// successfully start a listening session, record audio for the
+    /// full duration, and only see the failure when stop reaches the
+    /// worker — wasting the entire capture.
+    #[tokio::test]
+    async fn create_dictation_session_rejects_unknown_provider_id_before_recording() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "segmentation": {"mode": "one_shot"},
+            "provider_id": "mimo_v2_5",
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/sessions/dictation", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown provider_id must surface as 400 before recording starts; got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("invalid_provider_id"),
+            "rejection error code must classify the failure; got body: {body}",
+        );
+        // No transcribe call should have reached the worker — the
+        // request was rejected before any audio was captured.
+        assert!(
+            !log_path.exists()
+                || std::fs::read_to_string(&log_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "no transcribe call should fire when the request is rejected at the entry point",
+        );
+    }
+
+    /// Pre-flight provider validation: `mimo_v2_5_asr` does not
+    /// support `translate_to_english`. The worker would surface the
+    /// limitation, but only after recording — fail at request time
+    /// instead so the operator never wastes capture on a flag combo
+    /// that is documented to fail.
+    #[tokio::test]
+    async fn create_dictation_session_rejects_mimo_with_translate_to_english() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "segmentation": {"mode": "one_shot"},
+            "provider_id": "mimo_v2_5_asr",
+            "translate_to_english": true,
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/sessions/dictation", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "mimo_v2_5_asr + translate_to_english must surface as 400; got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("translate_to_english_unsupported"),
+            "rejection error code must classify the failure; got body: {body}",
+        );
+    }
+
+    /// Same pre-flight on the ad-hoc capture path: `POST
+    /// /v1/dictation/capture` rejects an unknown provider_id before
+    /// the recorder spawns. Mirrors the
+    /// `create_dictation_session_rejects_unknown_provider_id_before_recording`
+    /// pin one layer up, since the desktop overlay and `vl
+    /// record-transcribe` reach this endpoint when no live session is
+    /// in flight.
+    #[tokio::test]
+    async fn capture_dictation_rejects_unknown_provider_id_before_recording() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "duration_seconds": 1,
+            "recorder_backend": "pipewire",
+            "translate_to_english": false,
+            "keep_audio": false,
+            "provider_id": "voxtral_realtime",
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/dictation/capture", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "advertised-only catalog id (voxtral_realtime) must be rejected at the entry point; \
+             got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("invalid_provider_id"),
+        );
+        assert!(
+            !log_path.exists()
+                || std::fs::read_to_string(&log_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "no transcribe call should fire on a rejected capture request",
+        );
     }
 
     #[tokio::test]
@@ -4023,6 +4546,7 @@ mod sse_stream_tests {
                 segment_secs: 60,
                 overlap_secs: 0,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),

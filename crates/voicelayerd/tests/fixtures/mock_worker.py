@@ -67,6 +67,15 @@ up its stem via ``transcribe_map``, and echoes a synthetic payload
 ``health`` and ``list_providers`` return static payloads. Tests do not
 exercise them today, but keeping them here makes the script a drop-in
 replacement for any future probe.
+
+When ``transcribe_log_path`` is set in the config, every ``transcribe``
+call appends a single JSON line to that file capturing the request's
+``audio_file`` basename, the ``provider_id`` field (or null when
+omitted), and the resolved ``language``. Tests use the log to assert
+that the daemon threads ``provider_id`` from a dictation session into
+every transcribe call it issues. The log is opened in append mode so
+concurrent ``cargo test`` runs can each point at their own tempfile
+without trampling each other.
 """
 
 from __future__ import annotations
@@ -88,6 +97,17 @@ def _load_config() -> dict:
 def _transcribe_response(request_id: object, params: dict, config: dict) -> dict:
     audio_path = pathlib.Path(str(params.get("audio_file", "")))
     stem = audio_path.stem
+
+    log_path = config.get("transcribe_log_path")
+    if log_path:
+        record = {
+            "audio_file_stem": stem,
+            "provider_id": params.get("provider_id"),
+            "language": params.get("language"),
+            "translate_to_english": bool(params.get("translate_to_english", False)),
+        }
+        with pathlib.Path(log_path).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
 
     fail_stems = set(config.get("fail_stems", []))
     if stem in fail_stems:
@@ -128,6 +148,9 @@ def _health_response(request_id: object) -> dict:
             "asr_error": None,
             "whisper_mode": "mock",
             "whisper_server_url": None,
+            "mimo_configured": False,
+            "mimo_model_path": None,
+            "mimo_error": None,
             "llm_configured": False,
             "llm_model": None,
             "llm_endpoint": None,

@@ -80,6 +80,7 @@ pub(crate) async fn run_foreground_ptt(
     default_stop_action: StopAction,
     restore_clipboard_on_exit: bool,
     save_dir: Option<PathBuf>,
+    provider_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let foreground_target = resolve_foreground_injection_target(
         tmux_target_pane.clone(),
@@ -254,6 +255,7 @@ pub(crate) async fn run_foreground_ptt(
                         translate_to_english,
                         keep_audio,
                         segmentation: SegmentationMode::default(),
+                        provider_id: provider_id.clone(),
                     };
                     let session: voicelayer_core::CaptureSession =
                         uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request)

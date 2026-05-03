@@ -123,6 +123,8 @@ pub(crate) struct ForegroundPttConfig {
     pub(crate) default_stop_action: StopAction,
     pub(crate) restore_clipboard_on_exit: bool,
     pub(crate) save_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) provider_id: Option<String>,
 }
 
 impl Default for ForegroundPttConfig {
@@ -140,6 +142,7 @@ impl Default for ForegroundPttConfig {
             default_stop_action: StopAction::None,
             restore_clipboard_on_exit: false,
             save_dir: None,
+            provider_id: None,
         }
     }
 }
@@ -187,6 +190,7 @@ const SUPPORTED_CONFIG_KEYS: &[&str] = &[
     "foreground_ptt.default_stop_action",
     "foreground_ptt.restore_clipboard_on_exit",
     "foreground_ptt.save_dir",
+    "foreground_ptt.provider_id",
 ];
 
 pub(crate) fn set_config_value(
@@ -249,6 +253,9 @@ pub(crate) fn set_config_value(
         }
         "foreground_ptt.kitty_match" => {
             config.foreground_ptt.kitty_match = parse_optional_string(value);
+        }
+        "foreground_ptt.provider_id" => {
+            config.foreground_ptt.provider_id = parse_optional_string(value);
         }
         _ => {
             return Err(format!(

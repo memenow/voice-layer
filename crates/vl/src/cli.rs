@@ -69,6 +69,11 @@ enum Command {
         backend: CliRecorderBackend,
         #[arg(long, default_value_t = false)]
         keep_audio: bool,
+        /// ASR provider for the single transcription this capture
+        /// emits. Defaults to the configured whisper.cpp chain when
+        /// omitted.
+        #[arg(long)]
+        provider_id: Option<String>,
     },
     TranscribeFile {
         audio_file: String,
@@ -76,6 +81,10 @@ enum Command {
         language: Option<String>,
         #[arg(long, default_value_t = false)]
         translate_to_english: bool,
+        /// ASR provider for this transcription. Defaults to the
+        /// configured whisper.cpp chain when omitted.
+        #[arg(long)]
+        provider_id: Option<String>,
     },
     Preview {
         #[command(subcommand)]
@@ -120,6 +129,11 @@ enum DictationCommand {
         restore_clipboard_on_exit: bool,
         #[arg(long)]
         save_dir: Option<PathBuf>,
+        /// ASR provider for every transcription this PTT loop emits.
+        /// Defaults to the configured whisper.cpp chain when omitted;
+        /// `mimo_v2_5_asr` opts into Xiaomi MiMo-V2.5-ASR.
+        #[arg(long)]
+        provider_id: Option<String>,
     },
     Start {
         #[arg(long)]
@@ -182,6 +196,12 @@ enum DictationCommand {
         /// "print listening session, leave running" behavior.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         duration_seconds: Option<u32>,
+        /// ASR provider for every transcription this session emits.
+        /// Defaults to the configured whisper.cpp chain when omitted.
+        /// Currently accepted values: `whisper_cpp`, `mimo_v2_5_asr`.
+        /// The daemon rejects unknown values rather than falling back.
+        #[arg(long)]
+        provider_id: Option<String>,
     },
     Stop {
         session_id: uuid::Uuid,
@@ -520,6 +540,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 default_stop_action,
                 restore_clipboard_on_exit,
                 save_dir,
+                provider_id,
             } => {
                 let defaults = load_vl_config().unwrap_or_default().foreground_ptt;
                 run_foreground_ptt(
@@ -547,6 +568,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     restore_clipboard_on_exit || defaults.restore_clipboard_on_exit,
                     save_dir.or(defaults.save_dir),
+                    provider_id.or(defaults.provider_id),
                 )
                 .await?;
             }
@@ -562,6 +584,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_segment_secs,
                 silence_gap_probes,
                 duration_seconds,
+                provider_id,
             } => {
                 let segmentation = build_segmentation_mode(
                     mode,
@@ -582,6 +605,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     translate_to_english,
                     keep_audio,
                     segmentation,
+                    provider_id,
                 };
                 let session: voicelayer_core::CaptureSession =
                     uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request).await?;
@@ -816,6 +840,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             translate_to_english,
             backend,
             keep_audio,
+            provider_id,
         } => {
             let request = DictationCaptureRequest {
                 trigger: TriggerKind::Cli,
@@ -828,6 +853,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 recorder_backend: Some(backend.into()),
                 translate_to_english,
                 keep_audio,
+                provider_id,
             };
             // Prefer the running daemon so recording + transcription
             // inherit its environment (systemd EnvironmentFile) and the
@@ -862,11 +888,13 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             audio_file,
             language,
             translate_to_english,
+            provider_id,
         } => {
             let request = TranscribeRequest {
                 audio_file,
                 language,
                 translate_to_english,
+                provider_id,
             };
             // Prefer the running daemon so the request inherits its (e.g.
             // systemd-provided) environment. Fall back to spawning a
@@ -1357,6 +1385,74 @@ mod tests {
         fn list_parses_with_no_args() {
             try_parse(&["vl", "dictation", "list"])
                 .expect("dictation list must parse with no positional args or flags");
+        }
+
+        /// The `--provider-id` flag is the user-facing knob for picking a
+        /// non-default ASR provider (currently `mimo_v2_5_asr`) for an
+        /// entire dictation session. Pin parse-time acceptance so a
+        /// future refactor that drops the flag from the `Start`
+        /// subcommand surfaces at `cargo test` rather than at runtime
+        /// when an operator's PTT loop silently falls back to whisper.
+        #[test]
+        fn start_accepts_provider_id_flag() {
+            let parsed = try_parse(&["vl", "dictation", "start", "--provider-id", "mimo_v2_5_asr"])
+                .expect("dictation start must accept --provider-id mimo_v2_5_asr");
+            let provider_id = match parsed.command {
+                super::super::Command::Dictation {
+                    command: super::super::DictationCommand::Start { provider_id, .. },
+                } => provider_id,
+                other => panic!("expected dictation start, got {other:?}"),
+            };
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "--provider-id mimo_v2_5_asr must round-trip into the parsed Start variant",
+            );
+        }
+
+        #[test]
+        fn record_transcribe_accepts_provider_id_flag() {
+            let parsed = try_parse(&[
+                "vl",
+                "record-transcribe",
+                "--duration-seconds",
+                "5",
+                "--provider-id",
+                "mimo_v2_5_asr",
+            ])
+            .expect("record-transcribe must accept --provider-id mimo_v2_5_asr");
+            let provider_id = match parsed.command {
+                super::super::Command::RecordTranscribe { provider_id, .. } => provider_id,
+                other => panic!("expected record-transcribe, got {other:?}"),
+            };
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "--provider-id mimo_v2_5_asr must round-trip into RecordTranscribe",
+            );
+        }
+
+        #[test]
+        fn foreground_ptt_accepts_provider_id_flag() {
+            let parsed = try_parse(&[
+                "vl",
+                "dictation",
+                "foreground-ptt",
+                "--provider-id",
+                "mimo_v2_5_asr",
+            ])
+            .expect("foreground-ptt must accept --provider-id mimo_v2_5_asr");
+            let provider_id = match parsed.command {
+                super::super::Command::Dictation {
+                    command: super::super::DictationCommand::ForegroundPtt { provider_id, .. },
+                } => provider_id,
+                other => panic!("expected dictation foreground-ptt, got {other:?}"),
+            };
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "--provider-id mimo_v2_5_asr must round-trip into ForegroundPtt",
+            );
         }
 
         /// `vl --version` is the binary's "what release am I running?"

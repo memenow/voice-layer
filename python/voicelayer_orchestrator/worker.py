@@ -8,6 +8,7 @@ from typing import Any, TextIO
 
 from voicelayer_orchestrator.config import (
     load_llm_provider_config,
+    load_mimo_asr_config,
     load_whisper_provider_config,
     load_whisper_server_config,
     load_whisper_vad_config,
@@ -25,6 +26,10 @@ from voicelayer_orchestrator.providers.llm_openai_compatible import (
     build_rewrite_payload,
     build_translate_payload,
 )
+from voicelayer_orchestrator.providers.mimo_asr import (
+    transcribe_with_mimo,
+    validate_mimo_provider,
+)
 from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass, probe_audio_file
 from voicelayer_orchestrator.providers.whisper_cli import (
     transcribe_with_whisper_cli,
@@ -36,6 +41,11 @@ from voicelayer_orchestrator.providers.whisper_server import (
     transcribe_with_whisper_server,
     validate_autostart_prerequisites,
 )
+
+# Provider id selecting the Xiaomi MiMo-V2.5-ASR backend on the
+# `transcribe` JSON-RPC method. Whisper.cpp remains the default.
+MIMO_PROVIDER_ID = "mimo_v2_5_asr"
+WHISPER_PROVIDER_ID = "whisper_cpp"
 
 PROVIDER_UNAVAILABLE_CODE = -32004
 PROVIDER_REQUEST_FAILED_CODE = -32005
@@ -108,6 +118,8 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         llm_reachable, llm_error = ensure_llm_endpoint(config)
         whisper_config = load_whisper_provider_config()
         whisper_server_config = load_whisper_server_config()
+        mimo_config = load_mimo_asr_config()
+        mimo_configured, mimo_error = validate_mimo_provider(mimo_config)
         asr_configured, asr_error = validate_whisper_provider(whisper_config)
 
         # Report which whisper path the `transcribe` handler would
@@ -156,6 +168,9 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 "whisper_server_url": (
                     whisper_server_config.base_url if whisper_server_config is not None else None
                 ),
+                "mimo_configured": mimo_configured,
+                "mimo_model_path": None if mimo_config is None else mimo_config.model_path,
+                "mimo_error": mimo_error,
                 "llm_configured": config is not None,
                 "llm_model": None if config is None else config.model,
                 "llm_endpoint": None if config is None else config.endpoint,
@@ -168,8 +183,69 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         return make_result(identifier, {"providers": supported_providers()})
 
     if method == "transcribe":
+        # Pop `provider_id` before VAD pre-pass / downstream dispatch so the
+        # request struct handed to whisper-cli or MiMo only carries fields
+        # those providers know about. An explicit `provider_id` selects a
+        # single backend with no fallback; an absent or whisper id walks
+        # the existing whisper-server → whisper-cli chain.
+        request_params = dict(params or {})
+        raw_provider_id = request_params.pop("provider_id", None)
+        provider_id: str | None
+        if raw_provider_id is None:
+            provider_id = None
+        elif isinstance(raw_provider_id, str):
+            stripped = raw_provider_id.strip()
+            provider_id = stripped or None
+        else:
+            return make_error(
+                identifier,
+                INVALID_REQUEST_CODE,
+                "transcribe params.provider_id must be a string when present.",
+                {"method": method},
+            )
+
+        if provider_id is not None and provider_id not in {
+            WHISPER_PROVIDER_ID,
+            MIMO_PROVIDER_ID,
+        }:
+            return make_error(
+                identifier,
+                PROVIDER_UNAVAILABLE_CODE,
+                (
+                    f"Unknown ASR provider id `{provider_id}`. Supported ids: "
+                    f"`{WHISPER_PROVIDER_ID}`, `{MIMO_PROVIDER_ID}`."
+                ),
+                {"method": method},
+            )
+
+        if provider_id == MIMO_PROVIDER_ID:
+            mimo_config = load_mimo_asr_config()
+            if mimo_config is None:
+                return make_error(
+                    identifier,
+                    PROVIDER_UNAVAILABLE_CODE,
+                    (
+                        "MiMo-V2.5-ASR is not configured. Set "
+                        "VOICELAYER_MIMO_MODEL_PATH and "
+                        "VOICELAYER_MIMO_TOKENIZER_PATH (and optionally "
+                        "VOICELAYER_MIMO_REPO_PATH) before requesting "
+                        f"`provider_id={MIMO_PROVIDER_ID}`."
+                    ),
+                    {"method": method},
+                )
+            try:
+                result = transcribe_with_mimo(request_params, mimo_config)
+            except ProviderInvocationError as exc:
+                return make_error(
+                    identifier,
+                    PROVIDER_REQUEST_FAILED_CODE,
+                    str(exc),
+                    {"method": method},
+                )
+            return make_result(identifier, result)
+
         effective_params, extra_notes, short_circuit = _apply_vad_prepass_if_configured(
-            dict(params or {})
+            request_params
         )
         if short_circuit is not None:
             return make_result(identifier, short_circuit)

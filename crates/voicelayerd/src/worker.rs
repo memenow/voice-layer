@@ -246,6 +246,15 @@ pub struct WorkerHealthResult {
     pub whisper_mode: Option<String>,
     #[serde(default)]
     pub whisper_server_url: Option<String>,
+    /// Whether MiMo-V2.5-ASR is configured and validated. Defaults to
+    /// `false` so worker payloads predating the optional MiMo provider
+    /// continue to deserialize.
+    #[serde(default)]
+    pub mimo_configured: bool,
+    #[serde(default)]
+    pub mimo_model_path: Option<String>,
+    #[serde(default)]
+    pub mimo_error: Option<String>,
     pub llm_configured: bool,
     pub llm_model: Option<String>,
     pub llm_endpoint: Option<String>,
@@ -809,6 +818,21 @@ the bullet list above and must not be captured.
                 .iter()
                 .any(|provider| provider.id == "whisper_cpp")
         );
+        // The optional Xiaomi MiMo-V2.5-ASR backend must show up in
+        // the catalog so `vl providers` can list it, but with
+        // `default_enabled=false` and `experimental=true` so callers
+        // know the whisper.cpp chain stays the production default.
+        let mimo = providers
+            .providers
+            .iter()
+            .find(|provider| provider.id == "mimo_v2_5_asr")
+            .expect(
+                "the Python worker must advertise the mimo_v2_5_asr ASR \
+                 provider so operators can opt into it via \
+                 TranscribeRequest.provider_id",
+            );
+        assert!(!mimo.default_enabled);
+        assert!(mimo.experimental);
     }
 
     #[tokio::test]

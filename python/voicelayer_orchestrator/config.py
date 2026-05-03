@@ -80,6 +80,48 @@ class WhisperServerConfig:
         return f"http://{self.host}:{self.port}"
 
 
+@dataclass(frozen=True)
+class MimoAsrConfig:
+    """Configuration for the optional Xiaomi MiMo-V2.5-ASR provider.
+
+    The MiMo-V2.5-ASR model is an 8B-parameter audio-tokens-in /
+    text-tokens-out causal LM that runs through Xiaomi's `MimoAudio`
+    Python wrapper. Inference loads the model into the worker process
+    on first use and keeps it warm for subsequent requests; both the
+    LM weights (`model_path`) and the companion MiMo-Audio-Tokenizer
+    (`tokenizer_path`) are required.
+
+    The wrapper class lives in Xiaomi's source tree and is not
+    distributed as a wheel today. ``repo_path`` is the local checkout
+    of `XiaomiMiMo/MiMo-V2.5-ASR` whose **root** directory is prepended
+    to ``sys.path`` so the upstream-canonical
+    ``from src.mimo_audio.mimo_audio import MimoAudio`` import resolves
+    (the wrapper relies on PEP 420 namespace packages and a relative
+    import into ``src/mimo_audio_tokenizer``, so the parent of ``src``
+    must be importable). Leave it ``None`` only if the wrapper is
+    already importable (e.g., the operator installed it as a
+    pip-editable package).
+
+    Precision is intentionally not exposed: the upstream wrapper
+    hardcodes ``torch_dtype=torch.bfloat16`` when loading the LM, so a
+    ``dtype`` knob would lie about what actually happens. If a future
+    upstream release accepts a dtype kwarg, expose a new env key
+    rather than silently changing the meaning of an old one.
+
+    The provider is opt-in (`TranscribeRequest.provider_id =
+    "mimo_v2_5_asr"`). The whisper.cpp chain remains the default.
+    """
+
+    model_path: str
+    tokenizer_path: str
+    repo_path: str | None
+    device: str
+    audio_tag: str | None
+    timeout_seconds: float
+    long_audio_split_seconds: float
+    extra_args: tuple[str, ...]
+
+
 def load_llm_provider_config(
     environ: Mapping[str, str] | None = None,
 ) -> OpenAICompatibleConfig | None:
@@ -212,4 +254,40 @@ def load_whisper_server_config(
         poll_interval_seconds=float(
             source.get("VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS", "0.5")
         ),
+    )
+
+
+def load_mimo_asr_config(
+    environ: Mapping[str, str] | None = None,
+) -> MimoAsrConfig | None:
+    """Load Xiaomi MiMo-V2.5-ASR provider configuration from the environment.
+
+    Returns ``None`` when either of the two required model paths is
+    missing so callers can treat the provider as "not configured" the
+    same way they treat whisper without surfacing an error.
+    """
+
+    source = environ or os.environ
+    model_path = (source.get("VOICELAYER_MIMO_MODEL_PATH") or "").strip()
+    tokenizer_path = (source.get("VOICELAYER_MIMO_TOKENIZER_PATH") or "").strip()
+    if not model_path or not tokenizer_path:
+        return None
+
+    raw_audio_tag = (source.get("VOICELAYER_MIMO_AUDIO_TAG") or "").strip()
+    audio_tag = raw_audio_tag or None
+
+    raw_repo_path = (source.get("VOICELAYER_MIMO_REPO_PATH") or "").strip()
+    repo_path = raw_repo_path or None
+
+    return MimoAsrConfig(
+        model_path=model_path,
+        tokenizer_path=tokenizer_path,
+        repo_path=repo_path,
+        device=(source.get("VOICELAYER_MIMO_DEVICE") or "cuda:0").strip(),
+        audio_tag=audio_tag,
+        timeout_seconds=float(source.get("VOICELAYER_MIMO_TIMEOUT_SECONDS", "600")),
+        long_audio_split_seconds=float(
+            source.get("VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS", "180")
+        ),
+        extra_args=tuple(shlex.split(source.get("VOICELAYER_MIMO_ARGS", ""))),
     )
