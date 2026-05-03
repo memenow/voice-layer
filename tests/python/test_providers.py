@@ -210,7 +210,7 @@ class SupportedProvidersTest(unittest.TestCase):
     misclassified `kind`).
     """
 
-    def test_includes_two_asr_providers_and_an_llm_when_no_endpoint_configured(
+    def test_includes_three_asr_providers_and_an_llm_when_no_endpoint_configured(
         self,
     ) -> None:
         # Non-empty mapping with no VoiceLayer keys. `supported_providers`
@@ -220,12 +220,60 @@ class SupportedProvidersTest(unittest.TestCase):
         # mapping truthy without supplying any voicelayer config.
         catalog = supported_providers({"_test_marker": "1"})
         ids = {entry["id"] for entry in catalog}
-        self.assertEqual(ids, {"whisper_cpp", "voxtral_realtime", "gemma_4_local"})
+        self.assertEqual(
+            ids,
+            {"whisper_cpp", "voxtral_realtime", "mimo_v2_5_asr", "gemma_4_local"},
+        )
         kinds = {entry["id"]: entry["kind"] for entry in catalog}
         self.assertEqual(
             kinds,
-            {"whisper_cpp": "asr", "voxtral_realtime": "asr", "gemma_4_local": "llm"},
+            {
+                "whisper_cpp": "asr",
+                "voxtral_realtime": "asr",
+                "mimo_v2_5_asr": "asr",
+                "gemma_4_local": "llm",
+            },
         )
+
+    def test_mimo_descriptor_is_optional_and_experimental(self) -> None:
+        # MiMo-V2.5-ASR ships as opt-in: the catalog must advertise it
+        # so `vl providers` can list it, but the descriptor must keep
+        # `default_enabled=false` and `experimental=true` so callers
+        # know the whisper chain remains the production default.
+        catalog = supported_providers({"_test_marker": "1"})
+        mimo = next(entry for entry in catalog if entry["id"] == "mimo_v2_5_asr")
+        self.assertEqual(mimo["kind"], "asr")
+        self.assertEqual(mimo["license"], "MIT")
+        self.assertFalse(mimo["default_enabled"])
+        self.assertTrue(mimo["experimental"])
+        # Without env vars set, the descriptor reports the generic
+        # stdio_worker transport so operators can tell at a glance
+        # whether their environment has the model paths configured.
+        self.assertEqual(mimo["transport"], "stdio_worker")
+
+    def test_mimo_transport_flips_to_in_process_when_paths_configured(
+        self,
+        tmp_path: pathlib.Path = pathlib.Path("."),
+    ) -> None:
+        # Operator wires both VOICELAYER_MIMO_MODEL_PATH and
+        # VOICELAYER_MIMO_TOKENIZER_PATH to existing directories. The
+        # descriptor's `transport` flips to `in_process_torch` so the
+        # operator can confirm at a glance that the worker would route
+        # to the in-process MimoAudio wrapper rather than the legacy
+        # stdio bridge.
+        with tempfile.TemporaryDirectory(prefix="voicelayer-mimo-test-") as tmp:
+            model_dir = pathlib.Path(tmp) / "weights"
+            tokenizer_dir = pathlib.Path(tmp) / "tokenizer"
+            model_dir.mkdir()
+            tokenizer_dir.mkdir()
+            catalog = supported_providers(
+                {
+                    "VOICELAYER_MIMO_MODEL_PATH": str(model_dir),
+                    "VOICELAYER_MIMO_TOKENIZER_PATH": str(tokenizer_dir),
+                }
+            )
+            mimo = next(entry for entry in catalog if entry["id"] == "mimo_v2_5_asr")
+            self.assertEqual(mimo["transport"], "in_process_torch")
 
     def test_replaces_default_llm_with_configured_descriptor_when_endpoint_set(
         self,

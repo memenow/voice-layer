@@ -41,6 +41,15 @@ pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
             license: "Apache-2.0".to_owned(),
         },
         ProviderDescriptor {
+            id: "mimo_v2_5_asr".to_owned(),
+            kind: ProviderKind::Asr,
+            transport: "stdio_worker".to_owned(),
+            local: true,
+            default_enabled: false,
+            experimental: true,
+            license: "MIT".to_owned(),
+        },
+        ProviderDescriptor {
             id: "gemma_4_local".to_owned(),
             kind: ProviderKind::Llm,
             transport: "local_process".to_owned(),
@@ -102,6 +111,25 @@ mod tests {
                 .iter()
                 .any(|provider| provider.kind == ProviderKind::Asr && provider.default_enabled)
         );
+    }
+
+    /// `mimo_v2_5_asr` is the optional GPU-only ASR provider (Xiaomi
+    /// MiMo-V2.5-ASR via the Python worker). It must be advertised in
+    /// the catalog so `vl providers` lists it, but with
+    /// `default_enabled: false` and `experimental: true` so the
+    /// whisper.cpp chain stays the default and operators have to
+    /// explicitly opt in via `TranscribeRequest.provider_id`.
+    #[test]
+    fn catalog_contains_mimo_v2_5_asr_descriptor_as_optional_experimental() {
+        let catalog = default_provider_catalog();
+        let mimo = catalog
+            .iter()
+            .find(|provider| provider.id == "mimo_v2_5_asr")
+            .expect("mimo_v2_5_asr must be present in the default provider catalog");
+        assert_eq!(mimo.kind, ProviderKind::Asr);
+        assert!(!mimo.default_enabled);
+        assert!(mimo.experimental);
+        assert_eq!(mimo.license, "MIT");
     }
 
     #[test]

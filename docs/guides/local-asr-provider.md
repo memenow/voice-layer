@@ -210,6 +210,164 @@ requests but every probe falls back to "speech". Silence-triggered flushes never
 buffered-duration cap, not `probe_secs`. Configure VAD properly before relying on the gating
 to bound transcribe inputs.
 
+## MiMo-V2.5-ASR (optional GPU provider)
+
+The whisper.cpp chain above is the default ASR backend and is intentionally CPU-friendly.
+For multilingual or quality-priority workflows, VoiceLayer ships an opt-in Xiaomi MiMo-V2.5-ASR
+provider that the worker selects when callers send
+`TranscribeRequest.provider_id = "mimo_v2_5_asr"`. The whisper chain remains the default for any
+request that omits `provider_id`.
+
+### What you get
+
+- Native multilingual recognition: zh / en / yue / wuu / nan / Sichuanese, plus zh-en code-switch.
+- Significantly better quality than whisper-large-v3 on the maintainer-published benchmarks.
+- Lower-latency on a single CUDA GPU once the model is warm; **higher** absolute latency than
+  whisper.cpp on the same hardware because MiMo decodes a full causal LM per utterance with no
+  streaming.
+
+### What you give up
+
+- CUDA-only inference today. The audio tokenizer hardcodes
+  `from flash_attn import flash_attn_varlen_func`, so flash-attn is a hard runtime
+  requirement (not just the recommended optimisation the model card implies).
+- ~16 GB VRAM minimum at bf16 (model weights are ~15 GB on disk).
+- No streaming, no partial hypotheses, no timestamps.
+- Upstream issue #6 reports decoder repetition on continuous audio past ~3 minutes; the worker
+  splits inputs at 180 s by default to avoid the regime.
+- First-call cold start is on the order of tens of seconds while the wrapper loads weights into
+  VRAM. Subsequent calls reuse the cached instance for the worker's lifetime.
+
+### One-time setup
+
+```bash
+# 1. Install torch + torchaudio from the PyTorch index that matches your GPU compute
+#    capability. Use cu128 for Blackwell (RTX 50 series, sm_120); cu126 / cu124 for
+#    Hopper / Ada (sm_90 / sm_89). Pin to torch 2.10 because that is the latest version
+#    Dao-AILab ships a prebuilt flash-attn wheel for; jumping to torch 2.11+ lands you on
+#    a flash-attn source build that needs nvcc plus a long compile.
+uv sync --group dev
+uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+  "torch==2.10.0" "torchaudio==2.10.0"
+
+# 2. Install the rest of the wrapper-side runtime from PyPI.
+uv pip install -e ".[mimo]"
+
+# 3. Install flash-attn from the matching Dao-AILab GitHub wheel. There is no PyPI binary;
+#    the source build needs nvcc and ~1 hour of compute, so prefer the prebuilt wheel.
+#    Match the cxx11abi flag (TRUE on modern Linux), the torch version line (2.10), the
+#    Python version (cp312), and the platform (linux_x86_64). Update the URL to a newer
+#    flash-attn release once one ships a torch 2.11+ wheel; until then this combination
+#    is the working pin.
+uv pip install \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+
+# 4. Download both model artifacts. The audio tokenizer is mandatory; the LM weights alone
+#    will not transcribe. The new `hf` CLI replaces the deprecated `huggingface-cli`.
+hf download XiaomiMiMo/MiMo-V2.5-ASR \
+  --local-dir ~/.cache/voicelayer/models/mimo-v2.5-asr
+hf download XiaomiMiMo/MiMo-Audio-Tokenizer \
+  --local-dir ~/.cache/voicelayer/models/mimo-audio-tokenizer
+
+# 5. Clone Xiaomi's source tree to expose the `MimoAudio` wrapper class. There is no published
+#    wheel today; VoiceLayer prepends the repo root to sys.path so the upstream-canonical
+#    `from src.mimo_audio.mimo_audio import MimoAudio` import resolves on first transcribe.
+git clone https://github.com/XiaomiMiMo/MiMo-V2.5-ASR.git \
+  ~/.cache/voicelayer/sources/MiMo-V2.5-ASR
+```
+
+### Environment variables
+
+```bash
+VOICELAYER_MIMO_MODEL_PATH=/abs/path/to/MiMo-V2.5-ASR
+VOICELAYER_MIMO_TOKENIZER_PATH=/abs/path/to/MiMo-Audio-Tokenizer
+VOICELAYER_MIMO_REPO_PATH=/abs/path/to/MiMo-V2.5-ASR-source-checkout
+VOICELAYER_MIMO_DEVICE=cuda:0
+VOICELAYER_MIMO_AUDIO_TAG=
+VOICELAYER_MIMO_TIMEOUT_SECONDS=600
+VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS=180
+VOICELAYER_MIMO_ARGS=
+```
+
+The two required keys are `VOICELAYER_MIMO_MODEL_PATH` and `VOICELAYER_MIMO_TOKENIZER_PATH`. Set
+`VOICELAYER_MIMO_REPO_PATH` until the wrapper class becomes pip-installable. Precision is
+intentionally not exposed here: the upstream wrapper hardcodes `torch_dtype=torch.bfloat16`,
+so a `dtype` knob would lie about what actually happens. Leave `VOICELAYER_MIMO_AUDIO_TAG`
+empty to let MiMo auto-detect the language; explicit values are `<chinese>` and `<english>`.
+The worker also auto-translates the request `language` field (`zh`, `zh-cn`, `yue`, `en`,
+`en-us`, ...) into the matching tag at dispatch time.
+
+### Select the provider per request
+
+```bash
+SOCKET="${XDG_RUNTIME_DIR:-/run/user/$UID}/voicelayer/daemon.sock"
+
+curl --unix-socket "$SOCKET" -s -X POST http://d/v1/transcriptions \
+  -H 'content-type: application/json' \
+  -d '{"audio_file":"/abs/path/sample-zh.wav","provider_id":"mimo_v2_5_asr","language":"zh"}'
+```
+
+`vl doctor` reports `mimo_configured` / `mimo_error` once the env vars are set, and
+`vl providers` lists the new descriptor as `mimo_v2_5_asr` with `experimental=true,
+default_enabled=false` so the whisper.cpp chain remains the default.
+
+### Select the provider per dictation session
+
+`provider_id` is also a session-level knob on the dictation endpoints. The daemon stores it
+on the active session at `POST /v1/sessions/dictation` (or `POST /v1/dictation/capture`) and
+forwards the same value on every transcribe call the session emits — the OneShot stop call,
+each fixed-mode segment, each VAD-gated speech unit, and the ad-hoc capture path. Selecting
+MiMo at session start therefore opts the entire session into MiMo with no risk of a partial
+fallback to whisper. The CLI surfaces the same flag on the Start, RecordTranscribe,
+TranscribeFile, and ForegroundPtt commands:
+
+```bash
+# Live segmented dictation backed entirely by MiMo
+cargo run -p vl -- dictation start \
+  --mode fixed \
+  --segment-secs 8 \
+  --provider-id mimo_v2_5_asr
+
+# One-command record + capture + transcribe through MiMo
+cargo run -p vl -- record-transcribe \
+  --duration-seconds 8 \
+  --provider-id mimo_v2_5_asr
+
+# Foreground PTT TUI loop pinned to MiMo for every press-release cycle
+cargo run -p vl -- dictation foreground-ptt \
+  --provider-id mimo_v2_5_asr
+```
+
+The PTT default can be persisted in `~/.config/voicelayer/config.toml`:
+
+```bash
+vl config set foreground_ptt.provider_id mimo_v2_5_asr
+```
+
+An unrecognized `provider_id` surfaces as `provider unavailable` rather than falling back to
+whisper, so a typo or missing optional dependency is loud at the first transcribe rather than
+silently degraded across the session.
+
+### Trade-off summary
+
+| Backend | Cold load | Latency (warm) | Languages | Hardware | Streaming |
+| --- | --- | --- | --- | --- | --- |
+| `whisper_cpp` (server) | seconds (mmapped ggml) | ~0.65 s / call (base.en, CPU) | en (base.en) or multilingual (large-v3) | CPU sufficient | No |
+| `mimo_v2_5_asr` | ~30 s (LM + audio tokenizer into VRAM) | ~0.27 s / 3 s clip (RTX 5090, cu128, flash-attn 2.8.1) | zh / en / yue / wuu / nan / sc / mixed | CUDA, ~16 GB VRAM | No |
+
+The MiMo warm-call number above was measured on the maintainer's reference workstation against
+the 3-second silent fixture; expect a similar order of magnitude for short utterances and
+linear growth with longer audio.
+
+When in doubt, keep dictation on whisper for short PTT bursts (lower cold-load + warm
+latency) and route long-form / multilingual / quality-priority captures through MiMo by
+passing `--provider-id mimo_v2_5_asr` to the relevant CLI command or by setting it on the
+HTTP request body.
+
+The provider lives at `python/voicelayer_orchestrator/providers/mimo_asr.py` (lazy-loaded model
+cache + per-segment dispatch); long-audio splitting is performed in-process via the stdlib
+`wave` module to mitigate upstream issue #6.
+
 ## Current Scope
 
 The current ASR integration covers file transcription, short-recording transcription, Phase 3B

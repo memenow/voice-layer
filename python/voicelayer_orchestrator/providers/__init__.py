@@ -12,6 +12,7 @@ from typing import Any
 
 from voicelayer_orchestrator.config import (
     load_llm_provider_config,
+    load_mimo_asr_config,
     load_whisper_provider_config,
 )
 
@@ -168,6 +169,7 @@ def supported_providers(
     )
 
     whisper_config = load_whisper_provider_config(environ)
+    mimo_config = load_mimo_asr_config(environ)
     providers: list[dict[str, Any]] = [
         {
             "id": "whisper_cpp",
@@ -186,6 +188,15 @@ def supported_providers(
             "default_enabled": False,
             "experimental": True,
             "license": "Apache-2.0",
+        },
+        {
+            "id": "mimo_v2_5_asr",
+            "kind": "asr",
+            "transport": ("in_process_torch" if mimo_config is not None else "stdio_worker"),
+            "local": True,
+            "default_enabled": False,
+            "experimental": True,
+            "license": "MIT",
         },
     ]
 

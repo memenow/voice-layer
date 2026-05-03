@@ -41,6 +41,19 @@ The worker implements every required method with real providers:
   before dispatching to whisper, trims non-speech, and short-circuits
   with an empty-transcript response when no speech is detected.
   VAD failure falls back to the raw WAV without losing the request.
+  When the request body sets `provider_id="mimo_v2_5_asr"` and the
+  optional Xiaomi MiMo-V2.5-ASR provider is configured (see
+  `providers/mimo_asr.py` and `VOICELAYER_MIMO_*`), the worker bypasses
+  the whisper chain entirely and dispatches to the MiMo backend; an
+  unknown `provider_id` returns `-32004` rather than silently routing
+  to whisper, and an explicit MiMo failure returns `-32005` without
+  whisper fallback. The same `provider_id` is plumbed through every
+  transcribe call a dictation session emits — the daemon stores it on
+  the active session at `POST /v1/sessions/dictation` (or
+  `POST /v1/dictation/capture`) and forwards it on every fixed-segment,
+  vad-gated speech-unit, and one-shot stop transcribe call, so a
+  caller that selects MiMo at session start never silently falls back
+  to whisper for a subset of segments.
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.
@@ -100,6 +113,11 @@ Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
 - `whisper_cli.py` — validation and invocation of the `whisper-cli` subprocess.
 - `whisper_server.py` — HTTP client, readiness probe, optional autostart, and `/inference`
   multipart encoder for the persistent `whisper-server` path.
+- `mimo_asr.py` — optional Xiaomi MiMo-V2.5-ASR provider. Lazy-loads the `MimoAudio` wrapper
+  on first call and caches it in a module-level dict keyed by `(model_path, tokenizer_path,
+  device, dtype)`. Splits inputs longer than `VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS` into
+  WAV chunks via the stdlib `wave` module so upstream issue #6 (decoder repetition past ~3
+  minutes) does not surface in operator-facing transcripts.
 - `vad_segmenter.py` — optional silero-vad pre-pass (v4 or v5 ONNX) that trims non-speech out of
   the input WAV before transcription, plus `probe_audio_file` for the `segment_probe` RPC that
   backs VAD-gated segmentation. Lazy-imports `numpy` and `onnxruntime` so the `vad` extra stays

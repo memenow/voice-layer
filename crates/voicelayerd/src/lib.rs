@@ -119,6 +119,7 @@ struct OneShotActive {
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+    provider_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -231,6 +232,9 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             asr_error: health.asr_error,
             whisper_mode: health.whisper_mode,
             whisper_server_url: health.whisper_server_url,
+            mimo_configured: health.mimo_configured,
+            mimo_model_path: health.mimo_model_path,
+            mimo_error: health.mimo_error,
             llm_configured: health.llm_configured,
             llm_model: health.llm_model,
             llm_endpoint: health.llm_endpoint,
@@ -258,6 +262,9 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             asr_error: None,
             whisper_mode: None,
             whisper_server_url: None,
+            mimo_configured: false,
+            mimo_model_path: None,
+            mimo_error: None,
             message: Some(error.to_string()),
         },
     };
@@ -346,6 +353,7 @@ async fn create_dictation_session(
     let recorder_backend = request.recorder_backend.unwrap_or(RecorderBackend::Auto);
     let keep_audio = request.keep_audio;
     let translate_to_english = request.translate_to_english;
+    let provider_id = request.provider_id.clone();
     let base_session = CaptureSession::new(
         SessionMode::Dictation,
         request.trigger,
@@ -366,6 +374,7 @@ async fn create_dictation_session(
                             keep_audio,
                             translate_to_english,
                             language: detected_language,
+                            provider_id,
                         }),
                     );
                     session
@@ -394,6 +403,7 @@ async fn create_dictation_session(
                 let sessions = Arc::clone(&state.sessions);
                 let language = detected_language.clone();
                 let session_for_task = session.clone();
+                let provider_id_for_task = provider_id.clone();
                 tokio::spawn(async move {
                     let outcome = run_segmented_dictation_session(
                         session_for_task,
@@ -403,6 +413,7 @@ async fn create_dictation_session(
                         keep_audio,
                         translate_to_english,
                         language,
+                        provider_id_for_task,
                         worker_command,
                         events,
                         sessions,
@@ -449,6 +460,7 @@ async fn create_dictation_session(
                 let sessions = Arc::clone(&state.sessions);
                 let language = detected_language.clone();
                 let session_for_task = session.clone();
+                let provider_id_for_task = provider_id.clone();
                 tokio::spawn(async move {
                     let outcome = run_vad_gated_dictation_session(
                         session_for_task,
@@ -459,6 +471,7 @@ async fn create_dictation_session(
                         keep_audio,
                         translate_to_english,
                         language,
+                        provider_id_for_task,
                         worker_command,
                         events,
                         sessions,
@@ -631,6 +644,7 @@ pub async fn capture_dictation_once(
                     audio_file: audio_file.display().to_string(),
                     language: detected_language,
                     translate_to_english: request.translate_to_english,
+                    provider_id: request.provider_id.clone(),
                 })
                 .await
             {
@@ -758,6 +772,7 @@ async fn stop_oneshot_dictation(
             audio_file: audio_file.display().to_string(),
             language: active.language.clone(),
             translate_to_english: active.translate_to_english,
+            provider_id: active.provider_id.clone(),
         })
         .await
     {
@@ -874,6 +889,7 @@ async fn capture_dictation_with_state(
                     audio_file: audio_file.display().to_string(),
                     language: detected_language.clone(),
                     translate_to_english: request.translate_to_english,
+                    provider_id: request.provider_id.clone(),
                 })
                 .await
             {
@@ -951,6 +967,7 @@ async fn run_segmented_dictation_session(
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+    provider_id: Option<String>,
     worker_command: worker::WorkerCommand,
     events: broadcast::Sender<EventEnvelope>,
     sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
@@ -1029,6 +1046,7 @@ async fn run_segmented_dictation_session(
                             path,
                             language.clone(),
                             translate_to_english,
+                            provider_id.clone(),
                         );
                     }
                     Ok(None) => {}
@@ -1072,6 +1090,7 @@ async fn run_segmented_dictation_session(
             path,
             language.clone(),
             translate_to_english,
+            provider_id.clone(),
         );
     }
 
@@ -1184,6 +1203,7 @@ async fn run_vad_gated_dictation_session(
     keep_audio: bool,
     translate_to_english: bool,
     language: Option<String>,
+    provider_id: Option<String>,
     worker_command: worker::WorkerCommand,
     events: broadcast::Sender<EventEnvelope>,
     sessions: Arc<RwLock<HashMap<String, CaptureSession>>>,
@@ -1274,6 +1294,7 @@ async fn run_vad_gated_dictation_session(
                                     session_id,
                                     &language,
                                     translate_to_english,
+                                    &provider_id,
                                 )
                                 .await
                                 {
@@ -1295,6 +1316,7 @@ async fn run_vad_gated_dictation_session(
                                     session_id,
                                     &language,
                                     translate_to_english,
+                                    &provider_id,
                                 )
                                 .await
                                 {
@@ -1356,6 +1378,7 @@ async fn run_vad_gated_dictation_session(
             session_id,
             &language,
             translate_to_english,
+            &provider_id,
         )
         .await
         {
@@ -1536,12 +1559,14 @@ fn spawn_segment_transcribe(
     audio_path: PathBuf,
     language: Option<String>,
     translate_to_english: bool,
+    provider_id: Option<String>,
 ) {
     transcribe_tasks.spawn(async move {
         let request = TranscribeRequest {
             audio_file: audio_path.display().to_string(),
             language,
             translate_to_english,
+            provider_id,
         };
         let result = worker_command.transcribe(&request).await;
         let message = match &result {
@@ -1628,6 +1653,7 @@ async fn flush_pending_speech_probes(
     session_id: Uuid,
     language: &Option<String>,
     translate_to_english: bool,
+    provider_id: &Option<String>,
 ) -> Result<(), String> {
     if pending_paths.is_empty() {
         return Ok(());
@@ -1692,6 +1718,7 @@ async fn flush_pending_speech_probes(
         unit_path,
         language.clone(),
         translate_to_english,
+        provider_id.clone(),
     );
 
     Ok(())
@@ -1707,12 +1734,14 @@ fn spawn_speech_unit_transcribe(
     audio_path: PathBuf,
     language: Option<String>,
     translate_to_english: bool,
+    provider_id: Option<String>,
 ) {
     transcribe_tasks.spawn(async move {
         let request = TranscribeRequest {
             audio_file: audio_path.display().to_string(),
             language,
             translate_to_english,
+            provider_id,
         };
         let result = worker_command.transcribe(&request).await;
         let message = match &result {
@@ -2222,6 +2251,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2304,6 +2334,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2363,6 +2394,7 @@ mod segmented_orchestration_tests {
             0,
             true,
             false,
+            None,
             None,
             worker,
             events_tx,
@@ -2435,6 +2467,7 @@ mod segmented_orchestration_tests {
             1,   // silence_gap_probes
             false,
             false,
+            None,
             None,
             worker,
             events_tx,
@@ -2516,6 +2549,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2590,6 +2624,7 @@ mod segmented_orchestration_tests {
             1,
             false,
             false,
+            None,
             None,
             worker,
             events_tx,
@@ -2682,6 +2717,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2769,6 +2805,7 @@ mod segmented_orchestration_tests {
             false,
             false,
             None,
+            None,
             worker,
             events_tx,
             Arc::clone(&sessions),
@@ -2805,6 +2842,162 @@ mod segmented_orchestration_tests {
             "the stitched speech unit must transcribe through to the result; got {:?}",
             result.transcription.text,
         );
+    }
+
+    /// Pin the dictation pipeline's session-level `provider_id` plumbing.
+    /// When the orchestrator is started with a non-`None` provider, every
+    /// fresh transcribe call it spawns — segments captured during the
+    /// session and segments reaped from the recorder's graceful stop —
+    /// must carry the same value into the worker. Without this guarantee
+    /// a session whose operator selected `mimo_v2_5_asr` could silently
+    /// fall back to whisper for any subset of its segments, which is
+    /// exactly the behavior the new flag is meant to rule out.
+    #[tokio::test]
+    async fn segmented_orchestrator_threads_session_provider_id_to_every_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"segment-00000": " hello"},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, _events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_segmented_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            60,
+            0,
+            false,
+            false,
+            None,
+            Some("mimo_v2_5_asr".to_owned()),
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let _result = timeout(Duration::from_secs(10), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let provider_ids: Vec<Option<String>> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("each log line is valid json");
+                value
+                    .get("provider_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            !provider_ids.is_empty(),
+            "the orchestrator must drive at least one transcribe call (segment-00000); got log: {log_contents:?}",
+        );
+        for provider_id in &provider_ids {
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "session-level provider_id must be threaded into every transcribe call; \
+                 saw {provider_id:?} in log: {log_contents:?}",
+            );
+        }
+    }
+
+    /// Mirror the segmented pin for the VAD-gated path: the speech-unit
+    /// transcribe spawned after a forced flush must carry the session's
+    /// `provider_id` exactly the same as a fixed-segment transcribe
+    /// would. Without this, an operator who picks `mimo_v2_5_asr` would
+    /// have only the OneShot/Fixed paths actually route to MiMo while
+    /// the VAD-gated path stayed on whisper.
+    #[tokio::test]
+    async fn vad_gated_orchestrator_threads_session_provider_id_to_every_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {"unit-00000": " forced flush text"},
+                "fail_stems": [],
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let session = fresh_dictation_session();
+        let (events_tx, _events_rx) = broadcast::channel(64);
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        let orchestrator = tokio::spawn(run_vad_gated_dictation_session(
+            session,
+            RecorderBackend::Pipewire,
+            1,  // probe_secs
+            2,  // max_segment_secs — flushes after two speech probes
+            99, // silence_gap_probes — large enough not to trigger
+            false,
+            false,
+            None,
+            Some("mimo_v2_5_asr".to_owned()),
+            worker,
+            events_tx,
+            Arc::clone(&sessions),
+            stop_rx,
+            fake_successful_spawner,
+        ));
+
+        // Let the orchestrator drive a couple of probe-tick cycles so a
+        // forced flush actually fires and the unit transcribe spawns.
+        sleep(Duration::from_millis(2_500)).await;
+        stop_tx.send(()).expect("orchestrator listening on stop_rx");
+
+        let _result = timeout(Duration::from_secs(30), orchestrator)
+            .await
+            .expect("orchestrator finished in time")
+            .expect("orchestrator task joined cleanly");
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let provider_ids: Vec<Option<String>> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("each log line is valid json");
+                value
+                    .get("provider_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            !provider_ids.is_empty(),
+            "the vad-gated orchestrator must drive at least one transcribe call after a flush; \
+             got log: {log_contents:?}",
+        );
+        for provider_id in &provider_ids {
+            assert_eq!(
+                provider_id.as_deref(),
+                Some("mimo_v2_5_asr"),
+                "session-level provider_id must be threaded into every speech-unit transcribe; \
+                 saw {provider_id:?} in log: {log_contents:?}",
+            );
+        }
     }
 }
 
@@ -2963,6 +3156,9 @@ mod http_api_tests {
             asr_error: Some(String::new()),
             whisper_mode: Some(String::new()),
             whisper_server_url: Some(String::new()),
+            mimo_configured: false,
+            mimo_model_path: Some(String::new()),
+            mimo_error: Some(String::new()),
             llm_configured: false,
             llm_model: Some(String::new()),
             llm_endpoint: Some(String::new()),
@@ -3068,6 +3264,7 @@ mod http_api_tests {
                 segment_secs: 60,
                 overlap_secs: 0,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3124,6 +3321,7 @@ mod http_api_tests {
                 segment_secs: 0,
                 overlap_secs: 0,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3190,6 +3388,7 @@ mod http_api_tests {
                 max_segment_secs: 120,
                 silence_gap_probes: 1,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3242,6 +3441,7 @@ mod http_api_tests {
                 max_segment_secs: 60,
                 silence_gap_probes: 1,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3317,6 +3517,7 @@ mod http_api_tests {
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         let (_, started): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3379,6 +3580,7 @@ mod http_api_tests {
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         let (post_status, started): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3474,6 +3676,7 @@ mod http_api_tests {
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),
@@ -3509,6 +3712,134 @@ mod http_api_tests {
             "one-shot returns the worker transcript verbatim — unlike the segmented path, no trim is applied because there is only one transcript and no stitching seam where leading whitespace could matter",
         );
         assert_eq!(result.failure_kind, None);
+    }
+
+    /// Pin the HTTP-level wiring for session-level provider selection on
+    /// the one-shot path. POST `/v1/sessions/dictation` with a non-`None`
+    /// `provider_id`, drive the recorder briefly, then POST stop and
+    /// confirm the worker observed the provider id on the resulting
+    /// transcribe call. Without this the operator could set the flag in
+    /// the request and the daemon could silently drop it on the way to
+    /// `stop_oneshot_dictation`'s `TranscribeRequest`, sending whisper
+    /// instead of MiMo.
+    #[tokio::test]
+    async fn oneshot_dictation_http_threads_provider_id_into_worker_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "default_transcribe_text": " oneshot reply",
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let start_req = StartDictationRequest {
+            trigger: TriggerKind::Cli,
+            language_profile: None,
+            recorder_backend: Some(RecorderBackend::Pipewire),
+            translate_to_english: false,
+            keep_audio: false,
+            segmentation: SegmentationMode::OneShot,
+            provider_id: Some("mimo_v2_5_asr".to_owned()),
+        };
+        let (status, session): (StatusCode, CaptureSession) = post_json(
+            router.clone(),
+            "/v1/sessions/dictation",
+            serde_json::to_value(&start_req).expect("encode start req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let session_id = session.session_id;
+
+        sleep(Duration::from_millis(50)).await;
+
+        let (status, _result): (StatusCode, DictationCaptureResult) = post_json(
+            router,
+            "/v1/sessions/dictation/stop",
+            serde_json::to_value(&StopDictationRequest { session_id }).expect("encode stop req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let lines: Vec<&str> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one-shot stop must drive exactly one transcribe call; got log: {log_contents:?}",
+        );
+        let entry: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("the single log line is valid json");
+        assert_eq!(
+            entry.get("provider_id").and_then(serde_json::Value::as_str),
+            Some("mimo_v2_5_asr"),
+            "session provider_id must reach the worker; entry: {entry}",
+        );
+    }
+
+    /// Mirror the previous pin for the ad-hoc capture path. POST
+    /// `/v1/dictation/capture` with a non-`None` `provider_id` and
+    /// verify the resulting transcribe call carried the same value.
+    /// `capture_dictation_with_state` is the path the desktop overlay
+    /// and `vl record-transcribe` reach when no live session is in
+    /// flight, so dropping the field here would silently strand the
+    /// operator on whisper for every one-command capture.
+    #[tokio::test]
+    async fn capture_dictation_http_threads_provider_id_into_worker_transcribe() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("transcribe_calls.jsonl");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({
+                "transcribe_map": {},
+                "fail_stems": [],
+                "default_transcribe_text": " capture reply",
+                "transcribe_log_path": log_path.display().to_string(),
+            }),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "duration_seconds": 1,
+            "recorder_backend": "pipewire",
+            "translate_to_english": false,
+            "keep_audio": false,
+            "provider_id": "mimo_v2_5_asr",
+        });
+        let (status, _result): (StatusCode, DictationCaptureResult) =
+            post_json(router, "/v1/dictation/capture", request).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let log_contents =
+            std::fs::read_to_string(&log_path).expect("mock worker writes the transcribe log");
+        let lines: Vec<&str> = log_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "POST /v1/dictation/capture must drive exactly one transcribe call; \
+             got log: {log_contents:?}",
+        );
+        let entry: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("the single log line is valid json");
+        assert_eq!(
+            entry.get("provider_id").and_then(serde_json::Value::as_str),
+            Some("mimo_v2_5_asr"),
+            "ad-hoc capture must thread provider_id through to the worker; entry: {entry}",
+        );
     }
 
     #[tokio::test]
@@ -4023,6 +4354,7 @@ mod sse_stream_tests {
                 segment_secs: 60,
                 overlap_secs: 0,
             },
+            provider_id: None,
         };
         let (status, session): (StatusCode, CaptureSession) = post_json(
             router.clone(),

@@ -222,6 +222,7 @@ components:
         - status
         - command
         - asr_configured
+        - mimo_configured
         - llm_configured
         - llm_reachable
         - global_shortcuts_portal_available
@@ -260,6 +261,30 @@ components:
             Base URL of the configured whisper-server endpoint (e.g.
             `http://127.0.0.1:8188`). Absent when whisper-server is not
             configured or when the worker predates this field.
+          type:
+            - string
+            - "null"
+        mimo_configured:
+          description: |
+            True when the optional Xiaomi MiMo-V2.5-ASR provider has both
+            its model directories validated. The MiMo wrapper is loaded
+            lazily on the first transcribe call; this flag only proves
+            that the configured paths exist on disk, not that the model
+            has been pulled into VRAM yet. Absent when the worker
+            predates this field.
+          type: boolean
+        mimo_model_path:
+          description: |
+            Model weight directory for MiMo-V2.5-ASR. Absent when the
+            provider is unconfigured or the worker predates this field.
+          type:
+            - string
+            - "null"
+        mimo_error:
+          description: |
+            Reason MiMo-V2.5-ASR is not ready to serve, when
+            `mimo_configured` is `false`. Absent when the provider is
+            healthy or simply unconfigured.
           type:
             - string
             - "null"
@@ -365,6 +390,27 @@ components:
           type: boolean
         segmentation:
           $ref: "#/components/schemas/SegmentationMode"
+        provider_id:
+          description: |
+            Optional ASR provider for every transcription this dictation
+            session emits. When omitted the daemon routes to the
+            configured whisper.cpp chain (whisper-server preferred,
+            whisper-cli fallback). Selecting `mimo_v2_5_asr` opts the
+            entire session into the Xiaomi MiMo-V2.5-ASR backend; see
+            `docs/guides/local-asr-provider.md` for the hardware
+            preconditions and the opt-in environment variables. The
+            value is shared by every `TranscribeRequest` the daemon
+            issues for this session — fixed/vad-gated segments, the
+            stop-time transcription, and the one-shot path. An
+            unrecognized id surfaces as `provider unavailable` rather
+            than falling back to whisper.
+          type:
+            - string
+            - "null"
+          enum:
+            - whisper_cpp
+            - mimo_v2_5_asr
+            - null
     SegmentationMode:
       description: |
         Controls how the recorder subprocess is rolled during a live dictation
@@ -460,6 +506,20 @@ components:
           type: boolean
         keep_audio:
           type: boolean
+        provider_id:
+          description: |
+            Optional ASR provider for the single transcription this
+            capture emits. Defaults to the configured whisper.cpp chain
+            when omitted; `mimo_v2_5_asr` opts into the Xiaomi
+            MiMo-V2.5-ASR backend. See `TranscribeRequest.provider_id`
+            for the unrecognized-id semantics.
+          type:
+            - string
+            - "null"
+          enum:
+            - whisper_cpp
+            - mimo_v2_5_asr
+            - null
     CaptureSession:
       type: object
       required:
@@ -541,6 +601,23 @@ components:
             - "null"
         translate_to_english:
           type: boolean
+        provider_id:
+          description: |
+            Optional ASR provider identifier. Defaults to the configured
+            whisper.cpp chain (whisper-server preferred, whisper-cli
+            fallback). The optional `mimo_v2_5_asr` provider routes to the
+            Xiaomi MiMo-V2.5-ASR backend through the Python worker; see
+            `docs/guides/local-asr-provider.md` for the hardware
+            preconditions and the opt-in environment variables. An
+            unrecognized provider id surfaces as a `provider unavailable`
+            error rather than falling back to whisper.
+          type:
+            - string
+            - "null"
+          enum:
+            - whisper_cpp
+            - mimo_v2_5_asr
+            - null
     PreviewArtifact:
       type: object
       required: [artifact_id, status, title, notes]

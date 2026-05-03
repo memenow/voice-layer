@@ -128,6 +128,13 @@ pub struct StartDictationRequest {
     pub keep_audio: bool,
     #[serde(default)]
     pub segmentation: SegmentationMode,
+    /// Selects the ASR provider for every transcription this dictation
+    /// session emits. `None` (the default) routes to the configured
+    /// whisper.cpp chain. The value is shared by every TranscribeRequest
+    /// the daemon issues for the session — fixed/vad-gated segments,
+    /// the final stop-time transcription, and the one-shot path.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +197,11 @@ pub struct DictationCaptureRequest {
     pub translate_to_english: bool,
     #[serde(default)]
     pub keep_audio: bool,
+    /// Selects the ASR provider for the single transcription this
+    /// capture emits. `None` (the default) routes to the configured
+    /// whisper.cpp chain.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +270,8 @@ pub struct TranscribeRequest {
     pub language: Option<String>,
     #[serde(default)]
     pub translate_to_english: bool,
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -427,6 +441,22 @@ pub struct WorkerHealthSummary {
     /// configured or when the worker predates this field.
     #[serde(default)]
     pub whisper_server_url: Option<String>,
+    /// Whether the optional Xiaomi MiMo-V2.5-ASR provider is configured
+    /// and the model directories validated. The MiMo wrapper is loaded
+    /// lazily on first transcribe; a `true` here only proves that the
+    /// configured paths exist on disk, not that the model has been
+    /// pulled into VRAM yet.
+    #[serde(default)]
+    pub mimo_configured: bool,
+    /// Model weight directory for MiMo-V2.5-ASR, or `None` when the
+    /// provider is unconfigured or the worker predates this field.
+    #[serde(default)]
+    pub mimo_model_path: Option<String>,
+    /// Reason MiMo-V2.5-ASR is not ready to serve, when
+    /// `mimo_configured` is `false`. `None` when the provider is healthy
+    /// or simply unconfigured.
+    #[serde(default)]
+    pub mimo_error: Option<String>,
     pub llm_configured: bool,
     pub llm_model: Option<String>,
     pub llm_endpoint: Option<String>,
@@ -2877,6 +2907,9 @@ components:
             asr_error: None,
             whisper_mode: None,
             whisper_server_url: None,
+            mimo_configured: false,
+            mimo_model_path: None,
+            mimo_error: None,
             llm_configured: false,
             llm_model: None,
             llm_endpoint: None,
@@ -3263,11 +3296,17 @@ components:
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
+            provider_id: None,
         };
         assert_openapi_documents_every_field(
             "StartDictationRequest",
             &sentinel,
-            &["translate_to_english", "keep_audio", "segmentation"],
+            &[
+                "translate_to_english",
+                "keep_audio",
+                "segmentation",
+                "provider_id",
+            ],
         );
     }
 
@@ -3288,11 +3327,12 @@ components:
             recorder_backend: None,
             translate_to_english: false,
             keep_audio: false,
+            provider_id: None,
         };
         assert_openapi_documents_every_field(
             "DictationCaptureRequest",
             &sentinel,
-            &["translate_to_english", "keep_audio"],
+            &["translate_to_english", "keep_audio", "provider_id"],
         );
     }
 
@@ -3331,11 +3371,12 @@ components:
             audio_file: String::new(),
             language: None,
             translate_to_english: false,
+            provider_id: None,
         };
         assert_openapi_documents_every_field(
             "TranscribeRequest",
             &sentinel,
-            &["translate_to_english"],
+            &["translate_to_english", "provider_id"],
         );
     }
 

@@ -16,6 +16,44 @@ vad = [
     "numpy>=2.0",
     "onnxruntime>=1.18",
 ]
+# MiMo-V2.5-ASR (Xiaomi) optional GPU provider. CUDA-only at the moment.
+# The `MimoAudio` wrapper class lives in the upstream source tree and
+# is not currently published as a wheel — operators clone
+# https://github.com/XiaomiMiMo/MiMo-V2.5-ASR and point
+# VOICELAYER_MIMO_REPO_PATH at the checkout.
+#
+# `torch` and `torchaudio` are intentionally NOT pinned here: the wheel
+# matching the operator's CUDA capability has to come from the PyTorch
+# index (e.g., `--index-url https://download.pytorch.org/whl/cu128` for
+# Blackwell sm_120), and pinning a version on PyPI would silently pull
+# the CPU-only build instead. The lower bound (>= 2.7.0) is the floor
+# of the cu128 index; the upper bound is held to the next major version
+# of torch.
+#
+# The audio tokenizer's `from flash_attn import flash_attn_varlen_func`
+# means flash-attn is a hard requirement of the runtime path, not just
+# a recommended optimisation as the model card implies. flash-attn does
+# not ship binary wheels on PyPI today; operators install one of
+# Dao-AILab's GitHub release wheels manually after torch is in place
+# (the wheels are tagged `cu12torch2.{X}`). docs/guides/local-asr-provider.md
+# tracks the working combination — currently
+# `flash-attn==2.8.1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64`
+# against `torch==2.10.0+cu128` for Blackwell.
+#
+# `torchcodec` is required by `torchaudio>=2.10` for `torchaudio.load`,
+# but our provider bypasses that path by pre-loading the WAV through
+# `soundfile` and handing the wrapper a tensor — so torchcodec stays
+# off the runtime dependency list.
+mimo = [
+    "torch>=2.7.0,<3.0",
+    "torchaudio>=2.7.0,<3.0",
+    "transformers==4.49.0",
+    "accelerate>=1.9.0",
+    "librosa>=0.11.0",
+    "scipy>=1.16.1",
+    "soundfile>=0.12",
+    "zhon==2.1.1",
+]
 
 [dependency-groups]
 dev = [
