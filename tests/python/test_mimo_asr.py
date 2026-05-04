@@ -268,6 +268,47 @@ class SplitWavIntoSegmentsTest(unittest.TestCase):
             with self.assertRaises(ProviderInvocationError):
                 mimo_asr._split_wav_into_segments(bogus, 60.0, tmp_path)
 
+    def test_partial_chunks_are_cleaned_up_when_mid_write_fails(self) -> None:
+        # A mid-loop failure (disk quota, SIGTERM-driven OSError, ...)
+        # would otherwise leak every chunk written before the failure.
+        # Patch `wave.open` to fail on the second write so the first
+        # chunk file is on disk when the splitter raises; the splitter's
+        # finally must roll the partial state back.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            audio = tmp_path / "long.wav"
+            _write_silent_wav(audio, 5.0)
+            runtime_dir = tmp_path / "runtime"
+            runtime_dir.mkdir()
+
+            real_wave_open = wave.open
+            calls = {"count": 0}
+
+            def faulty_wave_open(path: object, mode: str = "rb", *args: object, **kwargs: object):
+                calls["count"] += 1
+                # Call 1 = read input; call 2 = write chunk 0; call 3 =
+                # write chunk 1 — fail there so chunk 0 is on disk and
+                # the splitter has to clean it up.
+                if mode == "wb" and calls["count"] >= 3:
+                    raise OSError("simulated disk failure during chunk write")
+                return real_wave_open(path, mode, *args, **kwargs)
+
+            with (
+                patch(
+                    "voicelayer_orchestrator.providers.mimo_asr.wave.open",
+                    side_effect=faulty_wave_open,
+                ),
+                self.assertRaises(ProviderInvocationError),
+            ):
+                mimo_asr._split_wav_into_segments(audio, 2.0, runtime_dir)
+
+            leftover = sorted(p.name for p in runtime_dir.glob("mimo-segment-*.wav"))
+            self.assertEqual(
+                leftover,
+                [],
+                f"splitter must clean up partial chunks on mid-write failure: {leftover}",
+            )
+
 
 class TranscribeWithMimoTest(unittest.TestCase):
     def _config(self, tmp: pathlib.Path) -> MimoAsrConfig:
@@ -460,6 +501,15 @@ class VadPrepassForMimoTest(unittest.TestCase):
             tmp_path = pathlib.Path(tmp)
             audio = tmp_path / "silent.wav"
             _write_silent_wav(audio, 1.0)
+            # Use a real path under the test tmp dir rather than a
+            # hard-coded `/tmp/...` string so the cleanup finally block
+            # in `transcribe_with_mimo` cannot accidentally delete a
+            # file that happens to exist on the host system. The file
+            # is pre-created here so the cleanup assertion below can
+            # observe a present-then-absent transition rather than a
+            # always-absent one.
+            trimmed_audio = tmp_path / "silent.vad-empty.wav"
+            trimmed_audio.write_bytes(b"")
             config = self._config(tmp_path)
 
             with (
@@ -471,7 +521,7 @@ class VadPrepassForMimoTest(unittest.TestCase):
                 patch.object(
                     mimo_asr,
                     "apply_vad_prepass",
-                    return_value=("/tmp/should-not-be-read.wav", []),
+                    return_value=(str(trimmed_audio), []),
                 ),
                 patch.object(mimo_asr, "_load_mimo_model") as load_model,
                 patch.object(mimo_asr, "_run_segment_inference") as run_inference,
@@ -488,6 +538,11 @@ class VadPrepassForMimoTest(unittest.TestCase):
             joined_notes = " | ".join(result["notes"])
             self.assertIn("VAD detected no speech", joined_notes)
             self.assertIn("MiMo inference was skipped", joined_notes)
+            # The `.vad-empty.wav` sidecar that `apply_vad_prepass`
+            # would have written must be cleaned up even though MiMo
+            # short-circuited; otherwise every silent capture leaks a
+            # file under `runtime_dir/vad/`.
+            self.assertFalse(trimmed_audio.exists())
 
     def test_vad_trimmed_audio_replaces_input_for_mimo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -534,6 +589,111 @@ class VadPrepassForMimoTest(unittest.TestCase):
             self.assertIn("VAD pre-pass kept 2 speech region(s)", joined_notes)
             # Two regions of 1.0 s + 1.5 s = 2.50 s of detected speech.
             self.assertIn("2.50s total", joined_notes)
+            # The trimmed WAV is owned by the worker; the finally block
+            # in `transcribe_with_mimo` must delete it once inference
+            # completes so `runtime_dir/vad/` does not accumulate one
+            # file per VAD-enabled call.
+            self.assertFalse(trimmed_audio.exists())
+            # The caller-supplied raw WAV is *not* worker-owned; it
+            # must still exist after transcribe so the dictation
+            # pipeline can clean it up via `keep_audio` later.
+            self.assertTrue(raw_audio.exists())
+
+    def test_segment_wavs_are_cleaned_up_after_long_audio_split(self) -> None:
+        # Mirrors the trimmed-WAV cleanup but for the per-chunk WAVs the
+        # long-audio splitter writes when the input crosses
+        # `long_audio_split_seconds`. Both the worker-owned chunks and
+        # the trimmed VAD output (when present) live under
+        # `provider_runtime_dir(environ)/...`; together they are the
+        # full cleanup surface that the dispatcher must clear before
+        # returning.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            runtime_root = tmp_path / "runtime"
+            runtime_root.mkdir()
+            audio = tmp_path / "long.wav"
+            _write_silent_wav(audio, 5.0)
+            config = MimoAsrConfig(
+                model_path=str(tmp_path / "model"),
+                tokenizer_path=str(tmp_path / "tokenizer"),
+                repo_path=None,
+                device="cuda:0",
+                audio_tag=None,
+                timeout_seconds=600.0,
+                long_audio_split_seconds=2.0,
+                extra_args=(),
+            )
+            (tmp_path / "model").mkdir()
+            (tmp_path / "tokenizer").mkdir()
+
+            with (
+                patch.object(mimo_asr, "load_whisper_vad_config", return_value=None),
+                patch.object(mimo_asr, "_load_mimo_model", return_value=object()),
+                patch.object(mimo_asr, "_run_segment_inference", return_value="chunk"),
+            ):
+                mimo_asr.transcribe_with_mimo(
+                    {"audio_file": str(audio)},
+                    config,
+                    environ={"XDG_RUNTIME_DIR": str(runtime_root)},
+                )
+
+            mimo_dir = runtime_root / "voicelayer" / "providers" / "mimo"
+            # The splitter must have actually written its chunks under
+            # `mimo_dir` for the test to be meaningful — otherwise the
+            # cleanup assertion below trivially passes whenever the
+            # split path was not exercised. With 5 s of audio and
+            # `long_audio_split_seconds=2.0` the splitter creates 3
+            # chunks before cleanup, so the directory must exist after
+            # the call.
+            self.assertTrue(
+                mimo_dir.exists(),
+                "splitter should have created the runtime dir",
+            )
+            # The directory itself stays (we never rmdir it), but every
+            # chunk the splitter wrote must be gone.
+            leftover = sorted(p.name for p in mimo_dir.iterdir())
+            self.assertEqual(leftover, [])
+            # The caller-supplied capture stays alive — only the worker-owned
+            # chunk WAVs are cleaned up.
+            self.assertTrue(audio.exists())
+
+    def test_vad_trimmed_audio_is_cleaned_up_when_inference_fails(self) -> None:
+        # Failure paths are the load-bearing case for try/finally
+        # cleanup: a transcribe that raises must still leave
+        # `runtime_dir/vad/` empty so a flaky model load cannot turn
+        # into a slow disk leak.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            raw_audio = tmp_path / "raw.wav"
+            _write_silent_wav(raw_audio, 1.0)
+            trimmed_audio = tmp_path / "raw.vad-trimmed.wav"
+            _write_silent_wav(trimmed_audio, 1.0)
+            config = self._config(tmp_path)
+
+            def failing_inference(*_args: object, **_kwargs: object) -> str:
+                raise ProviderInvocationError("simulated MiMo failure")
+
+            with (
+                patch.object(
+                    mimo_asr,
+                    "load_whisper_vad_config",
+                    return_value=_vad_config_sentinel(),
+                ),
+                patch.object(
+                    mimo_asr,
+                    "apply_vad_prepass",
+                    return_value=(str(trimmed_audio), [(0.0, 1.0)]),
+                ),
+                patch.object(mimo_asr, "_load_mimo_model", return_value=object()),
+                patch.object(mimo_asr, "_run_segment_inference", side_effect=failing_inference),
+                self.assertRaises(ProviderInvocationError),
+            ):
+                mimo_asr.transcribe_with_mimo({"audio_file": str(raw_audio)}, config)
+
+            self.assertFalse(trimmed_audio.exists())
+            # The original capture stays intact across failure too; the
+            # caller is responsible for its lifetime.
+            self.assertTrue(raw_audio.exists())
 
     def test_vad_failure_falls_back_to_raw_audio(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
