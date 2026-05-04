@@ -380,83 +380,98 @@ def transcribe_with_mimo(
     # - VAD raises: log the failure note and fall back to the raw WAV
     #   so a transient VAD error never makes the transcribe path go
     #   dark.
-    extra_notes, prepass_audio_path = _apply_vad_prepass_for_mimo(audio_file, environ)
-    if prepass_audio_path is _VAD_EMPTY_SPEECH:
-        return {
-            "text": "",
-            "detected_language": None,
-            "notes": [
-                "VAD detected no speech; MiMo inference was skipped.",
-                *extra_notes,
-            ],
-        }
-    if prepass_audio_path is not None:
-        audio_path = prepass_audio_path
-        audio_file = str(prepass_audio_path)
+    extra_notes, prepass_audio_path, vad_trimmed_path = _apply_vad_prepass_for_mimo(
+        audio_file, environ
+    )
 
-    runtime_dir = provider_runtime_dir(environ) / "mimo"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    duration = _wav_duration_seconds(audio_path)
-    segments = _split_wav_into_segments(audio_path, config.long_audio_split_seconds, runtime_dir)
-    audio_tag = _resolve_audio_tag(language, config)
-
-    model = _load_mimo_model(config)
+    # Track every WAV the worker created so the finally block can
+    # unlink them whether transcribe returns, raises, or short-circuits
+    # on no-speech. Excludes the caller-supplied audio (the dictation
+    # pipeline owns its lifetime via `keep_audio`).
+    worker_owned_files: list[Path] = []
+    if vad_trimmed_path is not None:
+        worker_owned_files.append(vad_trimmed_path)
 
     try:
+        if prepass_audio_path is _VAD_EMPTY_SPEECH:
+            return {
+                "text": "",
+                "detected_language": None,
+                "notes": [
+                    "VAD detected no speech; MiMo inference was skipped.",
+                    *extra_notes,
+                ],
+            }
+        if prepass_audio_path is not None:
+            audio_path = prepass_audio_path
+            audio_file = str(prepass_audio_path)
+
+        runtime_dir = provider_runtime_dir(environ) / "mimo"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        duration = _wav_duration_seconds(audio_path)
+        segments = _split_wav_into_segments(
+            audio_path, config.long_audio_split_seconds, runtime_dir
+        )
+        # Per-chunk WAVs from `_split_wav_into_segments` are worker-owned
+        # too. The splitter returns `[audio_path]` unchanged when the
+        # input fits in a single chunk, so filter that case out — the
+        # trimmed-VAD WAV (if any) is already tracked above, and the
+        # caller's WAV must not be deleted here.
+        for segment in segments:
+            if segment != audio_path:
+                worker_owned_files.append(segment)
+
+        audio_tag = _resolve_audio_tag(language, config)
+        model = _load_mimo_model(config)
+
         transcripts: list[str] = []
         for segment_path in segments:
             text = _run_segment_inference(model, segment_path, audio_tag)
             transcripts.append(text)
+
+        raw_text = " ".join(part for part in transcripts if part).strip()
+        text = collapse_nonspeech_transcript(raw_text)
+        notes = [
+            f"Transcribed by MiMo-V2.5-ASR (model `{config.model_path}`).",
+            f"Device: {config.device}, dtype: bfloat16 (wrapper-default).",
+        ]
+        if audio_tag is not None:
+            notes.append(f"Audio tag forwarded to the wrapper: {audio_tag}.")
+        else:
+            notes.append("Audio tag left to MiMo's auto-detect.")
+        notes.append(f"Audio duration: {duration:.2f}s; segments processed: {len(segments)}.")
+        if len(segments) > 1:
+            notes.append(
+                "Audio was split to mitigate MiMo issue #6 (decoder repetition past "
+                "~3 minutes); transcripts were concatenated with a single space."
+            )
+        notes.extend(extra_notes)
+        if not text:
+            notes.append("MiMo-V2.5-ASR returned no speech for this audio.")
+
+        detected_language: str | None = None
+        if audio_tag == "<chinese>":
+            detected_language = language or "zh"
+        elif audio_tag == "<english>":
+            detected_language = language or "en"
+        elif language:
+            detected_language = language
+
+        return {
+            "text": text,
+            "detected_language": detected_language,
+            "notes": notes,
+        }
     finally:
-        # `_split_wav_into_segments` writes per-chunk WAVs into
-        # `runtime_dir/mimo/` to dodge upstream issue #6. The original
-        # audio file is owned by the caller (the dictation pipeline
-        # cleans it up via `keep_audio`), so only delete chunks we
-        # created ourselves. Skipping the cleanup leaks 16 kHz mono
-        # PCM at ~32 KB/s × split-window-secs per long-audio call,
-        # which adds up across a long-running daemon.
-        for segment_path in segments:
-            if segment_path == audio_path:
-                continue
-            # Best-effort cleanup. A leftover chunk in `runtime_dir` is
-            # not worth surfacing as a transcribe failure; the daemon's
-            # restart will sweep the runtime dir anyway.
+        # Best-effort cleanup. A leftover chunk in `runtime_dir` is
+        # not worth surfacing as a transcribe failure; the daemon's
+        # restart will sweep the runtime dir anyway. Without this loop
+        # each long-audio call leaks ~32 KB/s × split-window-secs of
+        # PCM, and each VAD-trimmed run leaks ~32 KB/s × trimmed-secs;
+        # both add up over a long-running daemon.
+        for owned_path in worker_owned_files:
             with contextlib.suppress(OSError):
-                segment_path.unlink()
-
-    raw_text = " ".join(part for part in transcripts if part).strip()
-    text = collapse_nonspeech_transcript(raw_text)
-    notes = [
-        f"Transcribed by MiMo-V2.5-ASR (model `{config.model_path}`).",
-        f"Device: {config.device}, dtype: bfloat16 (wrapper-default).",
-    ]
-    if audio_tag is not None:
-        notes.append(f"Audio tag forwarded to the wrapper: {audio_tag}.")
-    else:
-        notes.append("Audio tag left to MiMo's auto-detect.")
-    notes.append(f"Audio duration: {duration:.2f}s; segments processed: {len(segments)}.")
-    if len(segments) > 1:
-        notes.append(
-            "Audio was split to mitigate MiMo issue #6 (decoder repetition past "
-            "~3 minutes); transcripts were concatenated with a single space."
-        )
-    notes.extend(extra_notes)
-    if not text:
-        notes.append("MiMo-V2.5-ASR returned no speech for this audio.")
-
-    detected_language: str | None = None
-    if audio_tag == "<chinese>":
-        detected_language = language or "zh"
-    elif audio_tag == "<english>":
-        detected_language = language or "en"
-    elif language:
-        detected_language = language
-
-    return {
-        "text": text,
-        "detected_language": detected_language,
-        "notes": notes,
-    }
+                owned_path.unlink()
 
 
 # Module-level sentinel so callers can distinguish "VAD found no speech"
@@ -469,16 +484,23 @@ _VAD_EMPTY_SPEECH: Any = object()
 def _apply_vad_prepass_for_mimo(
     audio_file: str,
     environ: Mapping[str, str] | None,
-) -> tuple[list[str], Any]:
+) -> tuple[list[str], Any, Path | None]:
     """Run silero-vad on ``audio_file`` ahead of MiMo inference.
 
-    Returns ``(extra_notes, replacement_audio_path)`` where the second
-    member is one of:
+    Returns ``(extra_notes, replacement_audio_path, trimmed_path)``.
+
+    ``replacement_audio_path`` (the second member) is one of:
 
     - ``None`` when VAD is unconfigured or fails (transcribe the raw WAV).
     - ``_VAD_EMPTY_SPEECH`` when VAD detected no speech (short-circuit).
     - A :class:`Path` pointing at the trimmed WAV that the caller should
       hand to MiMo in place of the original.
+
+    ``trimmed_path`` is the worker-owned WAV that the caller must
+    unlink after MiMo finishes — set whenever ``apply_vad_prepass``
+    actually wrote a file (both the trimmed-speech and empty-speech
+    cases produce a sidecar WAV). ``None`` when VAD was unconfigured
+    or raised before writing.
 
     Mirrors the whisper-side ``_apply_vad_prepass_if_configured`` so
     operators see identical pre-pass behavior regardless of which
@@ -487,7 +509,7 @@ def _apply_vad_prepass_for_mimo(
 
     vad_config = load_whisper_vad_config(environ)
     if vad_config is None:
-        return [], None
+        return [], None, None
 
     try:
         vad_dir = provider_runtime_dir(environ) / "vad"
@@ -496,17 +518,19 @@ def _apply_vad_prepass_for_mimo(
         return (
             [f"VAD pre-pass failed, transcribing raw audio with MiMo: {exc}"],
             None,
+            None,
         )
 
+    trimmed_owned = Path(trimmed_path)
     if not regions:
-        return [], _VAD_EMPTY_SPEECH
+        return [], _VAD_EMPTY_SPEECH, trimmed_owned
 
     total_sec = sum(end - start for start, end in regions)
     note = (
         f"VAD pre-pass kept {len(regions)} speech region(s) "
         f"({total_sec:.2f}s total) before MiMo inference."
     )
-    return [note], Path(trimmed_path)
+    return [note], trimmed_owned, trimmed_owned
 
 
 def _load_wav_as_tensor(segment_path: Path) -> tuple[Any, int]:

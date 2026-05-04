@@ -230,7 +230,7 @@ class VadWorkerIntegrationTest(unittest.TestCase):
             patch.object(self.worker, "load_whisper_vad_config", return_value=None),
             patch.object(self.worker, "apply_vad_prepass") as prepass,
         ):
-            params, notes, short = self.worker._apply_vad_prepass_if_configured(
+            params, notes, short, trimmed = self.worker._apply_vad_prepass_if_configured(
                 {"audio_file": str(audio_file)},
             )
 
@@ -238,6 +238,8 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         self.assertEqual(params, {"audio_file": str(audio_file)})
         self.assertEqual(notes, [])
         self.assertIsNone(short)
+        # VAD did not run — there is nothing for the dispatcher to clean up.
+        self.assertIsNone(trimmed)
 
     def test_vad_short_circuits_when_no_speech_found(self) -> None:
         audio_file = self.tmp_dir / "silence.wav"
@@ -255,7 +257,7 @@ class VadWorkerIntegrationTest(unittest.TestCase):
                 return_value=(str(trimmed), []),
             ),
         ):
-            _, _, short = self.worker._apply_vad_prepass_if_configured(
+            _, _, short, trimmed_path = self.worker._apply_vad_prepass_if_configured(
                 {"audio_file": str(audio_file)},
             )
 
@@ -265,6 +267,10 @@ class VadWorkerIntegrationTest(unittest.TestCase):
             "VAD detected no speech; whisper inference was skipped.",
             short["notes"],
         )
+        # `apply_vad_prepass` writes a `.vad-empty.wav` even on the
+        # no-speech path; the dispatcher must receive that path so the
+        # finally block can unlink it.
+        self.assertEqual(trimmed_path, trimmed)
 
     def test_vad_replaces_audio_and_annotates_notes(self) -> None:
         audio_file = self.tmp_dir / "raw.wav"
@@ -283,7 +289,7 @@ class VadWorkerIntegrationTest(unittest.TestCase):
                 return_value=(str(trimmed), regions),
             ),
         ):
-            params, notes, short = self.worker._apply_vad_prepass_if_configured(
+            params, notes, short, trimmed_path = self.worker._apply_vad_prepass_if_configured(
                 {"audio_file": str(audio_file)},
             )
 
@@ -292,6 +298,8 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("2 speech region(s)", notes[0])
         self.assertIn("1.00s total", notes[0])
+        # The trimmed WAV is the worker-owned cleanup target on success.
+        self.assertEqual(trimmed_path, trimmed)
 
     def test_vad_prepass_error_falls_back_to_raw_audio(self) -> None:
         from voicelayer_orchestrator.providers import ProviderInvocationError
@@ -308,7 +316,7 @@ class VadWorkerIntegrationTest(unittest.TestCase):
                 side_effect=ProviderInvocationError("onnxruntime missing"),
             ),
         ):
-            params, notes, short = self.worker._apply_vad_prepass_if_configured(
+            params, notes, short, trimmed = self.worker._apply_vad_prepass_if_configured(
                 {"audio_file": str(audio_file)},
             )
 
@@ -317,6 +325,152 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("VAD pre-pass failed", notes[0])
         self.assertIn("onnxruntime missing", notes[0])
+        # VAD raised before writing anything — no cleanup target.
+        self.assertIsNone(trimmed)
+
+
+class VadDispatcherCleanupTest(unittest.TestCase):
+    """End-to-end pin: the transcribe dispatcher unlinks the trimmed WAV.
+
+    These tests drive the full ``handle_request("transcribe", ...)``
+    path with ``apply_vad_prepass`` stubbed to return a real on-disk
+    sidecar file, and then assert that the file is gone after the
+    request returns. Without the dispatcher's finally block, every
+    VAD-enabled call would leak one WAV under ``runtime_dir/vad/``.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from voicelayer_orchestrator import worker
+
+        self.worker = worker
+        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-cleanup-"))
+
+    def _write_silent_wav(self, path: pathlib.Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sample_rate = 16000
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sample_rate)
+            handle.writeframes(b"\x00\x00" * sample_rate)
+
+    def test_trimmed_wav_is_unlinked_after_whisper_dispatch_succeeds(self) -> None:
+        audio = self.tmp_dir / "raw.wav"
+        self._write_silent_wav(audio)
+        trimmed = self.tmp_dir / "raw.vad-trimmed.wav"
+        self._write_silent_wav(trimmed)
+
+        with (
+            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
+            patch.object(
+                self.worker,
+                "apply_vad_prepass",
+                return_value=(str(trimmed), [(0.0, 1.0)]),
+            ),
+            patch.object(self.worker, "load_whisper_server_config", return_value=None),
+            # Stub the cli-config loader to a truthy sentinel so the
+            # dispatcher reaches the cli call site without needing the
+            # binary or model path on disk.
+            patch.object(
+                self.worker,
+                "load_whisper_provider_config",
+                return_value=object(),
+            ),
+            patch.object(
+                self.worker,
+                "transcribe_with_whisper_cli",
+                return_value={"text": "ok", "detected_language": None, "notes": []},
+            ),
+        ):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 901,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
+                }
+            )
+
+        assert response is not None
+        self.assertEqual(response["result"]["text"], "ok")
+        # Trimmed sidecar is worker-owned; must not survive the call.
+        self.assertFalse(trimmed.exists())
+        # Caller-supplied capture is untouched.
+        self.assertTrue(audio.exists())
+
+    def test_empty_speech_wav_is_unlinked_after_short_circuit(self) -> None:
+        audio = self.tmp_dir / "silent.wav"
+        self._write_silent_wav(audio)
+        trimmed = self.tmp_dir / "silent.vad-empty.wav"
+        # `apply_vad_prepass` writes a `.vad-empty.wav` even when no
+        # regions were found; pre-create one so we can observe its
+        # deletion.
+        trimmed.write_bytes(b"")
+
+        with (
+            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
+            patch.object(
+                self.worker,
+                "apply_vad_prepass",
+                return_value=(str(trimmed), []),
+            ),
+        ):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 902,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
+                }
+            )
+
+        assert response is not None
+        self.assertEqual(response["result"]["text"], "")
+        self.assertFalse(trimmed.exists())
+        self.assertTrue(audio.exists())
+
+    def test_trimmed_wav_is_unlinked_when_whisper_cli_raises(self) -> None:
+        from voicelayer_orchestrator.providers import ProviderInvocationError
+
+        audio = self.tmp_dir / "raw.wav"
+        self._write_silent_wav(audio)
+        trimmed = self.tmp_dir / "raw.vad-trimmed.wav"
+        self._write_silent_wav(trimmed)
+
+        with (
+            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
+            patch.object(
+                self.worker,
+                "apply_vad_prepass",
+                return_value=(str(trimmed), [(0.0, 1.0)]),
+            ),
+            patch.object(self.worker, "load_whisper_server_config", return_value=None),
+            patch.object(
+                self.worker,
+                "load_whisper_provider_config",
+                return_value=object(),
+            ),
+            patch.object(
+                self.worker,
+                "transcribe_with_whisper_cli",
+                side_effect=ProviderInvocationError("simulated whisper-cli crash"),
+            ),
+        ):
+            response = self.worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 903,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
+                }
+            )
+
+        assert response is not None
+        self.assertIn("simulated whisper-cli crash", response["error"]["message"])
+        # Failure must not turn into a slow disk leak.
+        self.assertFalse(trimmed.exists())
+        self.assertTrue(audio.exists())
 
 
 class _FakeSamples:

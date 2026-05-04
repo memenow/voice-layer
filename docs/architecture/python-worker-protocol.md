@@ -59,6 +59,13 @@ The worker implements every required method with real providers:
   before MiMo inference, which avoids paying the cold-load cost on
   pure-silence captures and prevents MiMo's causal LM from
   hallucinating transcripts on detected-silence audio.
+  After `transcribe` returns — on success, on whisper / MiMo failure,
+  and on the no-speech short-circuit — the dispatcher unlinks the
+  per-call sidecar files it produced under `runtime_dir/`: the
+  `.vad-trimmed.wav` / `.vad-empty.wav` written by the silero-vad
+  pre-pass, plus the `mimo-segment-<ts>-<idx>.wav` chunks emitted by
+  the long-audio splitter. The original capture is left intact for the
+  caller (the dictation pipeline owns its lifetime via `keep_audio`).
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
+from pathlib import Path
 from typing import Any, TextIO
 
 from voicelayer_orchestrator.config import (
@@ -56,30 +58,39 @@ PARSE_ERROR_CODE = -32700
 
 def _apply_vad_prepass_if_configured(
     params: dict[str, Any],
-) -> tuple[dict[str, Any], list[str], dict[str, Any] | None]:
+) -> tuple[dict[str, Any], list[str], dict[str, Any] | None, Path | None]:
     """Run the optional silero-vad pre-pass.
 
-    Returns ``(effective_params, extra_notes, short_circuit_result)``. When
-    ``short_circuit_result`` is not ``None`` the caller should return it
-    directly without invoking whisper (VAD detected no speech). When it is
-    ``None`` the caller proceeds with ``effective_params`` and appends
-    ``extra_notes`` to whisper's response.
+    Returns ``(effective_params, extra_notes, short_circuit_result, trimmed_path)``.
+
+    When ``short_circuit_result`` is not ``None`` the caller should
+    return it directly without invoking whisper (VAD detected no speech).
+    When it is ``None`` the caller proceeds with ``effective_params``
+    and appends ``extra_notes`` to whisper's response.
+
+    ``trimmed_path`` is the worker-owned WAV that the caller must
+    unlink after the dispatch finishes — set whenever
+    :func:`apply_vad_prepass` actually wrote a file (both the
+    trimmed-speech and empty-speech cases produce a sidecar WAV).
+    ``None`` when VAD was unconfigured, the caller did not provide an
+    ``audio_file``, or VAD raised before writing.
     """
 
     vad_config = load_whisper_vad_config()
     if vad_config is None:
-        return params, [], None
+        return params, [], None, None
 
     audio_file = str(params.get("audio_file", "")).strip()
     if not audio_file:
-        return params, [], None
+        return params, [], None, None
 
     try:
         runtime_dir = provider_runtime_dir() / "vad"
         trimmed_path, regions = apply_vad_prepass(audio_file, vad_config, runtime_dir)
     except ProviderInvocationError as exc:
-        return params, [f"VAD pre-pass failed, transcribing raw audio: {exc}"], None
+        return params, [f"VAD pre-pass failed, transcribing raw audio: {exc}"], None, None
 
+    trimmed_owned = Path(trimmed_path)
     if not regions:
         return (
             params,
@@ -89,6 +100,7 @@ def _apply_vad_prepass_if_configured(
                 "detected_language": None,
                 "notes": ["VAD detected no speech; whisper inference was skipped."],
             },
+            trimmed_owned,
         )
 
     new_params = dict(params)
@@ -98,7 +110,7 @@ def _apply_vad_prepass_if_configured(
         f"VAD pre-pass kept {len(regions)} speech region(s) "
         f"({total_sec:.2f}s total) from the original capture."
     )
-    return new_params, [note], None
+    return new_params, [note], None, trimmed_owned
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
@@ -244,62 +256,80 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 )
             return make_result(identifier, result)
 
-        effective_params, extra_notes, short_circuit = _apply_vad_prepass_if_configured(
-            request_params
-        )
-        if short_circuit is not None:
-            return make_result(identifier, short_circuit)
+        (
+            effective_params,
+            extra_notes,
+            short_circuit,
+            vad_trimmed_path,
+        ) = _apply_vad_prepass_if_configured(request_params)
+        try:
+            if short_circuit is not None:
+                return make_result(identifier, short_circuit)
 
-        server_config = load_whisper_server_config()
-        server_error: str | None = None
-        if server_config is not None:
-            reachable, probe_error = ensure_whisper_server(server_config)
-            if reachable:
-                try:
-                    result = transcribe_with_whisper_server(effective_params, server_config)
-                    if extra_notes:
-                        result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
-                    return make_result(identifier, result)
-                except ProviderInvocationError as exc:
-                    server_error = str(exc)
-            else:
-                server_error = probe_error or "whisper-server unreachable"
+            server_config = load_whisper_server_config()
+            server_error: str | None = None
+            if server_config is not None:
+                reachable, probe_error = ensure_whisper_server(server_config)
+                if reachable:
+                    try:
+                        result = transcribe_with_whisper_server(effective_params, server_config)
+                        if extra_notes:
+                            result = {
+                                **result,
+                                "notes": [*extra_notes, *result.get("notes", [])],
+                            }
+                        return make_result(identifier, result)
+                    except ProviderInvocationError as exc:
+                        server_error = str(exc)
+                else:
+                    server_error = probe_error or "whisper-server unreachable"
 
-        cli_config = load_whisper_provider_config()
-        if cli_config is None:
-            if server_error is not None:
+            cli_config = load_whisper_provider_config()
+            if cli_config is None:
+                if server_error is not None:
+                    return make_error(
+                        identifier,
+                        PROVIDER_REQUEST_FAILED_CODE,
+                        (
+                            f"whisper-server failed ({server_error}) and no whisper-cli "
+                            "fallback is configured."
+                        ),
+                        {"method": method},
+                    )
+                return make_error(
+                    identifier,
+                    PROVIDER_UNAVAILABLE_CODE,
+                    "No transcription provider is configured for the requested workflow.",
+                    {"method": method},
+                )
+
+            try:
+                result = transcribe_with_whisper_cli(effective_params, cli_config)
+            except ProviderInvocationError as exc:
+                detail = str(exc)
+                if server_error is not None:
+                    detail = f"{detail} (whisper-server also failed: {server_error})"
                 return make_error(
                     identifier,
                     PROVIDER_REQUEST_FAILED_CODE,
-                    (
-                        f"whisper-server failed ({server_error}) and no whisper-cli "
-                        "fallback is configured."
-                    ),
+                    detail,
                     {"method": method},
                 )
-            return make_error(
-                identifier,
-                PROVIDER_UNAVAILABLE_CODE,
-                "No transcription provider is configured for the requested workflow.",
-                {"method": method},
-            )
 
-        try:
-            result = transcribe_with_whisper_cli(effective_params, cli_config)
-        except ProviderInvocationError as exc:
-            detail = str(exc)
-            if server_error is not None:
-                detail = f"{detail} (whisper-server also failed: {server_error})"
-            return make_error(
-                identifier,
-                PROVIDER_REQUEST_FAILED_CODE,
-                detail,
-                {"method": method},
-            )
-
-        if extra_notes:
-            result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
-        return make_result(identifier, result)
+            if extra_notes:
+                result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
+            return make_result(identifier, result)
+        finally:
+            # Best-effort cleanup of the silero-vad pre-pass output. Both
+            # the trimmed-speech (`.vad-trimmed.wav`) and empty-speech
+            # (`.vad-empty.wav`) variants are written under
+            # `runtime_dir/vad/` and have no consumer once the
+            # transcribe call returns. Without this unlink each request
+            # leaks one WAV file at ~32 KB/s × duration, which adds up
+            # quickly under VAD-gated dictation.
+            if vad_trimmed_path is not None:
+                with contextlib.suppress(OSError):
+                    vad_trimmed_path.unlink()
 
     if method == "segment_probe":
         vad_config = load_whisper_vad_config()
