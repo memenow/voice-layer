@@ -268,6 +268,47 @@ class SplitWavIntoSegmentsTest(unittest.TestCase):
             with self.assertRaises(ProviderInvocationError):
                 mimo_asr._split_wav_into_segments(bogus, 60.0, tmp_path)
 
+    def test_partial_chunks_are_cleaned_up_when_mid_write_fails(self) -> None:
+        # A mid-loop failure (disk quota, SIGTERM-driven OSError, ...)
+        # would otherwise leak every chunk written before the failure.
+        # Patch `wave.open` to fail on the second write so the first
+        # chunk file is on disk when the splitter raises; the splitter's
+        # finally must roll the partial state back.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            audio = tmp_path / "long.wav"
+            _write_silent_wav(audio, 5.0)
+            runtime_dir = tmp_path / "runtime"
+            runtime_dir.mkdir()
+
+            real_wave_open = wave.open
+            calls = {"count": 0}
+
+            def faulty_wave_open(path: object, mode: str = "rb", *args: object, **kwargs: object):
+                calls["count"] += 1
+                # Call 1 = read input; call 2 = write chunk 0; call 3 =
+                # write chunk 1 — fail there so chunk 0 is on disk and
+                # the splitter has to clean it up.
+                if mode == "wb" and calls["count"] >= 3:
+                    raise OSError("simulated disk failure during chunk write")
+                return real_wave_open(path, mode, *args, **kwargs)
+
+            with (
+                patch(
+                    "voicelayer_orchestrator.providers.mimo_asr.wave.open",
+                    side_effect=faulty_wave_open,
+                ),
+                self.assertRaises(ProviderInvocationError),
+            ):
+                mimo_asr._split_wav_into_segments(audio, 2.0, runtime_dir)
+
+            leftover = sorted(p.name for p in runtime_dir.glob("mimo-segment-*.wav"))
+            self.assertEqual(
+                leftover,
+                [],
+                f"splitter must clean up partial chunks on mid-write failure: {leftover}",
+            )
+
 
 class TranscribeWithMimoTest(unittest.TestCase):
     def _config(self, tmp: pathlib.Path) -> MimoAsrConfig:
@@ -597,11 +638,21 @@ class VadPrepassForMimoTest(unittest.TestCase):
                 )
 
             mimo_dir = runtime_root / "voicelayer" / "providers" / "mimo"
-            # The directory itself may still exist (we never rmdir it),
-            # but every chunk the splitter wrote must be gone.
-            if mimo_dir.exists():
-                leftover = sorted(p.name for p in mimo_dir.iterdir())
-                self.assertEqual(leftover, [])
+            # The splitter must have actually written its chunks under
+            # `mimo_dir` for the test to be meaningful — otherwise the
+            # cleanup assertion below trivially passes whenever the
+            # split path was not exercised. With 5 s of audio and
+            # `long_audio_split_seconds=2.0` the splitter creates 3
+            # chunks before cleanup, so the directory must exist after
+            # the call.
+            self.assertTrue(
+                mimo_dir.exists(),
+                "splitter should have created the runtime dir",
+            )
+            # The directory itself stays (we never rmdir it), but every
+            # chunk the splitter wrote must be gone.
+            leftover = sorted(p.name for p in mimo_dir.iterdir())
+            self.assertEqual(leftover, [])
             # The caller-supplied capture stays alive — only the worker-owned
             # chunk WAVs are cleaned up.
             self.assertTrue(audio.exists())

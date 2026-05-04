@@ -170,6 +170,15 @@ def _split_wav_into_segments(
     if max_segment_seconds <= 0:
         return [audio_path]
 
+    # Track every chunk we have written so a mid-loop failure (mid-write
+    # OSError such as quota exceeded, an unexpected `wave.Error` after
+    # partial writes, ...) can roll back the on-disk state instead of
+    # leaking N-1 chunks under `runtime_dir/mimo/`. The `success` flag
+    # distinguishes a clean return from any exception path so we only
+    # clean on failure — segments returned on success are owned by the
+    # caller (`transcribe_with_mimo`).
+    segments: list[Path] = []
+    success = False
     try:
         with wave.open(str(audio_path), "rb") as wav:
             n_channels = wav.getnchannels()
@@ -178,13 +187,14 @@ def _split_wav_into_segments(
             n_frames = wav.getnframes()
             duration = n_frames / float(framerate) if framerate > 0 else 0.0
             if duration <= max_segment_seconds:
+                success = True
                 return [audio_path]
 
             frames_per_segment = int(max_segment_seconds * framerate)
             if frames_per_segment <= 0:
+                success = True
                 return [audio_path]
 
-            segments: list[Path] = []
             timestamp_ms = int(time.time() * 1000)
             segment_index = 0
             wav.rewind()
@@ -200,9 +210,18 @@ def _split_wav_into_segments(
                     out.writeframes(chunk)
                 segments.append(segment_path)
                 segment_index += 1
+            success = True
             return segments or [audio_path]
-    except wave.Error as exc:
+    except (wave.Error, OSError) as exc:
+        # Translate filesystem-level failures alongside `wave.Error` so
+        # the worker's transcribe handler treats both as a structured
+        # provider failure rather than crashing the JSON-RPC dispatch.
         raise ProviderInvocationError(f"Unable to split WAV at {audio_path}: {exc}") from exc
+    finally:
+        if not success:
+            for partial in segments:
+                with contextlib.suppress(OSError):
+                    partial.unlink()
 
 
 def _ensure_repo_on_path(repo_path: str | None) -> None:

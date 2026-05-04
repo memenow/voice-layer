@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -212,6 +213,13 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         self.worker = worker
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-worker-"))
 
+    def tearDown(self) -> None:
+        # `tempfile.mkdtemp` does not auto-clean; remove the per-test
+        # directory so repeated runs of the suite do not leave
+        # `voicelayer-vad-worker-*` debris in `/tmp`.
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        super().tearDown()
+
     def _write_silent_wav(self, path: pathlib.Path, duration_sec: float = 1.0) -> None:
         sample_rate = 16000
         frames = int(sample_rate * duration_sec)
@@ -345,6 +353,13 @@ class VadDispatcherCleanupTest(unittest.TestCase):
 
         self.worker = worker
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-cleanup-"))
+
+    def tearDown(self) -> None:
+        # Same cleanup discipline as `VadWorkerIntegrationTest` — keep
+        # `/tmp` from accumulating `voicelayer-vad-cleanup-*` dirs
+        # across test runs.
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        super().tearDown()
 
     def _write_silent_wav(self, path: pathlib.Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
