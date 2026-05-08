@@ -9,10 +9,21 @@ tuple and returns a list of result objects whose elements expose
 preprocessing, resampling, and long-audio chunking internally, so the
 worker hands the wrapper raw WAV paths and trusts it for the rest.
 
-The model is loaded on the first transcribe call and kept warm in a
-module-level cache for the lifetime of the worker process. Cold load
-takes seconds on a configured GPU; per-call latency on a single
-consumer CUDA accelerator with bf16 is sub-second on 5-15 s clips.
+The model loads inside the worker process on the first transcribe
+call. The module-level cache below survives only as long as the
+process: it shields multi-segment splits inside one call from
+re-loading and is forward-compatible with a persistent worker, but
+under today's daemon (`crates/voicelayerd/src/worker.rs::call`) every
+JSON-RPC request spawns a fresh ``python -m
+voicelayer_orchestrator.worker`` process and exits after the response,
+so each transcribe pays the cold load. Per-call latency on a
+configured CUDA accelerator with bf16 is therefore the cold-load cost
+of the wrapper plus inference; sub-second inference on 5-15 s clips
+matches upstream's published numbers but does not include the load
+time. Routed dictation sessions (fixed / vad-gated / repeated
+transcribe) inherit this cost on every segment until the daemon grows
+a persistent-worker mode. See `docs/guides/local-asr-provider.md` for
+the cold-start guidance and the operator-facing trade-off.
 
 Optional. The whisper.cpp chain remains the default ASR provider.
 Callers select Qwen3-ASR by setting ``TranscribeRequest.provider_id =
@@ -43,10 +54,20 @@ from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
 # load-time precision (``torch_dtype``). All three are operator-tunable
 # so they belong in the cache key; multiple unique configurations are
 # theoretically possible (operator switching between cuda:0 and cuda:1
-# mid-session, or flipping bf16 to fp16 to debug a numerical issue) but
-# the typical case is a single entry kept warm for the worker lifetime.
-# The cache is intentionally unbounded; switching keys is operator-driven
-# and infrequent.
+# mid-session, or flipping bf16 to fp16 to debug a numerical issue).
+#
+# Scope reality check: under the current daemon, every JSON-RPC request
+# spawns a fresh worker process and exits after the reply (see
+# `crates/voicelayerd/src/worker.rs::WorkerCommand::call`). The cache
+# is therefore module-level but process-scoped, which today means
+# "shared across the segments of one transcribe call only" — it does
+# not survive across separate `/v1/transcriptions` calls or across the
+# segments of a fixed/vad-gated dictation session, since each segment
+# is its own `transcribe` JSON-RPC call. The cache is kept here so a
+# future persistent-worker mode picks up the warm path for free; until
+# then operators selecting Qwen3-ASR for routed dictation pay the cold
+# load on every segment. The cache is intentionally unbounded;
+# switching keys is operator-driven and infrequent.
 _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 

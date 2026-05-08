@@ -370,6 +370,19 @@ linear growth with longer audio. The Qwen3-ASR latency figure is the upstream-pu
 expectation rather than a maintainer-measured number; rerun a benchmark on your own hardware
 before relying on the figure.
 
+**Cold-start applies per call.** The daemon currently spawns a fresh
+`python -m voicelayer_orchestrator.worker` process for every JSON-RPC request and exits after
+the response (see `crates/voicelayerd/src/worker.rs::WorkerCommand::call`), so the
+module-level model cache inside the worker only survives one transcribe call. A routed
+dictation session backed by `mimo_v2_5_asr` or `qwen3_asr_1_7b` pays the cold load **on every
+segment**: fixed-mode segments, VAD-gated speech units, and the stop-time transcript each
+spawn a separate worker. The whisper.cpp path side-steps this through the persistent
+`whisper-server` HTTP sidecar described above; an equivalent persistent-worker mode for the
+GPU providers is future work. Until that ships, prefer the GPU providers for one-shot
+transcribe / record-transcribe flows where a single cold load is amortised over the whole
+capture, and stay on whisper for fixed/vad-gated live dictation if cold-start cost is
+material on your hardware.
+
 When in doubt, keep dictation on whisper for short PTT bursts (lower cold-load + warm
 latency) and route long-form / multilingual / quality-priority captures through MiMo or
 Qwen3-ASR by passing `--provider-id mimo_v2_5_asr` / `--provider-id qwen3_asr_1_7b` to the
