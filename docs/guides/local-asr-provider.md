@@ -121,12 +121,13 @@ backend. When enabled it detects speech regions in the captured WAV, concatenate
 trimmed 16-bit mono WAV, and feeds that file to the transcription provider. The JSON-RPC
 `transcribe` contract is unchanged — VAD is invisible to the daemon.
 
-The pre-pass applies to **both** the default whisper.cpp chain and the optional MiMo-V2.5-ASR
-provider. Silero-vad is ASR-backend agnostic, so the same `VOICELAYER_WHISPER_VAD_*` variables
-control both paths — the `WHISPER_` prefix is a historical artefact from the whisper-only days.
-On the MiMo side the pre-pass also short-circuits inference when no speech is detected, which
-matters more than on whisper because MiMo's causal LM can hallucinate plausible-looking
-transcripts on pure silence.
+The pre-pass applies to the default whisper.cpp chain and to **every** opt-in ASR provider —
+MiMo-V2.5-ASR and Qwen3-ASR-1.7B both honor it. Silero-vad is ASR-backend agnostic, so the
+same `VOICELAYER_WHISPER_VAD_*` variables control every path — the `WHISPER_` prefix is a
+historical artefact from the whisper-only days. On the MiMo and Qwen3-ASR sides the pre-pass
+also short-circuits inference when no speech is detected, which matters more than on whisper
+because both backends use causal LMs that can hallucinate plausible-looking transcripts on
+pure silence.
 
 VAD pulls in `onnxruntime` and `numpy`, which are shipped as the optional `vad` extra to keep the
 default worker stdlib-only. Install the extra once and download a silero-vad ONNX model:
@@ -361,19 +362,142 @@ silently degraded across the session.
 | --- | --- | --- | --- | --- | --- |
 | `whisper_cpp` (server) | seconds (mmapped ggml) | ~0.65 s / call (base.en, CPU) | en (base.en) or multilingual (large-v3) | CPU sufficient | No |
 | `mimo_v2_5_asr` | ~30 s (LM + audio tokenizer into VRAM) | ~0.27 s / 3 s clip (RTX 5090, cu128, flash-attn 2.8.1) | zh / en / yue / wuu / nan / sc / mixed | CUDA, ~16 GB VRAM | No |
+| `qwen3_asr_1_7b` | seconds (4.7 GB weights into VRAM) | sub-second / ≤15 s clip on a modern CUDA GPU at bf16 | 30 languages incl. Chinese (mainland + Cantonese), English, Arabic, German, French, Spanish, Portuguese, Indonesian, Italian, Korean, Russian, Thai, Vietnamese, Japanese, Turkish, Hindi, Malay, Dutch, Swedish, Danish, Finnish, Polish, Czech, Filipino, Persian, Greek, Romanian, Hungarian, Macedonian | CUDA recommended (~6 GB VRAM at bf16); CPU works but 10-30× realtime | No |
 
 The MiMo warm-call number above was measured on the maintainer's reference workstation against
 the 3-second silent fixture; expect a similar order of magnitude for short utterances and
-linear growth with longer audio.
+linear growth with longer audio. The Qwen3-ASR latency figure is the upstream-published
+expectation rather than a maintainer-measured number; rerun a benchmark on your own hardware
+before relying on the figure.
 
 When in doubt, keep dictation on whisper for short PTT bursts (lower cold-load + warm
-latency) and route long-form / multilingual / quality-priority captures through MiMo by
-passing `--provider-id mimo_v2_5_asr` to the relevant CLI command or by setting it on the
-HTTP request body.
+latency) and route long-form / multilingual / quality-priority captures through MiMo or
+Qwen3-ASR by passing `--provider-id mimo_v2_5_asr` / `--provider-id qwen3_asr_1_7b` to the
+relevant CLI command or by setting it on the HTTP request body.
 
-The provider lives at `python/voicelayer_orchestrator/providers/mimo_asr.py` (lazy-loaded model
-cache + per-segment dispatch); long-audio splitting is performed in-process via the stdlib
-`wave` module to mitigate upstream issue #6.
+The MiMo provider lives at `python/voicelayer_orchestrator/providers/mimo_asr.py` (lazy-loaded
+model cache + per-segment dispatch); long-audio splitting is performed in-process via the
+stdlib `wave` module to mitigate upstream issue #6.
+
+## Qwen3-ASR-1.7B (optional Apache-2.0 GPU/CPU provider)
+
+For Apache-2.0-friendly multilingual workflows VoiceLayer ships an opt-in
+[Alibaba Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) provider. The whisper.cpp
+chain remains the default; callers select Qwen3-ASR by setting
+`TranscribeRequest.provider_id = "qwen3_asr_1_7b"`.
+
+### What you get
+
+- Native multilingual recognition across 30 languages including Mandarin Chinese, Cantonese,
+  English, Arabic, German, French, Spanish, Portuguese, Indonesian, Italian, Korean, Russian,
+  Thai, Vietnamese, Japanese, Turkish, Hindi, Malay, Dutch, Swedish, Danish, Finnish, Polish,
+  Czech, Filipino, Persian, Greek, Romanian, Hungarian, and Macedonian.
+- Apache-2.0 weights — usable in environments where MiMo's MIT-with-source-tree-only
+  distribution is awkward.
+- ~4.7 GB fp16 weights on disk; ~6 GB VRAM at bf16. No flash-attn requirement.
+- Sub-second latency on a modern CUDA accelerator for ≤15 s clips at bf16.
+
+### What you give up
+
+- No timestamps, no streaming, no partial hypotheses (timestamps require the separate
+  Qwen3-ForcedAligner-0.6B model, which VoiceLayer does not ship today).
+- No translation. The model is transcription-only; combining
+  `provider_id="qwen3_asr_1_7b"` with `translate_to_english=true` is rejected at the daemon
+  layer.
+- CPU inference works but is roughly 10-30× realtime. The worker prints a one-shot stderr
+  warning when first transcribe runs on CPU; consider a GPU before relying on this path.
+
+### One-time setup
+
+```bash
+# 1. Install torch + torchaudio from the PyTorch index that matches your GPU compute
+#    capability. Use cu128 for Blackwell (RTX 50 series, sm_120); cu126 / cu124 for
+#    Hopper / Ada. The qwen3-asr extra accepts torch >= 2.7 < 3.0.
+uv sync --group dev
+uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+  "torch>=2.7,<3.0" "torchaudio>=2.7,<3.0"
+
+# 2. Install the provider runtime. Brings in the official `qwen-asr` pip wrapper and its
+#    transformers floor.
+uv pip install -e ".[qwen3-asr]"
+
+# 3. Stage the weights locally. The new `hf` CLI replaces the deprecated `huggingface-cli`.
+hf download Qwen/Qwen3-ASR-1.7B \
+  --local-dir ~/.cache/voicelayer/models/qwen3-asr-1.7b
+```
+
+The `qwen3-asr` extra is intentionally independent from `mimo`. MiMo pins
+`transformers==4.49.0` while qwen-asr's transformers floor tracks the version the model card
+was saved against (4.57.6 at time of writing); installing both extras into the same virtualenv
+will fight over `transformers`. Pick one provider per environment, or run separate venvs.
+
+### Environment variables
+
+```bash
+VOICELAYER_QWEN3_ASR_MODEL_PATH=/abs/path/to/qwen3-asr-1.7b
+VOICELAYER_QWEN3_ASR_DEVICE=cuda:0
+VOICELAYER_QWEN3_ASR_DTYPE=bfloat16
+VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS=600
+VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS=0
+VOICELAYER_QWEN3_ASR_ARGS=
+```
+
+The only required key is `VOICELAYER_QWEN3_ASR_MODEL_PATH`. Set
+`VOICELAYER_QWEN3_ASR_DTYPE` to `float16` on GPUs that lack bf16 support
+(pre-Ampere) or to `float32` to debug numerical issues.
+`VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS` defaults to `0` (disabled) because the
+upstream wrapper handles long audio internally; set a positive value to force worker-side
+chunking when you want to bound peak VRAM on extremely long captures. The worker translates
+the request `language` field (`zh`, `zh-cn`, `yue`, `en`, `en-us`, ...) into the wrapper's
+English language name (`Chinese`, `Cantonese`, `English`, ...) automatically; unknown codes
+fall through to the wrapper's auto-detector.
+
+### Select the provider per request
+
+```bash
+SOCKET="${XDG_RUNTIME_DIR:-/run/user/$UID}/voicelayer/daemon.sock"
+
+curl --unix-socket "$SOCKET" -s -X POST http://d/v1/transcriptions \
+  -H 'content-type: application/json' \
+  -d '{"audio_file":"/abs/path/sample-zh.wav","provider_id":"qwen3_asr_1_7b","language":"zh"}'
+```
+
+`vl doctor` reports `qwen3_asr_configured` / `qwen3_asr_error` once the env var is set, and
+`vl providers` lists the descriptor as `qwen3_asr_1_7b` with `experimental=true,
+default_enabled=false`, license `Apache-2.0`, so the whisper.cpp chain remains the default.
+
+### Select the provider per dictation session
+
+`provider_id` is a session-level knob on every dictation endpoint, so a session that picks
+Qwen3-ASR at start uses Qwen3-ASR for every transcribe call (one-shot stop, fixed-mode
+segments, vad-gated speech units, ad-hoc captures):
+
+```bash
+# Live segmented dictation backed entirely by Qwen3-ASR-1.7B
+cargo run -p vl -- dictation start \
+  --mode fixed \
+  --segment-secs 8 \
+  --provider-id qwen3_asr_1_7b
+
+# One-command record + capture + transcribe through Qwen3-ASR
+cargo run -p vl -- record-transcribe \
+  --duration-seconds 8 \
+  --provider-id qwen3_asr_1_7b
+
+# Foreground PTT TUI loop pinned to Qwen3-ASR for every press-release cycle
+cargo run -p vl -- dictation foreground-ptt \
+  --provider-id qwen3_asr_1_7b
+```
+
+The PTT default can be persisted in `~/.config/voicelayer/config.toml`:
+
+```bash
+vl config set foreground_ptt.provider_id qwen3_asr_1_7b
+```
+
+The provider lives at `python/voicelayer_orchestrator/providers/qwen3_asr.py` (lazy-loaded
+model cache + dispatch); the upstream `qwen-asr` package handles audio preprocessing and
+long-audio chunking, so worker-side splitting is opt-in.
 
 ## Current Scope
 

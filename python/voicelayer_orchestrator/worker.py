@@ -11,6 +11,7 @@ from typing import Any, TextIO
 from voicelayer_orchestrator.config import (
     load_llm_provider_config,
     load_mimo_asr_config,
+    load_qwen3_asr_config,
     load_whisper_provider_config,
     load_whisper_server_config,
     load_whisper_vad_config,
@@ -32,6 +33,10 @@ from voicelayer_orchestrator.providers.mimo_asr import (
     transcribe_with_mimo,
     validate_mimo_provider,
 )
+from voicelayer_orchestrator.providers.qwen3_asr import (
+    transcribe_with_qwen3_asr,
+    validate_qwen3_asr_provider,
+)
 from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass, probe_audio_file
 from voicelayer_orchestrator.providers.whisper_cli import (
     transcribe_with_whisper_cli,
@@ -47,6 +52,7 @@ from voicelayer_orchestrator.providers.whisper_server import (
 # Provider id selecting the Xiaomi MiMo-V2.5-ASR backend on the
 # `transcribe` JSON-RPC method. Whisper.cpp remains the default.
 MIMO_PROVIDER_ID = "mimo_v2_5_asr"
+QWEN3_ASR_PROVIDER_ID = "qwen3_asr_1_7b"
 WHISPER_PROVIDER_ID = "whisper_cpp"
 
 PROVIDER_UNAVAILABLE_CODE = -32004
@@ -132,6 +138,8 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         whisper_server_config = load_whisper_server_config()
         mimo_config = load_mimo_asr_config()
         mimo_configured, mimo_error = validate_mimo_provider(mimo_config)
+        qwen3_config = load_qwen3_asr_config()
+        qwen3_configured, qwen3_error = validate_qwen3_asr_provider(qwen3_config)
         asr_configured, asr_error = validate_whisper_provider(whisper_config)
 
         # Report which whisper path the `transcribe` handler would
@@ -183,6 +191,9 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 "mimo_configured": mimo_configured,
                 "mimo_model_path": None if mimo_config is None else mimo_config.model_path,
                 "mimo_error": mimo_error,
+                "qwen3_asr_configured": qwen3_configured,
+                "qwen3_asr_model_path": None if qwen3_config is None else qwen3_config.model_path,
+                "qwen3_asr_error": qwen3_error,
                 "llm_configured": config is not None,
                 "llm_model": None if config is None else config.model,
                 "llm_endpoint": None if config is None else config.endpoint,
@@ -219,13 +230,15 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         if provider_id is not None and provider_id not in {
             WHISPER_PROVIDER_ID,
             MIMO_PROVIDER_ID,
+            QWEN3_ASR_PROVIDER_ID,
         }:
             return make_error(
                 identifier,
                 PROVIDER_UNAVAILABLE_CODE,
                 (
                     f"Unknown ASR provider id `{provider_id}`. Supported ids: "
-                    f"`{WHISPER_PROVIDER_ID}`, `{MIMO_PROVIDER_ID}`."
+                    f"`{WHISPER_PROVIDER_ID}`, `{MIMO_PROVIDER_ID}`, "
+                    f"`{QWEN3_ASR_PROVIDER_ID}`."
                 ),
                 {"method": method},
             )
@@ -247,6 +260,32 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 )
             try:
                 result = transcribe_with_mimo(request_params, mimo_config)
+            except ProviderInvocationError as exc:
+                return make_error(
+                    identifier,
+                    PROVIDER_REQUEST_FAILED_CODE,
+                    str(exc),
+                    {"method": method},
+                )
+            return make_result(identifier, result)
+
+        if provider_id == QWEN3_ASR_PROVIDER_ID:
+            qwen3_config = load_qwen3_asr_config()
+            if qwen3_config is None:
+                return make_error(
+                    identifier,
+                    PROVIDER_UNAVAILABLE_CODE,
+                    (
+                        "Qwen3-ASR-1.7B is not configured. Set "
+                        "VOICELAYER_QWEN3_ASR_MODEL_PATH to a directory "
+                        "containing the Qwen/Qwen3-ASR-1.7B HuggingFace "
+                        "snapshot before requesting "
+                        f"`provider_id={QWEN3_ASR_PROVIDER_ID}`."
+                    ),
+                    {"method": method},
+                )
+            try:
+                result = transcribe_with_qwen3_asr(request_params, qwen3_config)
             except ProviderInvocationError as exc:
                 return make_error(
                     identifier,

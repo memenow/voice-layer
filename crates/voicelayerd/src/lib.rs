@@ -221,9 +221,10 @@ fn pre_capture_provider_rejection_detail(
             SUPPORTED_TRANSCRIBE_PROVIDER_IDS.join(", "),
         ));
     }
-    if matches!(provider_id, Some("mimo_v2_5_asr")) && translate_to_english {
+    if matches!(provider_id, Some("mimo_v2_5_asr") | Some("qwen3_asr_1_7b")) && translate_to_english
+    {
         return Some(
-            "MiMo-V2.5-ASR does not support translate_to_english today; \
+            "MiMo-V2.5-ASR and Qwen3-ASR-1.7B do not support translate_to_english today; \
              run translation through the LLM workflow or pick the default \
              whisper.cpp provider."
                 .to_owned(),
@@ -244,7 +245,9 @@ fn dictation_provider_request_rejection(
     translate_to_english: bool,
 ) -> Option<Response> {
     let message = pre_capture_provider_rejection_detail(provider_id, translate_to_english)?;
-    let error_code = if matches!(provider_id, Some("mimo_v2_5_asr")) && translate_to_english {
+    let error_code = if matches!(provider_id, Some("mimo_v2_5_asr") | Some("qwen3_asr_1_7b"))
+        && translate_to_english
+    {
         "translate_to_english_unsupported"
     } else {
         "invalid_provider_id"
@@ -297,6 +300,9 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             mimo_configured: health.mimo_configured,
             mimo_model_path: health.mimo_model_path,
             mimo_error: health.mimo_error,
+            qwen3_asr_configured: health.qwen3_asr_configured,
+            qwen3_asr_model_path: health.qwen3_asr_model_path,
+            qwen3_asr_error: health.qwen3_asr_error,
             llm_configured: health.llm_configured,
             llm_model: health.llm_model,
             llm_endpoint: health.llm_endpoint,
@@ -327,6 +333,9 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             mimo_configured: false,
             mimo_model_path: None,
             mimo_error: None,
+            qwen3_asr_configured: false,
+            qwen3_asr_model_path: None,
+            qwen3_asr_error: None,
             message: Some(error.to_string()),
         },
     };
@@ -3256,6 +3265,9 @@ mod http_api_tests {
             mimo_configured: false,
             mimo_model_path: Some(String::new()),
             mimo_error: Some(String::new()),
+            qwen3_asr_configured: false,
+            qwen3_asr_model_path: Some(String::new()),
+            qwen3_asr_error: Some(String::new()),
             llm_configured: false,
             llm_model: Some(String::new()),
             llm_endpoint: Some(String::new()),
@@ -3975,6 +3987,40 @@ mod http_api_tests {
             status,
             StatusCode::BAD_REQUEST,
             "mimo_v2_5_asr + translate_to_english must surface as 400; got body: {body}",
+        );
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("translate_to_english_unsupported"),
+            "rejection error code must classify the failure; got body: {body}",
+        );
+    }
+
+    /// Mirror of the MiMo translate-rejection pin for the second opt-in
+    /// provider: `qwen3_asr_1_7b` is transcription-only, so combining
+    /// it with `translate_to_english` must fail at the daemon layer
+    /// rather than wasting a capture on a documented-incompatible flag.
+    #[tokio::test]
+    async fn create_dictation_session_rejects_qwen3_asr_with_translate_to_english() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let worker = mock_worker_command(
+            tempdir.path(),
+            serde_json::json!({"transcribe_map": {}, "fail_stems": []}),
+        );
+        let state = build_app_state(test_config(worker), fake_successful_spawner);
+        let router = build_app_router(state);
+
+        let request = serde_json::json!({
+            "trigger": "cli",
+            "segmentation": {"mode": "one_shot"},
+            "provider_id": "qwen3_asr_1_7b",
+            "translate_to_english": true,
+        });
+        let (status, body): (StatusCode, serde_json::Value) =
+            post_json(router, "/v1/sessions/dictation", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "qwen3_asr_1_7b + translate_to_english must surface as 400; got body: {body}",
         );
         assert_eq!(
             body.get("error").and_then(serde_json::Value::as_str),

@@ -30,7 +30,8 @@ pub struct ProviderDescriptor {
 ///
 /// Keep in sync with `python/voicelayer_orchestrator/worker.py` and the
 /// `provider_id` enum in `openapi/voicelayerd.v1.yaml`.
-pub const SUPPORTED_TRANSCRIBE_PROVIDER_IDS: &[&str] = &["whisper_cpp", "mimo_v2_5_asr"];
+pub const SUPPORTED_TRANSCRIBE_PROVIDER_IDS: &[&str] =
+    &["whisper_cpp", "mimo_v2_5_asr", "qwen3_asr_1_7b"];
 
 /// Return whether `provider_id` is a runtime-dispatchable ASR id.
 /// `None` (the default) is always accepted; the daemon falls back to
@@ -70,6 +71,15 @@ pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
             default_enabled: false,
             experimental: true,
             license: "MIT".to_owned(),
+        },
+        ProviderDescriptor {
+            id: "qwen3_asr_1_7b".to_owned(),
+            kind: ProviderKind::Asr,
+            transport: "stdio_worker".to_owned(),
+            local: true,
+            default_enabled: false,
+            experimental: true,
+            license: "Apache-2.0".to_owned(),
         },
         ProviderDescriptor {
             id: "gemma_4_local".to_owned(),
@@ -155,6 +165,25 @@ mod tests {
         assert!(!mimo.default_enabled);
         assert!(mimo.experimental);
         assert_eq!(mimo.license, "MIT");
+    }
+
+    /// `qwen3_asr_1_7b` is the optional Apache-2.0 ASR provider
+    /// (Alibaba Qwen/Qwen3-ASR-1.7B via the Python worker's `qwen-asr`
+    /// wrapper). Must advertise in the catalog so `vl providers` lists
+    /// it, but stay `default_enabled: false` / `experimental: true` so
+    /// the whisper.cpp chain remains the default and operators opt in
+    /// explicitly via `TranscribeRequest.provider_id`.
+    #[test]
+    fn catalog_contains_qwen3_asr_1_7b_descriptor_as_optional_experimental() {
+        let catalog = default_provider_catalog();
+        let qwen3 = catalog
+            .iter()
+            .find(|provider| provider.id == "qwen3_asr_1_7b")
+            .expect("qwen3_asr_1_7b must be present in the default provider catalog");
+        assert_eq!(qwen3.kind, ProviderKind::Asr);
+        assert!(!qwen3.default_enabled);
+        assert!(qwen3.experimental);
+        assert_eq!(qwen3.license, "Apache-2.0");
     }
 
     #[test]
@@ -296,6 +325,10 @@ mod tests {
         assert!(
             !is_supported_transcribe_provider_id(Some("mimo_v2_5")),
             "typo-style id (missing `_asr`) must be rejected",
+        );
+        assert!(
+            !is_supported_transcribe_provider_id(Some("qwen3_asr")),
+            "typo-style id (missing `_1_7b`) must be rejected",
         );
     }
 }

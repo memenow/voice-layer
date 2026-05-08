@@ -255,6 +255,15 @@ pub struct WorkerHealthResult {
     pub mimo_model_path: Option<String>,
     #[serde(default)]
     pub mimo_error: Option<String>,
+    /// Whether Qwen3-ASR-1.7B is configured and validated. Defaults to
+    /// `false` so worker payloads predating the optional Qwen3 provider
+    /// continue to deserialize.
+    #[serde(default)]
+    pub qwen3_asr_configured: bool,
+    #[serde(default)]
+    pub qwen3_asr_model_path: Option<String>,
+    #[serde(default)]
+    pub qwen3_asr_error: Option<String>,
     pub llm_configured: bool,
     pub llm_model: Option<String>,
     pub llm_endpoint: Option<String>,
@@ -833,6 +842,24 @@ the bullet list above and must not be captured.
             );
         assert!(!mimo.default_enabled);
         assert!(mimo.experimental);
+
+        // Same shape for the optional Qwen3-ASR-1.7B backend: advertised
+        // in the catalog with `default_enabled=false` /
+        // `experimental=true` so the whisper.cpp chain remains the
+        // production default and operators opt in via
+        // `TranscribeRequest.provider_id`.
+        let qwen3 = providers
+            .providers
+            .iter()
+            .find(|provider| provider.id == "qwen3_asr_1_7b")
+            .expect(
+                "the Python worker must advertise the qwen3_asr_1_7b ASR \
+                 provider so operators can opt into it via \
+                 TranscribeRequest.provider_id",
+            );
+        assert!(!qwen3.default_enabled);
+        assert!(qwen3.experimental);
+        assert_eq!(qwen3.license, "Apache-2.0");
     }
 
     #[tokio::test]

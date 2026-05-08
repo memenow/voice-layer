@@ -43,28 +43,33 @@ The worker implements every required method with real providers:
   VAD failure falls back to the raw WAV without losing the request.
   When the request body sets `provider_id="mimo_v2_5_asr"` and the
   optional Xiaomi MiMo-V2.5-ASR provider is configured (see
-  `providers/mimo_asr.py` and `VOICELAYER_MIMO_*`), the worker bypasses
-  the whisper chain entirely and dispatches to the MiMo backend; an
-  unknown `provider_id` returns `-32004` rather than silently routing
-  to whisper, and an explicit MiMo failure returns `-32005` without
+  `providers/mimo_asr.py` and `VOICELAYER_MIMO_*`), or sets
+  `provider_id="qwen3_asr_1_7b"` and the optional Alibaba
+  Qwen3-ASR-1.7B provider is configured (see `providers/qwen3_asr.py`
+  and `VOICELAYER_QWEN3_ASR_*`), the worker bypasses the whisper chain
+  entirely and dispatches to the selected backend; an unknown
+  `provider_id` returns `-32004` rather than silently routing to
+  whisper, and an explicit backend failure returns `-32005` without
   whisper fallback. The same `provider_id` is plumbed through every
   transcribe call a dictation session emits — the daemon stores it on
   the active session at `POST /v1/sessions/dictation` (or
   `POST /v1/dictation/capture`) and forwards it on every fixed-segment,
   vad-gated speech-unit, and one-shot stop transcribe call, so a
-  caller that selects MiMo at session start never silently falls back
-  to whisper for a subset of segments. The silero-vad pre-pass also
-  applies on the MiMo path: when `VOICELAYER_WHISPER_VAD_ENABLED=true`
-  the same trim/short-circuit/fall-back-to-raw-WAV behavior runs
-  before MiMo inference, which avoids paying the cold-load cost on
-  pure-silence captures and prevents MiMo's causal LM from
+  caller that selects MiMo or Qwen3-ASR at session start never silently
+  falls back to whisper for a subset of segments. The silero-vad
+  pre-pass also applies on both opt-in paths: when
+  `VOICELAYER_WHISPER_VAD_ENABLED=true` the same
+  trim/short-circuit/fall-back-to-raw-WAV behavior runs before backend
+  inference, which avoids paying the cold-load cost on pure-silence
+  captures and prevents the causal LMs in MiMo / Qwen3-ASR from
   hallucinating transcripts on detected-silence audio.
-  After `transcribe` returns — on success, on whisper / MiMo failure,
-  and on the no-speech short-circuit — the dispatcher unlinks the
-  per-call sidecar files it produced under `runtime_dir/`: the
-  `.vad-trimmed.wav` / `.vad-empty.wav` written by the silero-vad
-  pre-pass, plus the `mimo-segment-<ts>-<idx>.wav` chunks emitted by
-  the long-audio splitter. The original capture is left intact for the
+  After `transcribe` returns — on success, on whisper / MiMo /
+  Qwen3-ASR failure, and on the no-speech short-circuit — the
+  dispatcher unlinks the per-call sidecar files it produced under
+  `runtime_dir/`: the `.vad-trimmed.wav` / `.vad-empty.wav` written by
+  the silero-vad pre-pass, plus the `mimo-segment-<ts>-<idx>.wav` and
+  `qwen3-segment-<ts>-<idx>.wav` chunks emitted by the (optional)
+  long-audio splitters. The original capture is left intact for the
   caller (the dictation pipeline owns its lifetime via `keep_audio`).
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
@@ -130,6 +135,13 @@ Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
   device, dtype)`. Splits inputs longer than `VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS` into
   WAV chunks via the stdlib `wave` module so upstream issue #6 (decoder repetition past ~3
   minutes) does not surface in operator-facing transcripts.
+- `qwen3_asr.py` — optional Alibaba Qwen3-ASR-1.7B provider. Lazy-loads the `qwen-asr`
+  package's `Qwen3ASRModel` wrapper on first call and caches it in a module-level dict keyed
+  by `(model_path, device, torch_dtype)`. The wrapper handles audio preprocessing and
+  long-audio chunking internally, so worker-side splitting is opt-in via
+  `VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS` (default `0` = disabled). Apache-2.0; the
+  `qwen3-asr` extra is independent of the `mimo` extra so each provider can evolve its
+  transformers floor without breaking the other.
 - `vad_segmenter.py` — optional silero-vad pre-pass (v4 or v5 ONNX) that trims non-speech out of
   the input WAV before transcription, plus `probe_audio_file` for the `segment_probe` RPC that
   backs VAD-gated segmentation. Lazy-imports `numpy` and `onnxruntime` so the `vad` extra stays

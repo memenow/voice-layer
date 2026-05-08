@@ -210,7 +210,7 @@ class SupportedProvidersTest(unittest.TestCase):
     misclassified `kind`).
     """
 
-    def test_includes_three_asr_providers_and_an_llm_when_no_endpoint_configured(
+    def test_includes_four_asr_providers_and_an_llm_when_no_endpoint_configured(
         self,
     ) -> None:
         # Non-empty mapping with no VoiceLayer keys. `supported_providers`
@@ -222,7 +222,13 @@ class SupportedProvidersTest(unittest.TestCase):
         ids = {entry["id"] for entry in catalog}
         self.assertEqual(
             ids,
-            {"whisper_cpp", "voxtral_realtime", "mimo_v2_5_asr", "gemma_4_local"},
+            {
+                "whisper_cpp",
+                "voxtral_realtime",
+                "mimo_v2_5_asr",
+                "qwen3_asr_1_7b",
+                "gemma_4_local",
+            },
         )
         kinds = {entry["id"]: entry["kind"] for entry in catalog}
         self.assertEqual(
@@ -231,6 +237,7 @@ class SupportedProvidersTest(unittest.TestCase):
                 "whisper_cpp": "asr",
                 "voxtral_realtime": "asr",
                 "mimo_v2_5_asr": "asr",
+                "qwen3_asr_1_7b": "asr",
                 "gemma_4_local": "llm",
             },
         )
@@ -274,6 +281,39 @@ class SupportedProvidersTest(unittest.TestCase):
             )
             mimo = next(entry for entry in catalog if entry["id"] == "mimo_v2_5_asr")
             self.assertEqual(mimo["transport"], "in_process_torch")
+
+    def test_qwen3_asr_descriptor_is_optional_and_experimental(self) -> None:
+        # Qwen3-ASR-1.7B ships as opt-in: the catalog must advertise it
+        # so `vl providers` can list it, but the descriptor must keep
+        # `default_enabled=false` and `experimental=true` so callers
+        # know the whisper chain remains the production default. License
+        # is Apache-2.0 (vs MiMo's MIT) — pin so accidental copy-paste
+        # of the MiMo block does not silently relabel the provider.
+        catalog = supported_providers({"_test_marker": "1"})
+        qwen3 = next(entry for entry in catalog if entry["id"] == "qwen3_asr_1_7b")
+        self.assertEqual(qwen3["kind"], "asr")
+        self.assertEqual(qwen3["license"], "Apache-2.0")
+        self.assertFalse(qwen3["default_enabled"])
+        self.assertTrue(qwen3["experimental"])
+        # Without env vars set, the descriptor reports the generic
+        # stdio_worker transport so operators can tell at a glance
+        # whether their environment has the model path configured.
+        self.assertEqual(qwen3["transport"], "stdio_worker")
+
+    def test_qwen3_asr_transport_flips_to_in_process_when_path_configured(
+        self,
+    ) -> None:
+        # Operator wires VOICELAYER_QWEN3_ASR_MODEL_PATH to an existing
+        # directory. The descriptor's `transport` flips to
+        # `in_process_torch` so the operator can confirm at a glance
+        # that the worker would route to the in-process qwen-asr wrapper
+        # rather than the legacy stdio bridge.
+        with tempfile.TemporaryDirectory(prefix="voicelayer-qwen3-test-") as tmp:
+            model_dir = pathlib.Path(tmp) / "weights"
+            model_dir.mkdir()
+            catalog = supported_providers({"VOICELAYER_QWEN3_ASR_MODEL_PATH": str(model_dir)})
+            qwen3 = next(entry for entry in catalog if entry["id"] == "qwen3_asr_1_7b")
+            self.assertEqual(qwen3["transport"], "in_process_torch")
 
     def test_replaces_default_llm_with_configured_descriptor_when_endpoint_set(
         self,
