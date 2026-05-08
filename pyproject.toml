@@ -77,6 +77,11 @@ mimo = [
 qwen3-asr = [
     "torch>=2.7.0,<3.0",
     "torchaudio>=2.7.0,<3.0",
+    # The Qwen3-ASR-1.7B model card was saved against transformers
+    # 4.57.6; pin the floor explicitly here so `uv` can plan the
+    # `[tool.uv].conflicts` block against `mimo` (transformers==4.49.0)
+    # at sync time rather than discovering the version fight at import.
+    "transformers>=4.57.0",
     "qwen-asr>=0.0.6,<1.0",
 ]
 

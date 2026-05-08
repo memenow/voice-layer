@@ -447,10 +447,13 @@ The only required key is `VOICELAYER_QWEN3_ASR_MODEL_PATH`. Set
 (pre-Ampere) or to `float32` to debug numerical issues.
 `VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS` defaults to `0` (disabled) because the
 upstream wrapper handles long audio internally; set a positive value to force worker-side
-chunking when you want to bound peak VRAM on extremely long captures. The worker translates
-the request `language` field (`zh`, `zh-cn`, `yue`, `en`, `en-us`, ...) into the wrapper's
-English language name (`Chinese`, `Cantonese`, `English`, ...) automatically; unknown codes
-fall through to the wrapper's auto-detector.
+chunking when you want to bound peak VRAM on extremely long captures.
+`VOICELAYER_QWEN3_ASR_ARGS` is **reserved** for future passthrough into
+`model.transcribe` keyword arguments; the current upstream `qwen-asr` wrapper exposes only
+`audio` and `language`, so any value set here is parsed for forward compatibility but ignored
+at dispatch time. The worker translates the request `language` field (`zh`, `zh-cn`, `yue`,
+`en`, `en-us`, ...) into the wrapper's English language name (`Chinese`, `Cantonese`,
+`English`, ...) automatically; unknown codes fall through to the wrapper's auto-detector.
 
 ### Select the provider per request
 

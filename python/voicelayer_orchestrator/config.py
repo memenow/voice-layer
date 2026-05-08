@@ -141,6 +141,13 @@ class Qwen3AsrConfig:
     and point ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the
     worker never triggers HuggingFace downloads on its own.
 
+    ``extra_args`` is reserved for future passthrough into
+    ``model.transcribe`` keyword arguments. The current upstream
+    ``qwen-asr`` wrapper exposes only ``audio`` and ``language``, so the
+    field is parsed for forward compatibility but ignored at dispatch
+    time. Mirrors the same reserved-knob pattern on
+    :class:`MimoAsrConfig`.
+
     The provider is opt-in (`TranscribeRequest.provider_id =
     "qwen3_asr_1_7b"`). The whisper.cpp chain remains the default.
     """
