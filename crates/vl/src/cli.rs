@@ -131,7 +131,8 @@ enum DictationCommand {
         save_dir: Option<PathBuf>,
         /// ASR provider for every transcription this PTT loop emits.
         /// Defaults to the configured whisper.cpp chain when omitted;
-        /// `mimo_v2_5_asr` opts into Xiaomi MiMo-V2.5-ASR.
+        /// `mimo_v2_5_asr` opts into Xiaomi MiMo-V2.5-ASR, and
+        /// `qwen3_asr_1_7b` opts into Alibaba Qwen3-ASR-1.7B.
         #[arg(long)]
         provider_id: Option<String>,
     },
@@ -198,8 +199,9 @@ enum DictationCommand {
         duration_seconds: Option<u32>,
         /// ASR provider for every transcription this session emits.
         /// Defaults to the configured whisper.cpp chain when omitted.
-        /// Currently accepted values: `whisper_cpp`, `mimo_v2_5_asr`.
-        /// The daemon rejects unknown values rather than falling back.
+        /// Currently accepted values: `whisper_cpp`, `mimo_v2_5_asr`,
+        /// `qwen3_asr_1_7b`. The daemon rejects unknown values rather
+        /// than falling back.
         #[arg(long)]
         provider_id: Option<String>,
     },

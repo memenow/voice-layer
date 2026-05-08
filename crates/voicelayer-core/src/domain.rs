@@ -457,6 +457,22 @@ pub struct WorkerHealthSummary {
     /// or simply unconfigured.
     #[serde(default)]
     pub mimo_error: Option<String>,
+    /// Whether the optional Alibaba Qwen3-ASR-1.7B provider is configured
+    /// and the model directory validated. The model is loaded lazily on
+    /// first transcribe; a `true` here only proves that the configured
+    /// path exists on disk, not that the wrapper has been imported and
+    /// the weights pulled into VRAM yet.
+    #[serde(default)]
+    pub qwen3_asr_configured: bool,
+    /// Model weight directory for Qwen3-ASR-1.7B, or `None` when the
+    /// provider is unconfigured or the worker predates this field.
+    #[serde(default)]
+    pub qwen3_asr_model_path: Option<String>,
+    /// Reason Qwen3-ASR-1.7B is not ready to serve, when
+    /// `qwen3_asr_configured` is `false`. `None` when the provider is
+    /// healthy or simply unconfigured.
+    #[serde(default)]
+    pub qwen3_asr_error: Option<String>,
     pub llm_configured: bool,
     pub llm_model: Option<String>,
     pub llm_endpoint: Option<String>,
@@ -2910,6 +2926,9 @@ components:
             mimo_configured: false,
             mimo_model_path: None,
             mimo_error: None,
+            qwen3_asr_configured: false,
+            qwen3_asr_model_path: None,
+            qwen3_asr_error: None,
             llm_configured: false,
             llm_model: None,
             llm_endpoint: None,

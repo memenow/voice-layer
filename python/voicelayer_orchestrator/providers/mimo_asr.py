@@ -8,14 +8,25 @@ lives in the upstream source tree (no wheel published today) so the
 caller may need to point ``VOICELAYER_MIMO_REPO_PATH`` at a local
 checkout to anchor it on ``sys.path``.
 
-The model is loaded on the first transcribe call and kept warm in a
-module-level cache for the lifetime of the worker process. Cold load
-takes tens of seconds; per-call latency on a single consumer CUDA
-GPU with bf16 + flash-attn is in the seconds range — significantly
-slower than the whisper.cpp chain but with measurably better quality
-and native multilingual support (zh / en / yue / wuu / nan / cmn-sc
-/ zh-en code-switch). See `docs/guides/local-asr-provider.md` for
-the hardware preconditions and the comparison table.
+The model loads inside the worker process on the first transcribe
+call. The daemon
+(`crates/voicelayerd/src/worker.rs::WorkerCommand::call`) keeps a
+single Python worker subprocess alive across every JSON-RPC request,
+so the module-level cache below stays warm for the daemon's lifetime:
+the first transcribe pays the cold load and every subsequent call
+(per-segment fixed / vad-gated dictation, repeated transcribe RPCs,
+the stop-time transcription, ...) reuses the cached `MimoAudio`
+instance with no reload cost. Cold load takes tens of seconds; warm
+per-call latency on a single consumer CUDA GPU with bf16 + flash-attn
+is in the seconds range — slower than the whisper.cpp chain on
+absolute latency but with measurably better quality and native
+multilingual support (zh / en / yue / wuu / nan / cmn-sc / zh-en
+code-switch). Crashes drop the worker; the next call respawns and
+pays one fresh cold load before warming again. Operator env changes
+(`VOICELAYER_MIMO_*`) take effect on the next worker spawn — restart
+the daemon to apply them mid-session. See
+`docs/guides/local-asr-provider.md` for the hardware preconditions
+and the comparison table.
 
 Optional. The whisper.cpp chain remains the default ASR provider.
 Callers select MiMo by setting `TranscribeRequest.provider_id =
@@ -46,9 +57,19 @@ from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
 # (device). Precision is fixed to bf16 inside the upstream wrapper, so
 # it is intentionally not part of the cache key. Multiple unique
 # configurations are theoretically possible (operator switches between
-# cuda:0 and cuda:1 mid-session) but the typical case is a single entry
-# kept warm for the worker lifetime. The cache is intentionally
-# unbounded; switching keys is operator-driven and infrequent.
+# cuda:0 and cuda:1 mid-session).
+#
+# The daemon's persistent-worker mode keeps the same Python process
+# alive across JSON-RPC requests (see
+# `crates/voicelayerd/src/worker.rs::WorkerCommand::call`), so this
+# cache is the active warm path: the first transcribe call pays the
+# multi-GB cold load (tens of seconds for MiMo), and every subsequent
+# call returns from the dict in microseconds. The double-checked lock
+# serializes concurrent first-call spawns so a burst of overlapping
+# background transcribe tasks during the cold-start window queues on
+# a single load and then races freely on inference. Cache entries are
+# intentionally unbounded; switching keys is operator-driven and
+# infrequent, and a daemon restart clears the cache cleanly.
 _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 

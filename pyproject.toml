@@ -54,11 +54,52 @@ mimo = [
     "soundfile>=0.12",
     "zhon==2.1.1",
 ]
+# Qwen3-ASR-1.7B (Apache-2.0) optional ASR provider. Loaded through the
+# official `qwen-asr` pip wrapper which sits on top of HuggingFace
+# transformers; the wrapper handles audio preprocessing and long-audio
+# chunking internally, so the worker hands it raw WAV paths and trusts
+# it for the rest. Operators stage the weights via
+# `hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>` and point
+# `VOICELAYER_QWEN3_ASR_MODEL_PATH` at the directory.
+#
+# `torch` and `torchaudio` are intentionally NOT pinned here for the
+# same reason as the `mimo` extra: the operator pulls a CUDA wheel
+# from the PyTorch index that matches their GPU compute capability,
+# and pinning a version on PyPI would silently install the CPU-only
+# build. The lower bound (>= 2.7.0) is the floor of the cu128 index;
+# the upper bound is held to the next major torch.
+#
+# `qwen-asr` brings its own transformers floor — the model card was
+# saved under transformers 4.57.6, so the wrapper drives that range.
+# Installing this extra alongside `mimo` in the same environment will
+# fight over `transformers` (MiMo pins 4.49.0); the recommended
+# practice is one provider extra per virtualenv.
+qwen3-asr = [
+    "torch>=2.7.0,<3.0",
+    "torchaudio>=2.7.0,<3.0",
+    # The Qwen3-ASR-1.7B model card was saved against transformers
+    # 4.57.6; pin the floor explicitly here so `uv` can plan the
+    # `[tool.uv].conflicts` block against `mimo` (transformers==4.49.0)
+    # at sync time rather than discovering the version fight at import.
+    "transformers>=4.57.0",
+    "qwen-asr>=0.0.6,<1.0",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3,<10",
     "ruff>=0.15.11",
+]
+
+# The `mimo` extra pins `transformers==4.49.0` for compatibility with
+# Xiaomi's wrapper, while `qwen3-asr` pulls `qwen-asr` which tracks the
+# transformers floor of the saved model card (4.57.x). Each provider
+# can be installed on its own, but they cannot co-exist in the same
+# virtualenv. Declaring the conflict lets uv produce a single
+# universal lockfile that resolves each branch independently.
+[tool.uv]
+conflicts = [
+    [{ extra = "mimo" }, { extra = "qwen3-asr" }],
 ]
 
 [tool.setuptools]

@@ -223,6 +223,7 @@ components:
         - command
         - asr_configured
         - mimo_configured
+        - qwen3_asr_configured
         - llm_configured
         - llm_reachable
         - global_shortcuts_portal_available
@@ -285,6 +286,30 @@ components:
             Reason MiMo-V2.5-ASR is not ready to serve, when
             `mimo_configured` is `false`. Absent when the provider is
             healthy or simply unconfigured.
+          type:
+            - string
+            - "null"
+        qwen3_asr_configured:
+          description: |
+            True when the optional Alibaba Qwen3-ASR-1.7B provider has
+            its model directory validated. The wrapper is loaded lazily
+            on the first transcribe call; this flag only proves that the
+            configured path exists on disk, not that the model has been
+            pulled into VRAM yet. Absent when the worker predates this
+            field.
+          type: boolean
+        qwen3_asr_model_path:
+          description: |
+            Model weight directory for Qwen3-ASR-1.7B. Absent when the
+            provider is unconfigured or the worker predates this field.
+          type:
+            - string
+            - "null"
+        qwen3_asr_error:
+          description: |
+            Reason Qwen3-ASR-1.7B is not ready to serve, when
+            `qwen3_asr_configured` is `false`. Absent when the provider
+            is healthy or simply unconfigured.
           type:
             - string
             - "null"
@@ -396,20 +421,22 @@ components:
             session emits. When omitted the daemon routes to the
             configured whisper.cpp chain (whisper-server preferred,
             whisper-cli fallback). Selecting `mimo_v2_5_asr` opts the
-            entire session into the Xiaomi MiMo-V2.5-ASR backend; see
-            `docs/guides/local-asr-provider.md` for the hardware
-            preconditions and the opt-in environment variables. The
-            value is shared by every `TranscribeRequest` the daemon
-            issues for this session — fixed/vad-gated segments, the
-            stop-time transcription, and the one-shot path. An
-            unrecognized id surfaces as `provider unavailable` rather
-            than falling back to whisper.
+            entire session into the Xiaomi MiMo-V2.5-ASR backend, and
+            `qwen3_asr_1_7b` opts into the Alibaba Qwen3-ASR-1.7B
+            backend; see `docs/guides/local-asr-provider.md` for the
+            hardware preconditions and the opt-in environment variables
+            for each. The value is shared by every `TranscribeRequest`
+            the daemon issues for this session — fixed/vad-gated
+            segments, the stop-time transcription, and the one-shot
+            path. An unrecognized id surfaces as `provider unavailable`
+            rather than falling back to whisper.
           type:
             - string
             - "null"
           enum:
             - whisper_cpp
             - mimo_v2_5_asr
+            - qwen3_asr_1_7b
             - null
     SegmentationMode:
       description: |
@@ -511,14 +538,17 @@ components:
             Optional ASR provider for the single transcription this
             capture emits. Defaults to the configured whisper.cpp chain
             when omitted; `mimo_v2_5_asr` opts into the Xiaomi
-            MiMo-V2.5-ASR backend. See `TranscribeRequest.provider_id`
-            for the unrecognized-id semantics.
+            MiMo-V2.5-ASR backend, and `qwen3_asr_1_7b` opts into the
+            Alibaba Qwen3-ASR-1.7B backend. See
+            `TranscribeRequest.provider_id` for the unrecognized-id
+            semantics.
           type:
             - string
             - "null"
           enum:
             - whisper_cpp
             - mimo_v2_5_asr
+            - qwen3_asr_1_7b
             - null
     CaptureSession:
       type: object
@@ -605,18 +635,21 @@ components:
           description: |
             Optional ASR provider identifier. Defaults to the configured
             whisper.cpp chain (whisper-server preferred, whisper-cli
-            fallback). The optional `mimo_v2_5_asr` provider routes to the
-            Xiaomi MiMo-V2.5-ASR backend through the Python worker; see
-            `docs/guides/local-asr-provider.md` for the hardware
-            preconditions and the opt-in environment variables. An
-            unrecognized provider id surfaces as a `provider unavailable`
-            error rather than falling back to whisper.
+            fallback). The optional `mimo_v2_5_asr` provider routes to
+            the Xiaomi MiMo-V2.5-ASR backend, and `qwen3_asr_1_7b`
+            routes to the Alibaba Qwen3-ASR-1.7B backend, both through
+            the Python worker; see `docs/guides/local-asr-provider.md`
+            for the hardware preconditions and the opt-in environment
+            variables. An unrecognized provider id surfaces as a
+            `provider unavailable` error rather than falling back to
+            whisper.
           type:
             - string
             - "null"
           enum:
             - whisper_cpp
             - mimo_v2_5_asr
+            - qwen3_asr_1_7b
             - null
     PreviewArtifact:
       type: object

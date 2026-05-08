@@ -13,6 +13,7 @@ from typing import Any
 from voicelayer_orchestrator.config import (
     load_llm_provider_config,
     load_mimo_asr_config,
+    load_qwen3_asr_config,
     load_whisper_provider_config,
 )
 
@@ -170,6 +171,7 @@ def supported_providers(
 
     whisper_config = load_whisper_provider_config(environ)
     mimo_config = load_mimo_asr_config(environ)
+    qwen3_config = load_qwen3_asr_config(environ)
     providers: list[dict[str, Any]] = [
         {
             "id": "whisper_cpp",
@@ -197,6 +199,15 @@ def supported_providers(
             "default_enabled": False,
             "experimental": True,
             "license": "MIT",
+        },
+        {
+            "id": "qwen3_asr_1_7b",
+            "kind": "asr",
+            "transport": ("in_process_torch" if qwen3_config is not None else "stdio_worker"),
+            "local": True,
+            "default_enabled": False,
+            "experimental": True,
+            "license": "Apache-2.0",
         },
     ]
 

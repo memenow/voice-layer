@@ -7,11 +7,20 @@ an audio stack that CI does not have. This stub speaks the same
 stdio JSON-RPC protocol so tests can drive ``WorkerCommand`` without
 those dependencies:
 
-- Reads exactly one JSON-RPC request from stdin.
-- Writes exactly one JSON-RPC response to stdout.
-- Exits with status 0 on success, 1 on unrecoverable error (matches
-  what ``WorkerCommand::call`` expects — it calls ``child.wait()``
-  after reading the reply).
+- Reads JSON-RPC requests line-by-line from stdin.
+- Writes one JSON-RPC response line per request to stdout.
+- Exits with status 0 when stdin closes (the daemon's persistent
+  worker drops the child on shutdown, on a deterministic crash, or
+  when the test fixture goes out of scope and `kill_on_drop(true)`
+  reaps the process). Returns 1 only on unrecoverable parse failures.
+
+Looping on stdin is required by the persistent-worker mode in
+``WorkerCommand::call`` (see ``crates/voicelayerd/src/worker.rs``):
+the daemon keeps a single child alive across requests so that GPU
+provider model caches actually warm, then drains the response one
+line at a time. A one-shot mock would let the persistent connection
+collapse after the first call and force every subsequent test
+request through a respawn dance.
 
 The first CLI argument, if present, is a path to a JSON config file.
 Using a file (instead of environment variables) keeps the stub safe
@@ -151,6 +160,9 @@ def _health_response(request_id: object) -> dict:
             "mimo_configured": False,
             "mimo_model_path": None,
             "mimo_error": None,
+            "qwen3_asr_configured": False,
+            "qwen3_asr_model_path": None,
+            "qwen3_asr_error": None,
             "llm_configured": False,
             "llm_model": None,
             "llm_endpoint": None,
@@ -266,66 +278,68 @@ def _preview_response(
     }
 
 
-def main() -> int:
-    line = sys.stdin.readline()
-    if not line:
-        return 1
-    try:
-        request = json.loads(line)
-    except json.JSONDecodeError:
-        return 1
-
-    config = _load_config()
+def _dispatch_one(request: dict, config: dict) -> dict:
     request_id = request.get("id")
     method = request.get("method")
     params = request.get("params") or {}
 
     if method == "transcribe":
-        response = _transcribe_response(request_id, params, config)
-    elif method == "segment_probe":
-        response = _segment_probe_response(request_id, params, config)
-    elif method == "stitch_wav_segments":
-        response = _stitch_wav_segments_response(request_id, params, config)
-    elif method == "compose":
-        response = _preview_response(
+        return _transcribe_response(request_id, params, config)
+    if method == "segment_probe":
+        return _segment_probe_response(request_id, params, config)
+    if method == "stitch_wav_segments":
+        return _stitch_wav_segments_response(request_id, params, config)
+    if method == "compose":
+        return _preview_response(
             request_id,
             "compose",
             config,
             default_title="Compose preview",
             default_generated_text="mock compose output",
         )
-    elif method == "rewrite":
-        response = _preview_response(
+    if method == "rewrite":
+        return _preview_response(
             request_id,
             "rewrite",
             config,
             default_title="Rewrite preview",
             default_generated_text="mock rewrite output",
         )
-    elif method == "translate":
-        response = _preview_response(
+    if method == "translate":
+        return _preview_response(
             request_id,
             "translate",
             config,
             default_title="Translate preview",
             default_generated_text="mock translate output",
         )
-    elif method == "health":
-        response = _health_response(request_id)
-    elif method == "list_providers":
-        response = _list_providers_response(request_id)
-    else:
-        response = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32601,
-                "message": f"mock worker does not implement method {method!r}",
-            },
-        }
+    if method == "health":
+        return _health_response(request_id)
+    if method == "list_providers":
+        return _list_providers_response(request_id)
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32601,
+            "message": f"mock worker does not implement method {method!r}",
+        },
+    }
 
-    sys.stdout.write(json.dumps(response) + "\n")
-    sys.stdout.flush()
+
+def main() -> int:
+    config = _load_config()
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            return 1
+        response = _dispatch_one(request, config)
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
     return 0
 
 

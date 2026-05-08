@@ -943,6 +943,64 @@ class TranscribeProviderIdRoutingTest(unittest.TestCase):
         self.assertEqual(response["error"]["code"], PROVIDER_UNAVAILABLE_CODE)
         self.assertIn("VOICELAYER_MIMO_MODEL_PATH", response["error"]["message"])
 
+    def test_qwen3_asr_provider_id_without_config_returns_unavailable(self) -> None:
+        # Mirror of the MiMo pin for the second opt-in provider:
+        # `provider_id="qwen3_asr_1_7b"` with no MODEL_PATH set must
+        # not fall back to whisper. The error message has to name the
+        # missing key so the operator can fix their env.
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICELAYER_QWEN3_ASR_MODEL_PATH": "",
+                # Whisper *is* configured to ensure a silent fallback
+                # would surface in the response and break the test.
+                "VOICELAYER_WHISPER_BIN": "/bin/sh",
+                "VOICELAYER_WHISPER_MODEL_PATH": "/tmp/does-not-matter.bin",
+            },
+            clear=False,
+        ):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 204,
+                    "method": "transcribe",
+                    "params": {
+                        "audio_file": "/tmp/whatever.wav",
+                        "provider_id": "qwen3_asr_1_7b",
+                    },
+                }
+            )
+        assert response is not None
+        self.assertEqual(response["error"]["code"], PROVIDER_UNAVAILABLE_CODE)
+        self.assertIn(
+            "VOICELAYER_QWEN3_ASR_MODEL_PATH",
+            response["error"]["message"],
+        )
+
+    def test_unknown_provider_id_typo_returns_unavailable(self) -> None:
+        # An id that is neither whisper_cpp / mimo_v2_5_asr /
+        # qwen3_asr_1_7b must reject up front with PROVIDER_UNAVAILABLE
+        # rather than silently falling back to whisper. The error
+        # message must enumerate every supported id so the operator
+        # spots the typo without grepping the codebase.
+        response = handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 205,
+                "method": "transcribe",
+                "params": {
+                    "audio_file": "/tmp/whatever.wav",
+                    "provider_id": "qwen3_asr_2",
+                },
+            }
+        )
+        assert response is not None
+        self.assertEqual(response["error"]["code"], PROVIDER_UNAVAILABLE_CODE)
+        message = response["error"]["message"]
+        self.assertIn("whisper_cpp", message)
+        self.assertIn("mimo_v2_5_asr", message)
+        self.assertIn("qwen3_asr_1_7b", message)
+
     def test_explicit_whisper_cpp_provider_id_still_routes_to_whisper(self) -> None:
         # Explicit `provider_id="whisper_cpp"` is identical to the
         # default in routing, since whisper is the existing

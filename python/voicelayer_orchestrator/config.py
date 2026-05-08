@@ -87,9 +87,17 @@ class MimoAsrConfig:
     The MiMo-V2.5-ASR model is an 8B-parameter audio-tokens-in /
     text-tokens-out causal LM that runs through Xiaomi's `MimoAudio`
     Python wrapper. Inference loads the model into the worker process
-    on first use and keeps it warm for subsequent requests; both the
-    LM weights (`model_path`) and the companion MiMo-Audio-Tokenizer
-    (`tokenizer_path`) are required.
+    on first use and the daemon's persistent-worker mode (see
+    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``) keeps
+    the same Python subprocess alive across every JSON-RPC request,
+    so subsequent calls hit the warm cache in
+    ``providers/mimo_asr.py`` with no reload cost. Operator env
+    changes (``VOICELAYER_MIMO_*``) take effect on the next worker
+    spawn — restart the daemon to apply them mid-session. Both the LM
+    weights (``model_path``) and the companion MiMo-Audio-Tokenizer
+    (``tokenizer_path``) are required. See
+    ``docs/guides/local-asr-provider.md`` for the hardware envelope
+    and the comparison table.
 
     The wrapper class lives in Xiaomi's source tree and is not
     distributed as a wheel today. ``repo_path`` is the local checkout
@@ -117,6 +125,53 @@ class MimoAsrConfig:
     repo_path: str | None
     device: str
     audio_tag: str | None
+    timeout_seconds: float
+    long_audio_split_seconds: float
+    extra_args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Qwen3AsrConfig:
+    """Configuration for the optional Qwen3-ASR-1.7B provider.
+
+    The provider runs through the official ``qwen-asr`` pip package's
+    ``Qwen3ASRModel`` wrapper, which sits on top of HuggingFace
+    transformers and exposes a high-level
+    ``Qwen3ASRModel.from_pretrained`` + ``model.transcribe(audio,
+    language)`` API. The wrapper handles audio preprocessing and
+    long-audio chunking internally, so the worker passes paths through
+    verbatim (the optional ``long_audio_split_seconds`` knob is
+    available for operators who want to force client-side splitting).
+
+    The model loads inside the worker process on the first transcribe
+    call and the daemon's persistent-worker mode (see
+    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``) keeps
+    the same Python subprocess alive across every JSON-RPC request,
+    so subsequent calls hit the warm cache in
+    ``providers/qwen3_asr.py`` with no reload cost. Operator env
+    changes (``VOICELAYER_QWEN3_ASR_*``) take effect on the next
+    worker spawn — restart the daemon to apply them mid-session.
+    Operators stage the Apache-2.0 weights via
+    ``hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>`` and point
+    ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the worker
+    never triggers HuggingFace downloads on its own. See
+    ``docs/guides/local-asr-provider.md`` for the hardware envelope
+    and the comparison table.
+
+    ``extra_args`` is reserved for future passthrough into
+    ``model.transcribe`` keyword arguments. The current upstream
+    ``qwen-asr`` wrapper exposes only ``audio`` and ``language``, so the
+    field is parsed for forward compatibility but ignored at dispatch
+    time. Mirrors the same reserved-knob pattern on
+    :class:`MimoAsrConfig`.
+
+    The provider is opt-in (`TranscribeRequest.provider_id =
+    "qwen3_asr_1_7b"`). The whisper.cpp chain remains the default.
+    """
+
+    model_path: str
+    device: str
+    torch_dtype: str
     timeout_seconds: float
     long_audio_split_seconds: float
     extra_args: tuple[str, ...]
@@ -290,4 +345,39 @@ def load_mimo_asr_config(
             source.get("VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS", "180")
         ),
         extra_args=tuple(shlex.split(source.get("VOICELAYER_MIMO_ARGS", ""))),
+    )
+
+
+def load_qwen3_asr_config(
+    environ: Mapping[str, str] | None = None,
+) -> Qwen3AsrConfig | None:
+    """Load Qwen3-ASR-1.7B provider configuration from the environment.
+
+    Returns ``None`` when ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` is unset
+    so callers treat the provider as "not configured" the same way they
+    treat MiMo, without surfacing an error. Operators must pre-stage
+    the weights themselves; the loader does not trigger HuggingFace
+    downloads to keep cold-start cost predictable on the local-first
+    runtime path.
+
+    The default ``long_audio_split_seconds=0`` disables client-side
+    splitting because the upstream ``qwen-asr`` wrapper handles long
+    audio internally; operators can opt back into worker-side chunking
+    by setting a positive value.
+    """
+
+    source = environ or os.environ
+    model_path = (source.get("VOICELAYER_QWEN3_ASR_MODEL_PATH") or "").strip()
+    if not model_path:
+        return None
+
+    return Qwen3AsrConfig(
+        model_path=model_path,
+        device=(source.get("VOICELAYER_QWEN3_ASR_DEVICE") or "cuda:0").strip(),
+        torch_dtype=(source.get("VOICELAYER_QWEN3_ASR_DTYPE") or "bfloat16").strip().lower(),
+        timeout_seconds=float(source.get("VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS", "600")),
+        long_audio_split_seconds=float(
+            source.get("VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS", "0")
+        ),
+        extra_args=tuple(shlex.split(source.get("VOICELAYER_QWEN3_ASR_ARGS", ""))),
     )
