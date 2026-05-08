@@ -90,6 +90,11 @@ class LoadQwen3AsrConfigTest(unittest.TestCase):
     def test_reads_full_environment_with_optional_overrides(self) -> None:
         # Every documented knob must round-trip into the dataclass so
         # operator overrides actually take effect on the running worker.
+        # Note: `extra_args` is reserved for a future passthrough into
+        # `model.transcribe`; the current `qwen-asr` wrapper exposes
+        # only `audio` and `language`, so the field is parsed (and
+        # asserted here) for forward compatibility but is not forwarded
+        # at dispatch today. See `Qwen3AsrConfig` docstring.
         config = load_qwen3_asr_config(
             {
                 "VOICELAYER_QWEN3_ASR_MODEL_PATH": "/abs/qwen3-asr",

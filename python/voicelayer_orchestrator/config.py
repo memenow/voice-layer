@@ -87,9 +87,17 @@ class MimoAsrConfig:
     The MiMo-V2.5-ASR model is an 8B-parameter audio-tokens-in /
     text-tokens-out causal LM that runs through Xiaomi's `MimoAudio`
     Python wrapper. Inference loads the model into the worker process
-    on first use and keeps it warm for subsequent requests; both the
-    LM weights (`model_path`) and the companion MiMo-Audio-Tokenizer
-    (`tokenizer_path`) are required.
+    on first use. Under the current daemon every JSON-RPC request
+    spawns a fresh ``python -m voicelayer_orchestrator.worker`` process
+    and exits after the response (see
+    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``), so the
+    cold load is paid on every call; routed dictation sessions inherit
+    the cost on every segment. The module-level cache in
+    ``providers/mimo_asr.py`` is forward compatibility for a future
+    persistent-worker mode. Both the LM weights (``model_path``) and
+    the companion MiMo-Audio-Tokenizer (``tokenizer_path``) are
+    required. See ``docs/guides/local-asr-provider.md`` for the
+    cold-start trade-off.
 
     The wrapper class lives in Xiaomi's source tree and is not
     distributed as a wheel today. ``repo_path`` is the local checkout

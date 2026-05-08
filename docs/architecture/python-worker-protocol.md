@@ -132,7 +132,8 @@ Provider-specific logic lives under `python/voicelayer_orchestrator/providers/`:
   multipart encoder for the persistent `whisper-server` path.
 - `mimo_asr.py` — optional Xiaomi MiMo-V2.5-ASR provider. Lazy-loads the `MimoAudio` wrapper
   on first call and caches it in a module-level dict keyed by `(model_path, tokenizer_path,
-  device, dtype)`. Splits inputs longer than `VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS` into
+  device)`. Precision is fixed to bf16 by the upstream wrapper and intentionally not part of
+  the cache key. Splits inputs longer than `VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS` into
   WAV chunks via the stdlib `wave` module so upstream issue #6 (decoder repetition past ~3
   minutes) does not surface in operator-facing transcripts.
 - `qwen3_asr.py` — optional Alibaba Qwen3-ASR-1.7B provider. Lazy-loads the `qwen-asr`
