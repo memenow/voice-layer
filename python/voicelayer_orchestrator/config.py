@@ -135,11 +135,17 @@ class Qwen3AsrConfig:
     verbatim (the optional ``long_audio_split_seconds`` knob is
     available for operators who want to force client-side splitting).
 
-    The model is loaded into the worker process on first transcribe and
-    kept warm for the worker lifetime. Operators stage the Apache-2.0
-    weights via ``hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>``
-    and point ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the
-    worker never triggers HuggingFace downloads on its own.
+    The model loads inside the worker process on the first transcribe
+    call. Under the current daemon every JSON-RPC request spawns a
+    fresh ``python -m voicelayer_orchestrator.worker`` process and
+    exits after the response (see
+    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``), so the
+    cold load is paid on every call; routed dictation sessions inherit
+    the cost on every segment. Operators stage the Apache-2.0 weights
+    via ``hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>`` and
+    point ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the
+    worker never triggers HuggingFace downloads on its own. See
+    ``docs/guides/local-asr-provider.md`` for the cold-start trade-off.
 
     ``extra_args`` is reserved for future passthrough into
     ``model.transcribe`` keyword arguments. The current upstream

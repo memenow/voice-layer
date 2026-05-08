@@ -10,20 +10,24 @@ preprocessing, resampling, and long-audio chunking internally, so the
 worker hands the wrapper raw WAV paths and trusts it for the rest.
 
 The model loads inside the worker process on the first transcribe
-call. The module-level cache below survives only as long as the
-process: it shields multi-segment splits inside one call from
-re-loading and is forward-compatible with a persistent worker, but
-under today's daemon (`crates/voicelayerd/src/worker.rs::call`) every
-JSON-RPC request spawns a fresh ``python -m
-voicelayer_orchestrator.worker`` process and exits after the response,
-so each transcribe pays the cold load. Per-call latency on a
-configured CUDA accelerator with bf16 is therefore the cold-load cost
-of the wrapper plus inference; sub-second inference on 5-15 s clips
-matches upstream's published numbers but does not include the load
-time. Routed dictation sessions (fixed / vad-gated / repeated
-transcribe) inherit this cost on every segment until the daemon grows
-a persistent-worker mode. See `docs/guides/local-asr-provider.md` for
-the cold-start guidance and the operator-facing trade-off.
+call. ``transcribe_with_qwen3_asr`` calls ``_load_qwen3_asr_model``
+once, before the per-segment loop, and reuses the returned object
+across every segment in that call via a local variable, so the cache
+is not on the hot path inside a single call. The module-level cache
+below exists purely as forward compatibility with a future
+persistent-worker mode that would reuse the process across JSON-RPC
+requests; under today's daemon
+(`crates/voicelayerd/src/worker.rs::call`) every JSON-RPC request
+spawns a fresh ``python -m voicelayer_orchestrator.worker`` process
+and exits after the response, so each transcribe pays the cold load
+and the cache is effectively dead until the daemon supports a
+long-lived worker. Per-call latency on a configured CUDA accelerator
+with bf16 is therefore the cold-load cost of the wrapper plus
+inference; sub-second inference on 5-15 s clips matches upstream's
+published numbers but does not include the load time. Routed
+dictation sessions (fixed / vad-gated / repeated transcribe) inherit
+this cost on every segment. See `docs/guides/local-asr-provider.md`
+for the cold-start guidance and the operator-facing trade-off.
 
 Optional. The whisper.cpp chain remains the default ASR provider.
 Callers select Qwen3-ASR by setting ``TranscribeRequest.provider_id =
@@ -58,16 +62,17 @@ from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
 #
 # Scope reality check: under the current daemon, every JSON-RPC request
 # spawns a fresh worker process and exits after the reply (see
-# `crates/voicelayerd/src/worker.rs::WorkerCommand::call`). The cache
-# is therefore module-level but process-scoped, which today means
-# "shared across the segments of one transcribe call only" — it does
-# not survive across separate `/v1/transcriptions` calls or across the
-# segments of a fixed/vad-gated dictation session, since each segment
-# is its own `transcribe` JSON-RPC call. The cache is kept here so a
-# future persistent-worker mode picks up the warm path for free; until
-# then operators selecting Qwen3-ASR for routed dictation pay the cold
-# load on every segment. The cache is intentionally unbounded;
-# switching keys is operator-driven and infrequent.
+# `crates/voicelayerd/src/worker.rs::WorkerCommand::call`).
+# ``transcribe_with_qwen3_asr`` only invokes ``_load_qwen3_asr_model``
+# once per call (outside the per-segment loop), so the cache does no
+# intra-call work either: it is dead code under today's architecture.
+# The dict + lock are kept here purely as forward compatibility with a
+# future persistent-worker mode that would reuse the process across
+# JSON-RPC requests; once that ships the cache automatically picks up
+# the warm path. Until then operators selecting Qwen3-ASR for routed
+# dictation pay the cold load on every segment. The cache is
+# intentionally unbounded; switching keys is operator-driven and
+# infrequent.
 _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
