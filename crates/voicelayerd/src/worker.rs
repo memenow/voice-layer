@@ -26,13 +26,18 @@ const WORKER_MODULE: &str = "voicelayer_orchestrator.worker";
 /// rotate the oldest entries out.
 const STDERR_TAIL_MAX_LINES: usize = 64;
 
-/// After a successful read returns the JSON-RPC response, the daemon
-/// performs a single non-blocking poll on the child to detect the
-/// "respond-then-exit" pattern that happens with one-shot test
-/// fixtures and worker crashes that race the response. Production
-/// workers stay alive forever, so the poll returns immediately when
-/// the child is still running and adds no measurable latency.
-const POST_RESPONSE_EXIT_GRACE: Duration = Duration::from_millis(25);
+/// Wall-clock grace before the post-response `try_wait` poll. The
+/// daemon's pipe reactor can wake the parent before the kernel
+/// finishes the child's `exit` transition, so a respond-then-exit
+/// fixture occasionally still shows as alive on the first
+/// `try_wait` even though it has already entered zombie state.
+/// 1 ms is enough margin to make the detection deterministic across
+/// every system the verification chain has been observed on, and
+/// far below the 25 ms grace the previous busy-loop implementation
+/// charged on every successful call (the production path used to
+/// pay the full window because the loop did not break early on a
+/// living child).
+const POST_RESPONSE_EXIT_GRACE: Duration = Duration::from_millis(1);
 
 /// Upper bound on how long the daemon waits for a worker response.
 ///
@@ -396,46 +401,40 @@ impl WorkerCommand {
                 return Err(WorkerCallError::InvalidProtocolVersion(response.jsonrpc));
             }
 
-            // Detect the "respond-then-exit" pattern. Production workers
-            // stay alive forever, so this poll resolves immediately with
-            // a still-running child and adds no latency. Test fixtures
-            // that print a response then exit non-zero hit the
-            // `Some(status)` branch — surface the exit status so the
-            // operator sees a worker crash instead of a bare success.
-            let exit_status = timeout(POST_RESPONSE_EXIT_GRACE, async {
-                loop {
-                    match process.child.try_wait() {
-                        Ok(Some(status)) => return Ok::<_, std::io::Error>(Some(status)),
-                        Ok(None) => tokio::time::sleep(Duration::from_millis(2)).await,
-                        Err(err) => return Err(err),
-                    }
-                }
-            })
-            .await;
-
-            match exit_status {
-                Ok(Ok(Some(status))) if !status.success() => {
+            // Detect the "respond-then-exit" pattern with a single
+            // non-blocking poll after a 1 ms grace. Production workers
+            // stay alive forever, so the cost is bounded at
+            // `POST_RESPONSE_EXIT_GRACE` per call (down from the 25 ms
+            // the previous busy-loop charged); test fixtures and rare
+            // crash-after-response paths get the margin they need for
+            // the kernel to complete the child's `exit` transition
+            // before `try_wait` is asked to observe it. Without the
+            // grace the tokio pipe reactor can race ahead of the
+            // child's exit syscall and `try_wait` flakily returns
+            // `Ok(None)` for a child that is, microseconds later,
+            // observably zombie.
+            tokio::time::sleep(POST_RESPONSE_EXIT_GRACE).await;
+            match process.child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
                     *guard = None;
                     let stderr_tail = self.snapshot_stderr_tail();
                     return Err(WorkerCallError::ProcessExited(status.code(), stderr_tail));
                 }
-                Ok(Ok(Some(_))) => {
+                Ok(Some(_)) => {
                     // Clean exit after a clean response; mark for
                     // respawn on the next call but pass the response
                     // through.
                     *guard = None;
                 }
-                Ok(Err(_)) => {
+                Ok(None) => {
+                    // Still alive — production path. Leave the worker
+                    // alive for the next call.
+                }
+                Err(_) => {
                     // try_wait surfaced an I/O error; assume the child
                     // is gone and respawn next call. The current
                     // response is still valid.
                     *guard = None;
-                }
-                Err(_) | Ok(Ok(None)) => {
-                    // Either the grace timed out (still alive — the
-                    // production case) or try_wait kept returning None
-                    // for the duration. Either way, leave the worker
-                    // alive for the next call.
                 }
             }
 
