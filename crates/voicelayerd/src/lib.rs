@@ -2264,15 +2264,14 @@ mod test_support {
             mock_script.display(),
         );
 
-        WorkerCommand {
-            executable: "python3".to_owned(),
-            args: vec![
+        WorkerCommand::new(
+            "python3".to_owned(),
+            vec![
                 mock_script.display().to_string(),
                 config_path.display().to_string(),
             ],
-            project_root: dir.to_path_buf(),
-            timeout_override: None,
-        }
+            dir.to_path_buf(),
+        )
     }
 
     pub(super) fn fresh_dictation_session() -> CaptureSession {

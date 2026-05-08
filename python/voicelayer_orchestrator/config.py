@@ -87,17 +87,17 @@ class MimoAsrConfig:
     The MiMo-V2.5-ASR model is an 8B-parameter audio-tokens-in /
     text-tokens-out causal LM that runs through Xiaomi's `MimoAudio`
     Python wrapper. Inference loads the model into the worker process
-    on first use. Under the current daemon every JSON-RPC request
-    spawns a fresh ``python -m voicelayer_orchestrator.worker`` process
-    and exits after the response (see
-    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``), so the
-    cold load is paid on every call; routed dictation sessions inherit
-    the cost on every segment. The module-level cache in
-    ``providers/mimo_asr.py`` is forward compatibility for a future
-    persistent-worker mode. Both the LM weights (``model_path``) and
-    the companion MiMo-Audio-Tokenizer (``tokenizer_path``) are
-    required. See ``docs/guides/local-asr-provider.md`` for the
-    cold-start trade-off.
+    on first use and the daemon's persistent-worker mode (see
+    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``) keeps
+    the same Python subprocess alive across every JSON-RPC request,
+    so subsequent calls hit the warm cache in
+    ``providers/mimo_asr.py`` with no reload cost. Operator env
+    changes (``VOICELAYER_MIMO_*``) take effect on the next worker
+    spawn — restart the daemon to apply them mid-session. Both the LM
+    weights (``model_path``) and the companion MiMo-Audio-Tokenizer
+    (``tokenizer_path``) are required. See
+    ``docs/guides/local-asr-provider.md`` for the hardware envelope
+    and the comparison table.
 
     The wrapper class lives in Xiaomi's source tree and is not
     distributed as a wheel today. ``repo_path`` is the local checkout
@@ -144,16 +144,19 @@ class Qwen3AsrConfig:
     available for operators who want to force client-side splitting).
 
     The model loads inside the worker process on the first transcribe
-    call. Under the current daemon every JSON-RPC request spawns a
-    fresh ``python -m voicelayer_orchestrator.worker`` process and
-    exits after the response (see
-    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``), so the
-    cold load is paid on every call; routed dictation sessions inherit
-    the cost on every segment. Operators stage the Apache-2.0 weights
-    via ``hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>`` and
-    point ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the
-    worker never triggers HuggingFace downloads on its own. See
-    ``docs/guides/local-asr-provider.md`` for the cold-start trade-off.
+    call and the daemon's persistent-worker mode (see
+    ``crates/voicelayerd/src/worker.rs::WorkerCommand::call``) keeps
+    the same Python subprocess alive across every JSON-RPC request,
+    so subsequent calls hit the warm cache in
+    ``providers/qwen3_asr.py`` with no reload cost. Operator env
+    changes (``VOICELAYER_QWEN3_ASR_*``) take effect on the next
+    worker spawn — restart the daemon to apply them mid-session.
+    Operators stage the Apache-2.0 weights via
+    ``hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>`` and point
+    ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the worker
+    never triggers HuggingFace downloads on its own. See
+    ``docs/guides/local-asr-provider.md`` for the hardware envelope
+    and the comparison table.
 
     ``extra_args`` is reserved for future passthrough into
     ``model.transcribe`` keyword arguments. The current upstream

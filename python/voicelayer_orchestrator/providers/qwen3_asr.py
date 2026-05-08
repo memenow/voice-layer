@@ -10,24 +10,21 @@ preprocessing, resampling, and long-audio chunking internally, so the
 worker hands the wrapper raw WAV paths and trusts it for the rest.
 
 The model loads inside the worker process on the first transcribe
-call. ``transcribe_with_qwen3_asr`` calls ``_load_qwen3_asr_model``
-once, before the per-segment loop, and reuses the returned object
-across every segment in that call via a local variable, so the cache
-is not on the hot path inside a single call. The module-level cache
-below exists purely as forward compatibility with a future
-persistent-worker mode that would reuse the process across JSON-RPC
-requests; under today's daemon
-(`crates/voicelayerd/src/worker.rs::call`) every JSON-RPC request
-spawns a fresh ``python -m voicelayer_orchestrator.worker`` process
-and exits after the response, so each transcribe pays the cold load
-and the cache is effectively dead until the daemon supports a
-long-lived worker. Per-call latency on a configured CUDA accelerator
-with bf16 is therefore the cold-load cost of the wrapper plus
-inference; sub-second inference on 5-15 s clips matches upstream's
-published numbers but does not include the load time. Routed
-dictation sessions (fixed / vad-gated / repeated transcribe) inherit
-this cost on every segment. See `docs/guides/local-asr-provider.md`
-for the cold-start guidance and the operator-facing trade-off.
+call. The daemon
+(`crates/voicelayerd/src/worker.rs::WorkerCommand::call`) keeps a
+single Python worker subprocess alive across every JSON-RPC request
+through a shared `Arc<TokioMutex<Option<WorkerProcess>>>`, so the
+module-level cache below stays warm for the daemon's lifetime: the
+first transcribe pays the cold load and every subsequent call (per-
+segment fixed / vad-gated dictation, repeated `/v1/transcriptions`,
+the stop-time transcription, ...) reuses the cached
+`Qwen3ASRModel` instance with no reload cost. Per-call latency on
+the warm path is just inference: sub-second on 5-15 s clips on a
+configured CUDA accelerator with bf16. Crashes drop the worker;
+the next call respawns and pays one fresh cold load before warming
+again. Operator env changes (`VOICELAYER_QWEN3_ASR_*`) take effect
+on the next worker spawn — restart the daemon to apply them
+mid-session.
 
 Optional. The whisper.cpp chain remains the default ASR provider.
 Callers select Qwen3-ASR by setting ``TranscribeRequest.provider_id =
@@ -60,19 +57,18 @@ from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass
 # theoretically possible (operator switching between cuda:0 and cuda:1
 # mid-session, or flipping bf16 to fp16 to debug a numerical issue).
 #
-# Scope reality check: under the current daemon, every JSON-RPC request
-# spawns a fresh worker process and exits after the reply (see
-# `crates/voicelayerd/src/worker.rs::WorkerCommand::call`).
-# ``transcribe_with_qwen3_asr`` only invokes ``_load_qwen3_asr_model``
-# once per call (outside the per-segment loop), so the cache does no
-# intra-call work either: it is dead code under today's architecture.
-# The dict + lock are kept here purely as forward compatibility with a
-# future persistent-worker mode that would reuse the process across
-# JSON-RPC requests; once that ships the cache automatically picks up
-# the warm path. Until then operators selecting Qwen3-ASR for routed
-# dictation pay the cold load on every segment. The cache is
+# The daemon's persistent-worker mode keeps the same Python process
+# alive across JSON-RPC requests (see
+# `crates/voicelayerd/src/worker.rs::WorkerCommand::call`), so this
+# cache is the active warm path: the first transcribe call pays the
+# multi-GB cold load, and every subsequent call (per-segment fixed /
+# vad-gated dictation, repeated `/v1/transcriptions`, ...) returns
+# from the dict in microseconds. The double-checked lock serializes
+# concurrent first-call spawns so a burst of overlapping background
+# transcribe tasks during the cold-start window queues on a single
+# load and then races freely on inference. Cache entries are
 # intentionally unbounded; switching keys is operator-driven and
-# infrequent.
+# infrequent, and a daemon restart clears the cache cleanly.
 _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 

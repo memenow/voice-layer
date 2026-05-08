@@ -7,8 +7,17 @@ The Python worker boundary exists so provider-specific logic can move faster wit
 ## Transport
 
 - Protocol: JSON-RPC 2.0
-- Medium: stdio
-- Ownership: Rust starts the worker process on demand and owns the call lifecycle
+- Medium: stdio (line-delimited)
+- Ownership: Rust spawns one long-lived worker subprocess per `WorkerCommand` and serializes
+  every JSON-RPC line through a shared `tokio::sync::Mutex`. The same Python child handles
+  every request the daemon issues; `WorkerCommand::call` only respawns when the child crashes,
+  EOFs unexpectedly, or times out. Operator env var changes (`VOICELAYER_*`) are read at
+  worker spawn time and therefore require a daemon restart (or an explicit worker kill) to
+  apply mid-session — the trade-off the persistent mode pays for the warm GPU model caches
+  in `providers/mimo_asr.py` and `providers/qwen3_asr.py`. The last
+  `STDERR_TAIL_MAX_LINES` lines of stderr are buffered in the daemon and surfaced in
+  `WorkerCallError::ProcessExited` so a worker crash report still includes the Python-side
+  traceback even though the daemon no longer reads stderr to EOF per call.
 - Runtime environment: the worker must execute through the repository's `uv` environment, not the system interpreter
 
 ## Required Methods

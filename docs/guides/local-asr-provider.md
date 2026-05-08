@@ -370,23 +370,23 @@ linear growth with longer audio. The Qwen3-ASR latency figure is the upstream-pu
 expectation rather than a maintainer-measured number; rerun a benchmark on your own hardware
 before relying on the figure.
 
-**Cold-start applies per call.** The daemon currently spawns a fresh
-`python -m voicelayer_orchestrator.worker` process for every JSON-RPC request and exits after
-the response (see `crates/voicelayerd/src/worker.rs::WorkerCommand::call`), so the
-module-level model cache inside the worker only survives one transcribe call. A routed
-dictation session backed by `mimo_v2_5_asr` or `qwen3_asr_1_7b` pays the cold load **on every
-segment**: fixed-mode segments, VAD-gated speech units, and the stop-time transcript each
-spawn a separate worker. The whisper.cpp path side-steps this through the persistent
-`whisper-server` HTTP sidecar described above; an equivalent persistent-worker mode for the
-GPU providers is future work. Until that ships, prefer the GPU providers for one-shot
-transcribe / record-transcribe flows where a single cold load is amortised over the whole
-capture, and stay on whisper for fixed/vad-gated live dictation if cold-start cost is
-material on your hardware.
+**Cold-start applies once per daemon lifetime.** The daemon keeps one Python worker
+subprocess alive across every JSON-RPC request (see
+`crates/voicelayerd/src/worker.rs::WorkerCommand::call`), so the module-level model cache
+inside the worker stays warm for the daemon's lifetime. The first transcribe call against
+`mimo_v2_5_asr` or `qwen3_asr_1_7b` pays the multi-GB cold load; every subsequent call —
+fixed-mode segments, VAD-gated speech units, the stop-time transcript, repeated
+`/v1/transcriptions` calls, the next dictation session — reuses the cached model with no
+reload cost. A worker crash or daemon restart is the only thing that triggers a fresh cold
+load. **Operator env var changes** (`VOICELAYER_MIMO_*`, `VOICELAYER_QWEN3_ASR_*`,
+`VOICELAYER_WHISPER_*`, ...) are read by the worker at spawn time and therefore only take
+effect on the next worker spawn — restart the daemon (or, equivalently, force a worker
+respawn by SIGTERM-ing the Python child) to apply changes mid-session.
 
-When in doubt, keep dictation on whisper for short PTT bursts (lower cold-load + warm
-latency) and route long-form / multilingual / quality-priority captures through MiMo or
+When in doubt, route long-form / multilingual / quality-priority captures through MiMo or
 Qwen3-ASR by passing `--provider-id mimo_v2_5_asr` / `--provider-id qwen3_asr_1_7b` to the
-relevant CLI command or by setting it on the HTTP request body.
+relevant CLI command or by setting it on the HTTP request body. Cold load is one-time per
+daemon, so the per-utterance cost is just inference.
 
 The MiMo provider lives at `python/voicelayer_orchestrator/providers/mimo_asr.py` (lazy-loaded
 model cache + per-segment dispatch); long-audio splitting is performed in-process via the

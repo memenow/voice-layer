@@ -1,10 +1,18 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex as TokioMutex,
+    task::JoinHandle,
     time::timeout,
 };
 use uuid::Uuid;
@@ -12,6 +20,19 @@ use voicelayer_core::{ProviderDescriptor, TranscriptionResult};
 
 const JSONRPC_VERSION: &str = "2.0";
 const WORKER_MODULE: &str = "voicelayer_orchestrator.worker";
+
+/// How many recent stderr lines to keep around for inclusion in error
+/// reports. Most Python tracebacks fit comfortably; long log streams
+/// rotate the oldest entries out.
+const STDERR_TAIL_MAX_LINES: usize = 64;
+
+/// After a successful read returns the JSON-RPC response, the daemon
+/// performs a single non-blocking poll on the child to detect the
+/// "respond-then-exit" pattern that happens with one-shot test
+/// fixtures and worker crashes that race the response. Production
+/// workers stay alive forever, so the poll returns immediately when
+/// the child is still running and adds no measurable latency.
+const POST_RESPONSE_EXIT_GRACE: Duration = Duration::from_millis(25);
 
 /// Upper bound on how long the daemon waits for a worker response.
 ///
@@ -42,7 +63,45 @@ fn worker_call_timeout(method: &str) -> Duration {
     Duration::from_secs(seconds)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Long-lived stdio JSON-RPC connection to a Python worker subprocess.
+///
+/// The daemon previously spawned a fresh `python -m
+/// voicelayer_orchestrator.worker` per request and shut its stdin
+/// after one line, which made every transcribe call pay the model
+/// cold load — multi-GB GPU providers like MiMo-V2.5-ASR and
+/// Qwen3-ASR-1.7B were re-loading on every dictation segment because
+/// the in-process model cache was effectively dead under that
+/// architecture.
+///
+/// The current implementation keeps a single child alive across
+/// requests and serializes JSON-RPC line exchanges through a tokio
+/// mutex; clones of the same `WorkerCommand` share the underlying
+/// process via `Arc`. Crashes, EOFs, and protocol failures all drop
+/// the child so the next call lazily respawns and the operator never
+/// sees a stuck handle. Stderr is drained into a ring buffer
+/// (`STDERR_TAIL_MAX_LINES` lines) so error reports include the
+/// Python-side traceback even though stderr is no longer read to EOF
+/// per call.
+#[derive(Debug)]
+struct WorkerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    stderr_drainer: JoinHandle<()>,
+}
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        // Cancel the stderr drainer; the underlying child has
+        // `kill_on_drop(true)` so the kernel reaps it as soon as the
+        // `Child` itself drops. Aborting the drainer prevents the
+        // task from outliving its pipe and warning about a closed
+        // reader.
+        self.stderr_drainer.abort();
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkerCommand {
     pub executable: String,
     pub args: Vec<String>,
@@ -56,33 +115,63 @@ pub struct WorkerCommand {
     /// `clippy::await_holding_lock` problem that arises when an
     /// `ENV_LOCK` mutex is held across the subprocess `.await`.
     pub(crate) timeout_override: Option<Duration>,
+    /// Lazy-spawned long-lived child process shared by every clone of
+    /// this `WorkerCommand`. The tokio mutex serializes JSON-RPC line
+    /// exchanges; clones share the same `Arc` so all request handlers
+    /// cooperate on one worker process. Setting the inner Option to
+    /// `None` (after a crash, EOF, or protocol failure) tells the
+    /// next call to lazily respawn before retrying.
+    process: Arc<TokioMutex<Option<WorkerProcess>>>,
+    /// Last `STDERR_TAIL_MAX_LINES` lines of stderr, populated by the
+    /// drainer task that owns the child's stderr pipe. Snapshotted on
+    /// `ProcessExited` errors so the operator sees the Python-side
+    /// traceback rather than an opaque EOF. Outlives any single
+    /// `WorkerProcess`: when a respawn happens, the buffer accumulates
+    /// across the boundary so a stable read of the most recent failure
+    /// is always available.
+    stderr_tail: Arc<StdMutex<VecDeque<String>>>,
 }
 
 impl WorkerCommand {
+    /// Build a `WorkerCommand` from the spec fields. The lazy process
+    /// handle and stderr tail buffer are initialised empty; the first
+    /// `call` spawns the worker and seeds them.
+    pub fn new(executable: String, args: Vec<String>, project_root: PathBuf) -> Self {
+        Self {
+            executable,
+            args,
+            project_root,
+            timeout_override: None,
+            process: Arc::new(TokioMutex::new(None)),
+            stderr_tail: Arc::new(StdMutex::new(VecDeque::with_capacity(
+                STDERR_TAIL_MAX_LINES,
+            ))),
+        }
+    }
+
     pub fn discover(project_root: PathBuf) -> Self {
         let uv_python = project_root.join(".venv").join("bin").join("python");
         if uv_python.is_file() {
-            return Self {
-                executable: uv_python.display().to_string(),
-                args: vec!["-m".to_owned(), WORKER_MODULE.to_owned()],
+            return Self::new(
+                uv_python.display().to_string(),
+                vec!["-m".to_owned(), WORKER_MODULE.to_owned()],
                 project_root,
-                timeout_override: None,
-            };
+            );
         }
 
-        Self {
-            executable: "uv".to_owned(),
-            args: vec![
+        let project_display = project_root.display().to_string();
+        Self::new(
+            "uv".to_owned(),
+            vec![
                 "run".to_owned(),
                 "--project".to_owned(),
-                project_root.display().to_string(),
+                project_display,
                 "python".to_owned(),
                 "-m".to_owned(),
                 WORKER_MODULE.to_owned(),
             ],
             project_root,
-            timeout_override: None,
-        }
+        )
     }
 
     /// Override the per-call timeout for this `WorkerCommand`. Used by
@@ -157,6 +246,73 @@ impl WorkerCommand {
         self.call("stitch_wav_segments", Some(request)).await
     }
 
+    /// Spawn a fresh worker subprocess and wire its pipes into a
+    /// `WorkerProcess`. The stderr drainer task owns the stderr pipe
+    /// and pushes lines into the shared `stderr_tail` ring buffer so
+    /// every error reported by `call` carries the most recent
+    /// Python-side log lines without blocking the JSON-RPC dance on a
+    /// `read_to_string` to EOF (which would never return for a
+    /// healthy long-lived worker).
+    fn spawn_process(&self) -> Result<WorkerProcess, WorkerCallError> {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(&self.args)
+            .current_dir(&self.project_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(WorkerCallError::MissingPipe("stdin"))?;
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or(WorkerCallError::MissingPipe("stdout"))?,
+        )
+        .lines();
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(WorkerCallError::MissingPipe("stderr"))?;
+
+        let tail = Arc::clone(&self.stderr_tail);
+        let stderr_drainer = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut buffer) = tail.lock() {
+                    if buffer.len() >= STDERR_TAIL_MAX_LINES {
+                        buffer.pop_front();
+                    }
+                    buffer.push_back(line);
+                }
+            }
+        });
+
+        Ok(WorkerProcess {
+            child,
+            stdin,
+            stdout,
+            stderr_drainer,
+        })
+    }
+
+    /// Snapshot the current contents of the stderr ring buffer as a
+    /// single newline-joined `String`, suitable for inclusion in
+    /// `WorkerCallError::ProcessExited`. Poisoned mutex degrades to
+    /// the empty string rather than propagating panics out of the
+    /// daemon's request path.
+    fn snapshot_stderr_tail(&self) -> String {
+        match self.stderr_tail.lock() {
+            Ok(buffer) => buffer.iter().cloned().collect::<Vec<_>>().join("\n"),
+            Err(_) => String::new(),
+        }
+    }
+
     async fn call<P, R>(&self, method: &str, params: Option<P>) -> Result<R, WorkerCallError>
     where
         P: Serialize,
@@ -168,68 +324,131 @@ impl WorkerCommand {
             method: method.to_owned(),
             params,
         };
-        let payload = serde_json::to_string(&request)?;
-
-        let mut command = Command::new(&self.executable);
-        command
-            .args(&self.args)
-            .current_dir(&self.project_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = command.spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or(WorkerCallError::MissingPipe("stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(WorkerCallError::MissingPipe("stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(WorkerCallError::MissingPipe("stderr"))?;
-
-        let stderr_task = tokio::spawn(async move {
-            let mut buffer = String::new();
-            let mut reader = BufReader::new(stderr);
-            let _ = reader.read_to_string(&mut buffer).await;
-            buffer
-        });
-
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.shutdown().await?;
-        drop(stdin);
-
-        let mut reader = BufReader::new(stdout).lines();
+        let mut payload = serde_json::to_string(&request)?;
+        payload.push('\n');
         let timeout_duration = self
             .timeout_override
             .unwrap_or_else(|| worker_call_timeout(method));
-        let line = timeout(timeout_duration, reader.next_line())
-            .await
-            .map_err(|_| WorkerCallError::TimedOut)??
-            .ok_or(WorkerCallError::EmptyResponse)?;
 
-        let response: JsonRpcResponse<R> = serde_json::from_str(&line)?;
-        if response.jsonrpc != JSONRPC_VERSION {
-            return Err(WorkerCallError::InvalidProtocolVersion(response.jsonrpc));
+        let mut guard = self.process.lock().await;
+
+        // Two attempts at most: if the child died between calls, the
+        // first write/read fails fast and we re-spawn before retrying.
+        // After the second failure we surface the error so the operator
+        // sees the underlying problem (typically a Python import failure
+        // or a model load crash, captured in the stderr tail).
+        for attempt in 0..2 {
+            if guard.is_none() {
+                match self.spawn_process() {
+                    Ok(process) => *guard = Some(process),
+                    Err(err) => return Err(err),
+                }
+            }
+
+            let process = guard.as_mut().expect("just spawned or pre-existing");
+
+            // Write the JSON-RPC line. `BrokenPipe` and similar I/O
+            // errors mean the child died between calls; drop the handle
+            // and retry once with a fresh spawn.
+            let write_result = async {
+                process.stdin.write_all(payload.as_bytes()).await?;
+                process.stdin.flush().await?;
+                Ok::<(), std::io::Error>(())
+            }
+            .await;
+            if write_result.is_err() {
+                *guard = None;
+                if attempt == 0 {
+                    continue;
+                }
+                let stderr_tail = self.snapshot_stderr_tail();
+                return Err(WorkerCallError::ProcessExited(None, stderr_tail));
+            }
+
+            // Read one response line. `Ok(Ok(None))` is EOF (child
+            // exited without writing); `Ok(Err(_))` is an I/O error
+            // mid-stream; `Err(_)` is the timeout.
+            let line_result = timeout(timeout_duration, process.stdout.next_line()).await;
+            let line = match line_result {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => {
+                    *guard = None;
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(WorkerCallError::EmptyResponse);
+                }
+                Ok(Err(io_err)) => {
+                    *guard = None;
+                    return Err(WorkerCallError::Io(io_err));
+                }
+                Err(_) => {
+                    // Timeout: we have no way to recover an in-flight
+                    // worker call cleanly, so kill the child and let
+                    // the next call respawn.
+                    *guard = None;
+                    return Err(WorkerCallError::TimedOut);
+                }
+            };
+
+            let response: JsonRpcResponse<R> = serde_json::from_str(&line)?;
+            if response.jsonrpc != JSONRPC_VERSION {
+                return Err(WorkerCallError::InvalidProtocolVersion(response.jsonrpc));
+            }
+
+            // Detect the "respond-then-exit" pattern. Production workers
+            // stay alive forever, so this poll resolves immediately with
+            // a still-running child and adds no latency. Test fixtures
+            // that print a response then exit non-zero hit the
+            // `Some(status)` branch — surface the exit status so the
+            // operator sees a worker crash instead of a bare success.
+            let exit_status = timeout(POST_RESPONSE_EXIT_GRACE, async {
+                loop {
+                    match process.child.try_wait() {
+                        Ok(Some(status)) => return Ok::<_, std::io::Error>(Some(status)),
+                        Ok(None) => tokio::time::sleep(Duration::from_millis(2)).await,
+                        Err(err) => return Err(err),
+                    }
+                }
+            })
+            .await;
+
+            match exit_status {
+                Ok(Ok(Some(status))) if !status.success() => {
+                    *guard = None;
+                    let stderr_tail = self.snapshot_stderr_tail();
+                    return Err(WorkerCallError::ProcessExited(status.code(), stderr_tail));
+                }
+                Ok(Ok(Some(_))) => {
+                    // Clean exit after a clean response; mark for
+                    // respawn on the next call but pass the response
+                    // through.
+                    *guard = None;
+                }
+                Ok(Err(_)) => {
+                    // try_wait surfaced an I/O error; assume the child
+                    // is gone and respawn next call. The current
+                    // response is still valid.
+                    *guard = None;
+                }
+                Err(_) | Ok(Ok(None)) => {
+                    // Either the grace timed out (still alive — the
+                    // production case) or try_wait kept returning None
+                    // for the duration. Either way, leave the worker
+                    // alive for the next call.
+                }
+            }
+
+            return match (response.result, response.error) {
+                (Some(result), None) => Ok(result),
+                (None, Some(error)) => Err(WorkerCallError::Rpc(error)),
+                _ => Err(WorkerCallError::MalformedResponse),
+            };
         }
 
-        let status = child.wait().await?;
-        let stderr_output = stderr_task.await.unwrap_or_default();
-        if !status.success() {
-            return Err(WorkerCallError::ProcessExited(status.code(), stderr_output));
-        }
-
-        match (response.result, response.error) {
-            (Some(result), None) => Ok(result),
-            (None, Some(error)) => Err(WorkerCallError::Rpc(error)),
-            _ => Err(WorkerCallError::MalformedResponse),
-        }
+        // The retry loop always returns inside the body; reaching
+        // here would mean a logic bug.
+        unreachable!("call retry loop must return after at most two attempts")
     }
 }
 
@@ -912,33 +1131,35 @@ the bullet list above and must not be captured.
     }
 
     /// Build a `WorkerCommand` that runs an arbitrary shell script as
-    /// the JSON-RPC worker. The helper prepends `cat > /dev/null;`
-    /// so the subprocess always consumes the daemon's request from
-    /// stdin before running the caller's response snippet — without
-    /// that, `printf '...'; exit 0` style scripts close the stdin pipe
-    /// before our `write_all` lands and the test fails with
-    /// `BrokenPipe` instead of the variant we wanted to exercise. The
+    /// the JSON-RPC worker. The helper prepends `head -n 1 > /dev/null;`
+    /// so the subprocess consumes exactly one line of the daemon's
+    /// request before running the caller's response snippet — without
+    /// it, `printf '...'; exit 0` style scripts close stdin before our
+    /// `write_all` lands and the test fails with `BrokenPipe` instead
+    /// of the variant we wanted to exercise. `head -n 1` (rather than
+    /// `cat > /dev/null`) is required by the persistent-worker mode in
+    /// `WorkerCommand::call`: the daemon now keeps stdin open across
+    /// calls so `cat` would block forever waiting for EOF, while the
+    /// JSON-RPC dance is one line in / one line out per call. The
     /// script's stdout becomes the response line and its final exit
     /// status feeds the post-response classification (success /
-    /// `ProcessExited`).
+    /// `ProcessExited`) via the 25 ms try_wait grace window.
     fn shell_worker(response_script: &str) -> WorkerCommand {
-        let combined = format!("cat > /dev/null; {response_script}");
-        WorkerCommand {
-            executable: "sh".to_owned(),
-            args: vec!["-c".to_owned(), combined],
-            project_root: std::env::current_dir().expect("current_dir should resolve"),
-            timeout_override: None,
-        }
+        let combined = format!("head -n 1 > /dev/null; {response_script}");
+        WorkerCommand::new(
+            "sh".to_owned(),
+            vec!["-c".to_owned(), combined],
+            std::env::current_dir().expect("current_dir should resolve"),
+        )
     }
 
     #[tokio::test]
     async fn worker_call_returns_io_error_when_executable_does_not_exist() {
-        let worker = WorkerCommand {
-            executable: "/voicelayer-test/definitely-not-a-real-binary".to_owned(),
-            args: vec![],
-            project_root: std::env::current_dir().expect("current_dir should resolve"),
-            timeout_override: None,
-        };
+        let worker = WorkerCommand::new(
+            "/voicelayer-test/definitely-not-a-real-binary".to_owned(),
+            vec![],
+            std::env::current_dir().expect("current_dir should resolve"),
+        );
         match worker.health().await {
             Err(WorkerCallError::Io(_)) => {}
             other => panic!("expected Io error from missing executable; got {other:?}"),
@@ -1011,6 +1232,100 @@ the bullet list above and must not be captured.
             }
             other => panic!("expected ProcessExited; got {other:?}"),
         }
+    }
+
+    /// End-to-end pin for the persistent-worker mode added to retire
+    /// the per-call spawn cost on GPU providers like MiMo-V2.5-ASR and
+    /// Qwen3-ASR-1.7B. The shell records one line per spawn into a
+    /// counter file on startup, then loops on stdin emitting a static
+    /// JSON-RPC response per request line. After two `list_providers`
+    /// calls through the same `WorkerCommand` clone, the counter must
+    /// end at exactly one entry — proof that both calls flowed through
+    /// the same child process and that the in-process model cache on
+    /// the Python side now actually warms across requests. A
+    /// regression that flipped back to spawn-per-call (or that broke
+    /// `Arc` sharing across `WorkerCommand` clones) would land the
+    /// counter at two.
+    #[tokio::test]
+    async fn persistent_worker_reuses_child_across_calls() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be creatable");
+        let spawn_counter = tempdir.path().join("spawn_counter");
+        let counter_path = spawn_counter.display().to_string();
+
+        // `IFS= read -r _` reads one line per request without stripping
+        // whitespace; the loop body emits a fixed valid JSON-RPC
+        // response each time.
+        let script = format!(
+            r#"echo x >> {counter_path}; while IFS= read -r _; do printf '%s\n' '{{"jsonrpc":"2.0","id":"x","result":{{"providers":[]}}}}'; done"#,
+        );
+        let worker = WorkerCommand::new(
+            "sh".to_owned(),
+            vec!["-c".to_owned(), script],
+            std::env::current_dir().expect("current_dir should resolve"),
+        );
+
+        worker
+            .list_providers()
+            .await
+            .expect("first list_providers call must succeed");
+        worker
+            .list_providers()
+            .await
+            .expect("second list_providers call must succeed");
+
+        let spawn_marks = std::fs::read_to_string(&spawn_counter)
+            .expect("counter file should exist after spawn")
+            .lines()
+            .count();
+        assert_eq!(
+            spawn_marks, 1,
+            "persistent-worker mode must spawn the child exactly once across \
+             multiple calls; got {spawn_marks} spawn marks. A regression that \
+             reverts to spawn-per-call would land at 2.",
+        );
+    }
+
+    /// Crash recovery: when the shared child dies between calls, the
+    /// next call must transparently respawn instead of surfacing the
+    /// EOF as a permanent error. The script writes one response per
+    /// request line and exits cleanly after each, so the persistent
+    /// worker handle goes stale between calls and the next call has
+    /// to rebuild it. Both calls must succeed and the spawn counter
+    /// must show two distinct child processes.
+    #[tokio::test]
+    async fn persistent_worker_respawns_after_child_exits_cleanly() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be creatable");
+        let spawn_counter = tempdir.path().join("spawn_counter");
+        let counter_path = spawn_counter.display().to_string();
+
+        let script = format!(
+            r#"echo x >> {counter_path}; head -n 1 > /dev/null; printf '%s\n' '{{"jsonrpc":"2.0","id":"x","result":{{"providers":[]}}}}'"#,
+        );
+        let worker = WorkerCommand::new(
+            "sh".to_owned(),
+            vec!["-c".to_owned(), script],
+            std::env::current_dir().expect("current_dir should resolve"),
+        );
+
+        worker
+            .list_providers()
+            .await
+            .expect("first list_providers call must succeed");
+        worker
+            .list_providers()
+            .await
+            .expect("second list_providers call must respawn and succeed");
+
+        let spawn_marks = std::fs::read_to_string(&spawn_counter)
+            .expect("counter file should exist after spawn")
+            .lines()
+            .count();
+        assert_eq!(
+            spawn_marks, 2,
+            "after a clean child exit, the second call must respawn the worker; \
+             got {spawn_marks} spawns. A regression that left the dead handle \
+             in place would surface an EOF error on the second call.",
+        );
     }
 
     #[tokio::test]
