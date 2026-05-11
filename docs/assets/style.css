@@ -1,0 +1,277 @@
+/*
+ * VoiceLayer documentation stylesheet.
+ *
+ * Plain CSS, no build step. Applied uniformly to every generated HTML
+ * page under docs/ so the operator-facing reading experience stays
+ * consistent across architecture references and operator guides.
+ */
+
+:root {
+  color-scheme: light dark;
+  --vl-bg: #ffffff;
+  --vl-fg: #1f2328;
+  --vl-muted: #57606a;
+  --vl-accent: #1f6feb;
+  --vl-rule: #d0d7de;
+  --vl-surface: #f6f8fa;
+  --vl-code-bg: #f6f8fa;
+  --vl-code-fg: #1f2328;
+  --vl-radius: 6px;
+  --vl-max-width: 960px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --vl-bg: #0d1117;
+    --vl-fg: #e6edf3;
+    --vl-muted: #8b949e;
+    --vl-accent: #58a6ff;
+    --vl-rule: #30363d;
+    --vl-surface: #161b22;
+    --vl-code-bg: #161b22;
+    --vl-code-fg: #e6edf3;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--vl-bg);
+  color: var(--vl-fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+    "Liberation Sans", "Noto Sans", sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+body {
+  max-width: var(--vl-max-width);
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+
+header.vl-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--vl-rule);
+  flex-wrap: wrap;
+}
+
+header.vl-header .vl-brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--vl-muted);
+  font-size: 0.875rem;
+}
+
+header.vl-header nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  font-size: 0.95rem;
+}
+
+header.vl-header nav a {
+  color: var(--vl-muted);
+}
+
+header.vl-header nav a:hover {
+  color: var(--vl-accent);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  color: var(--vl-fg);
+  line-height: 1.25;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 2rem;
+  border-bottom: 1px solid var(--vl-rule);
+  padding-bottom: 0.5rem;
+}
+
+h2 {
+  font-size: 1.5rem;
+}
+
+h3 {
+  font-size: 1.25rem;
+}
+
+p {
+  margin: 0 0 1rem;
+}
+
+a {
+  color: var(--vl-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
+code {
+  background: var(--vl-code-bg);
+  color: var(--vl-code-fg);
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  border: 1px solid var(--vl-rule);
+}
+
+pre {
+  background: var(--vl-code-bg);
+  color: var(--vl-code-fg);
+  padding: 1rem 1.25rem;
+  border-radius: var(--vl-radius);
+  border: 1px solid var(--vl-rule);
+  overflow-x: auto;
+  margin: 0 0 1.25rem;
+  line-height: 1.55;
+}
+
+pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+blockquote {
+  border-left: 4px solid var(--vl-accent);
+  background: var(--vl-surface);
+  padding: 0.5rem 1rem;
+  margin: 0 0 1rem;
+  color: var(--vl-fg);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1.25rem;
+  font-size: 0.95rem;
+}
+
+thead {
+  background: var(--vl-surface);
+}
+
+th,
+td {
+  border: 1px solid var(--vl-rule);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+ul,
+ol {
+  margin: 0 0 1rem 1.5rem;
+  padding-left: 0.5rem;
+}
+
+li > p:last-child {
+  margin-bottom: 0.5rem;
+}
+
+hr {
+  height: 1px;
+  background: var(--vl-rule);
+  border: none;
+  margin: 2rem 0;
+}
+
+#TOC {
+  background: var(--vl-surface);
+  border: 1px solid var(--vl-rule);
+  border-radius: var(--vl-radius);
+  padding: 1rem 1.25rem;
+  margin: 0 0 2rem;
+  font-size: 0.95rem;
+}
+
+#TOC ul {
+  margin: 0 0 0 1.25rem;
+  padding-left: 0;
+}
+
+#TOC > ul {
+  margin-left: 1rem;
+}
+
+#TOC li {
+  margin: 0.25rem 0;
+}
+
+footer.vl-footer {
+  margin-top: 3rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--vl-rule);
+  font-size: 0.875rem;
+  color: var(--vl-muted);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.vl-callout {
+  background: var(--vl-surface);
+  border: 1px solid var(--vl-rule);
+  border-left: 4px solid var(--vl-accent);
+  padding: 0.75rem 1rem;
+  border-radius: var(--vl-radius);
+  margin: 0 0 1.25rem;
+  font-size: 0.95rem;
+  color: var(--vl-fg);
+}
+
+.vl-card-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin: 1rem 0 2rem;
+}
+
+.vl-card {
+  background: var(--vl-surface);
+  border: 1px solid var(--vl-rule);
+  border-radius: var(--vl-radius);
+  padding: 1rem 1.1rem 1.25rem;
+}
+
+.vl-card h3 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.vl-card p {
+  color: var(--vl-muted);
+  margin: 0 0 0.5rem;
+}

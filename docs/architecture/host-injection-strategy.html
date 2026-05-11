@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Host Injection Strategy</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/systemd.html">Systemd</a>
+    <a href="../guides/local-asr-provider.html">ASR providers</a>
+    <a href="../guides/local-llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+<header id="title-block-header">
+<h1 class="title">Host Injection Strategy — VoiceLayer</h1>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#host-injection-strategy"
+id="toc-host-injection-strategy">Host Injection Strategy</a>
+<ul>
+<li><a href="#principles" id="toc-principles">Principles</a></li>
+<li><a href="#gui-targets" id="toc-gui-targets">GUI Targets</a>
+<ul>
+<li><a href="#why-at-spi-first" id="toc-why-at-spi-first">Why AT-SPI
+First</a></li>
+<li><a href="#why-clipboard-second" id="toc-why-clipboard-second">Why
+Clipboard Second</a></li>
+<li><a href="#why-keyboard-simulation-last"
+id="toc-why-keyboard-simulation-last">Why Keyboard Simulation
+Last</a></li>
+</ul></li>
+<li><a href="#terminal-and-tui-targets"
+id="toc-terminal-and-tui-targets">Terminal and TUI Targets</a>
+<ul>
+<li><a href="#default-safety-rule" id="toc-default-safety-rule">Default
+Safety Rule</a></li>
+</ul></li>
+<li><a href="#future-adapters" id="toc-future-adapters">Future
+Adapters</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="host-injection-strategy">Host Injection Strategy</h1>
+<h2 id="principles">Principles</h2>
+<ul>
+<li>Use the least invasive insertion mechanism that preserves
+correctness.</li>
+<li>Prefer semantic insertion over keyboard simulation.</li>
+<li>Keep terminal submission explicit. Never send Enter by default.</li>
+</ul>
+<h2 id="gui-targets">GUI Targets</h2>
+<p>The preferred order for GUI insertion on Ubuntu GNOME Wayland is:</p>
+<ol type="1">
+<li>AT-SPI editable text insertion or replacement</li>
+<li>Clipboard-assisted paste with restoration</li>
+<li>Keyboard simulation fallback</li>
+</ol>
+<h3 id="why-at-spi-first">Why AT-SPI First</h3>
+<p>AT-SPI provides direct editable text operations and avoids timing
+races common with simulated input. This is the preferred path for
+browser editors, GTK apps, Electron apps, and IDE surfaces that expose
+accessibility trees correctly.</p>
+<h3 id="why-clipboard-second">Why Clipboard Second</h3>
+<p>Clipboard-assisted paste works across a wide set of targets and is
+less layout-sensitive than per-key typing. It still requires careful
+clipboard restore behavior and target-specific timing.</p>
+<h3 id="why-keyboard-simulation-last">Why Keyboard Simulation Last</h3>
+<p>Wayland intentionally limits unrestricted event injection.
+<code>ydotool</code> and <code>wtype</code> remain useful escape hatches
+but should not define the product contract.</p>
+<h2 id="terminal-and-tui-targets">Terminal and TUI Targets</h2>
+<p>The preferred order for terminal insertion is:</p>
+<ol type="1">
+<li>Bracketed paste payloads</li>
+<li>Terminal-specific send-text adapters</li>
+<li>Clipboard paste fallback when explicitly requested</li>
+</ol>
+<h3 id="default-safety-rule">Default Safety Rule</h3>
+<p>Terminal injection must not submit text automatically. If a user
+wants post-insert submission, that should be an explicit opt-in flag or
+per-target profile setting.</p>
+<h2 id="future-adapters">Future Adapters</h2>
+<p>The adapter boundary is intentionally open for:</p>
+<ul>
+<li>kitty remote control</li>
+<li>tmux pane targeting</li>
+<li>Neovim RPC</li>
+<li>Terminal emulator-specific paste integrations</li>
+</ul>
+<p>Those adapters should compose with the same
+<code>InjectionPlan</code> abstraction instead of creating parallel
+domain models.</p>
+<footer class="vl-footer">
+  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
+  <span>This page is generated from the matching Markdown source.</span>
+</footer>
+</body>
+</html>

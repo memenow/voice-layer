@@ -101,6 +101,7 @@ foreground_ptt.copy_on_stop                bool
 foreground_ptt.default_stop_action         none | copy | inject | save
 foreground_ptt.restore_clipboard_on_exit   bool
 foreground_ptt.save_dir                    directory path; "none" clears
+foreground_ptt.provider_id                 whisper_cpp | mimo_v2_5_asr | qwen3_asr_1_7b; "none" clears
 ```
 
 Boolean values accept `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`.

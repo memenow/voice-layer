@@ -39,3 +39,18 @@ from `systemd/voicelayerd.env.example`.
 - `vl-desktop` consumes the same SSE stream (`/v1/events/stream`) the
   CLI does — portal-registered hotkeys, overlay state, and
   `DictationFailureKind` all flow through the shared event envelope.
+
+## System-wide hotkey
+
+On startup `vl-desktop` registers the shortcut id
+`voicelayer.dictation_toggle` through
+`org.freedesktop.portal.GlobalShortcuts`. When the desktop session
+exposes the portal, the registered hotkey toggles the same dictation
+session the GUI start/stop buttons drive — there is no separate
+hotkey-only code path. When the portal is unavailable (the probe
+result surfaces in the window), `vl-desktop` falls back to the
+window-focused F9 binding inside the iced window.
+
+The CLI tool `vl` does not consume the portal shortcut today; for
+terminal usage prefer `vl dictation foreground-ptt`, which handles
+press / release inside the controlling TTY's raw mode.

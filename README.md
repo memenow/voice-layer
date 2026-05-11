@@ -29,7 +29,7 @@ VoiceLayer is not designed as:
 - `python/voicelayer_orchestrator`: JSON-RPC worker protocol and provider orchestration entry point
 - `systemd/`: user-service templates for the daemon and the optional persistent `whisper-server`
 - `scripts/install.sh`: one-shot installer that builds release binaries and seeds `~/.local/bin/`, `~/.config/systemd/user/`, and `~/.config/voicelayer/`
-- `docs/`: architecture, host strategy, and operations documentation
+- `docs/`: architecture, host strategy, and operations documentation. The Markdown sources stay authoritative for guard tests; open [`docs/index.html`](docs/index.html) for the rendered, navigation-friendly version.
 - `openapi/`: local API contract
 
 ## Current Status
@@ -38,7 +38,7 @@ Shipped today:
 
 - Rust workspace with `voicelayer-core`, `voicelayerd`, `vl`, and `vl-desktop`
 - `/v1` control API over a Unix domain socket with Server-Sent Events at `/v1/events/stream`
-- One-shot and fixed-duration segmented live dictation (`POST /v1/sessions/dictation` with `segmentation.mode = one_shot | fixed`), with per-segment `segment_recorded` / `segment_transcribed` events and a concatenated transcript on stop
+- One-shot, fixed-duration segmented, and silero-vad gated live dictation (`POST /v1/sessions/dictation` with `segmentation.mode = one_shot | fixed | vad_gated`), with per-segment `segment_recorded` / `segment_transcribed` events for fixed mode, per-probe `probe_analyzed` / `speech_unit_flushed` / `speech_unit_transcribed` events for VAD-gated mode, and a concatenated transcript on stop
 - `vl dictation foreground-ptt` alternate-screen panel with hold-to-record, transcript scrolling, clipboard restore, and tmux / WezTerm / Kitty targets
 - `vl-desktop` GUI overlay that shares the same socket, session state, and event stream as the CLI
 - Real ASR via `whisper.cpp`: one-shot `whisper-cli` plus an optional persistent `whisper-server` endpoint (with autostart) for warm-model reuse
@@ -52,10 +52,10 @@ Shipped today:
 
 Not yet implemented (documented and scoped):
 
-- GNOME portal hotkey binding beyond availability probing
+- GNOME portal hotkey binding inside the `vl` CLI (`vl-desktop` already registers `voicelayer.dictation_toggle` through `org.freedesktop.portal.GlobalShortcuts` and maps activations to start/stop; the terminal CLI still relies on `dictation foreground-ptt` raw-mode key handling rather than the portal)
 - AT-SPI writable target discovery
 - Always-on background microphone and mid-utterance partial transcripts
-- VAD-driven segmentation boundaries at the recorder layer (fixed-duration segmentation is shipped; adaptive VAD-driven segmentation is a later stage)
+- Adaptive recorder cadence driven by VAD verdicts (the shipped `vad_gated` mode flushes buffered speech on silence but the recorder itself still rolls on a fixed `probe_secs` schedule)
 - `.deb` packaging
 
 ## Development
@@ -161,15 +161,19 @@ The daemon exposes a live dictation session flow:
 - `POST /v1/sessions/dictation` starts recording
 - `POST /v1/sessions/dictation/stop` stops recording and returns the transcript
 
-The request body's `segmentation` field selects between one-shot and fixed-duration segmented capture:
+The request body's `segmentation` field selects between one-shot, fixed-duration segmented, and silero-vad gated capture:
 
 - `{"mode": "one_shot"}` (default) records a single WAV from start to stop and transcribes it once.
 - `{"mode": "fixed", "segment_secs": N}` rolls the recorder every `N` seconds; each finalized chunk is transcribed in the background and the per-segment events surface on `/v1/events/stream` (`dictation.segment_recorded`, `dictation.segment_transcribed`) while stop returns the concatenated transcript.
+- `{"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}` rolls the recorder every `P` seconds, classifies each probe via the worker's `segment_probe` RPC (silero-vad), and flushes the buffered speech unit to `transcribe` when `G` consecutive silent probes arrive or the buffered duration reaches `M`. Per-probe / per-unit events (`dictation.probe_analyzed`, `dictation.speech_unit_flushed`, `dictation.speech_unit_transcribed`) stream alongside the lifecycle events.
 
 The `vl` CLI exercises that control plane directly:
 
 ```bash
 cargo run -p vl -- dictation start --backend pipewire --language auto
+cargo run -p vl -- dictation start --mode fixed --segment-secs 8 --language auto
+cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
+cargo run -p vl -- dictation list
 cargo run -p vl -- dictation stop <session-id>
 ```
 

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Systemd User Service Guide</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/systemd.html">Systemd</a>
+    <a href="../guides/local-asr-provider.html">ASR providers</a>
+    <a href="../guides/local-llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+<header id="title-block-header">
+<h1 class="title">Systemd User Service Guide — VoiceLayer</h1>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#systemd-user-unit" id="toc-systemd-user-unit">Systemd User
+Unit</a>
+<ul>
+<li><a href="#one-shot-install" id="toc-one-shot-install">One-shot
+install</a></li>
+<li><a href="#environment-variables"
+id="toc-environment-variables">Environment variables</a>
+<ul>
+<li><a href="#core" id="toc-core">Core</a></li>
+<li><a href="#whispercpp-asr" id="toc-whispercpp-asr">whisper.cpp
+(ASR)</a></li>
+<li><a href="#openai-compatible-llm"
+id="toc-openai-compatible-llm">OpenAI-compatible LLM</a></li>
+<li><a href="#client-side-only-vl-desktop"
+id="toc-client-side-only-vl-desktop">Client-side only
+(vl-desktop)</a></li>
+</ul></li>
+<li><a href="#persistent-whisper-server"
+id="toc-persistent-whisper-server">Persistent whisper-server</a>
+<ul>
+<li><a href="#enable-the-dedicated-unit"
+id="toc-enable-the-dedicated-unit">Enable the dedicated unit</a></li>
+<li><a href="#docker-alternative" id="toc-docker-alternative">Docker
+alternative</a></li>
+</ul></li>
+<li><a href="#manual-install" id="toc-manual-install">Manual
+install</a></li>
+<li><a href="#uninstall" id="toc-uninstall">Uninstall</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="systemd-user-unit">Systemd User Unit</h1>
+<p>VoiceLayer's daemon (<code>voicelayerd</code>) is intended to run as
+a long-lived user-level systemd service so the socket is always
+available when the CLI, desktop shell, or a hotkey target asks for
+it.</p>
+<h2 id="one-shot-install">One-shot install</h2>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">scripts/install.sh</span></span></code></pre></div>
+<p>The script:</p>
+<ol type="1">
+<li>Runs
+<code>cargo build --release --bin vl --bin vl-desktop</code>.</li>
+<li>Installs <code>vl</code>, <code>vl-desktop</code>, and
+<code>voicelayer-whisper-server-run.sh</code> into
+<code>~/.local/bin</code> (override with
+<code>VOICELAYER_INSTALL_BIN_DIR</code>).</li>
+<li>Copies both <code>systemd/voicelayerd.service</code> and
+<code>systemd/voicelayer-whisper-server.service</code> to
+<code>~/.config/systemd/user/</code> (override with
+<code>VOICELAYER_INSTALL_UNIT_DIR</code>). The whisper-server unit is
+installed but left disabled — enable it only if you want server-mode ASR
+(see <a href="#persistent-whisper-server">Persistent
+whisper-server</a>).</li>
+<li>Seeds <code>~/.config/voicelayer/voicelayerd.env</code> from the
+shipped <code>voicelayerd.env.example</code> unless it already exists
+(override directory with <code>VOICELAYER_INSTALL_ENV_DIR</code>).</li>
+<li>Runs <code>systemctl --user daemon-reload</code> and finishes with
+<code>vl doctor</code>.</li>
+</ol>
+<p>Enabling the daemon afterwards is a single command:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable <span class="at">--now</span> voicelayerd</span></code></pre></div>
+<p><code>systemctl --user status voicelayerd</code> and
+<code>journalctl --user -u voicelayerd</code> are the usual knobs for
+inspection.</p>
+<h2 id="environment-variables">Environment variables</h2>
+<p><code>~/.config/voicelayer/voicelayerd.env</code> drives the daemon.
+The install script seeds it from
+<code>systemd/voicelayerd.env.example</code>; edit paths before enabling
+the unit.</p>
+<h3 id="core">Core</h3>
+<ul>
+<li><code>VOICELAYER_PROJECT_ROOT</code> — repository root the daemon
+uses to locate the Python worker
+(<code>python/voicelayer_orchestrator</code>).</li>
+<li><code>VOICELAYER_SOCKET_PATH</code> — optional override for the
+daemon socket path. Defaults to
+<code>$XDG_RUNTIME_DIR/voicelayer/daemon.sock</code>. The shipped unit
+hardcodes <code>--socket-path %t/voicelayer/daemon.sock</code>, so this
+env var is only consulted when the daemon is launched outside
+systemd.</li>
+<li><code>VOICELAYER_WORKER_TIMEOUT_SECONDS</code> — per-call upper
+bound on worker JSON-RPC inference calls (<code>transcribe</code>,
+<code>compose</code>, <code>rewrite</code>, <code>translate</code>).
+Probes (<code>health</code>, <code>list_providers</code>) use a fixed
+15s budget. Defaults to 600.</li>
+</ul>
+<h3 id="whispercpp-asr">whisper.cpp (ASR)</h3>
+<ul>
+<li><code>VOICELAYER_WHISPER_BIN</code> — path (or <code>$PATH</code>
+binary) for <code>whisper-cli</code>.</li>
+<li><code>VOICELAYER_WHISPER_MODEL_PATH</code> — absolute path to a ggml
+model.</li>
+<li><code>VOICELAYER_WHISPER_TIMEOUT_SECONDS</code> — per-call
+timeout.</li>
+<li><code>VOICELAYER_WHISPER_NO_GPU</code> — set truthy to force CPU on
+whisper-cli.</li>
+<li><code>VOICELAYER_WHISPER_ARGS</code> — extra flags forwarded
+verbatim.</li>
+<li><code>VOICELAYER_WHISPER_SERVER_HOST</code>,
+<code>VOICELAYER_WHISPER_SERVER_PORT</code>,
+<code>VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS</code> — persistent <a
+href="./local-asr-provider.html">whisper-server</a> configuration.</li>
+<li><code>VOICELAYER_WHISPER_SERVER_AUTO_START</code>,
+<code>VOICELAYER_WHISPER_SERVER_BIN</code>,
+<code>VOICELAYER_WHISPER_SERVER_ARGS</code>,
+<code>VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS</code> — autostart
+a local whisper-server subprocess.</li>
+<li><code>VOICELAYER_WHISPER_VAD_ENABLED</code>,
+<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code>,
+<code>VOICELAYER_WHISPER_VAD_THRESHOLD</code>,
+<code>VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS</code>,
+<code>VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS</code>,
+<code>VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS</code>,
+<code>VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS</code>,
+<code>VOICELAYER_WHISPER_VAD_SAMPLE_RATE</code> — optional silero-vad
+pre-pass.</li>
+</ul>
+<h3 id="openai-compatible-llm">OpenAI-compatible LLM</h3>
+<ul>
+<li><code>VOICELAYER_LLM_ENDPOINT</code>,
+<code>VOICELAYER_LLM_MODEL</code>, <code>VOICELAYER_LLM_API_KEY</code>,
+<code>VOICELAYER_LLM_TIMEOUT_SECONDS</code>.</li>
+<li><code>VOICELAYER_LLM_AUTO_START</code>,
+<code>VOICELAYER_LLAMA_SERVER_BIN</code>,
+<code>VOICELAYER_LLAMA_MODEL_PATH</code>,
+<code>VOICELAYER_LLAMA_HF_REPO</code>,
+<code>VOICELAYER_LLAMA_SERVER_ARGS</code>,
+<code>VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS</code> — optional
+llama-server autostart.</li>
+</ul>
+<h3 id="client-side-only-vl-desktop">Client-side only (vl-desktop)</h3>
+<p><code>VOICELAYER_VL_BIN</code> and <code>VOICELAYER_LOG</code> are
+read by <code>vl-desktop</code>, not the daemon, and are intentionally
+kept out of <code>voicelayerd.env</code>. See <a
+href="./desktop.html">desktop.md</a> for details.</p>
+<h2 id="persistent-whisper-server">Persistent whisper-server</h2>
+<p>whisper.cpp's <code>whisper-server</code> keeps the ggml model
+mmapped across requests, cutting ~260ms/capture compared with spawning
+<code>whisper-cli</code> per request. You have two ways to keep one
+running:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Option</th>
+<th>When to pick it</th>
+<th>Managed by</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>VOICELAYER_WHISPER_SERVER_AUTO_START=1</code> in
+<code>voicelayerd.env</code></td>
+<td>You want the daemon to spawn the server lazily on first transcribe
+and reap it on daemon exit.</td>
+<td><code>voicelayerd</code></td>
+</tr>
+<tr class="even">
+<td><code>systemctl --user enable --now voicelayer-whisper-server</code></td>
+<td>You want the server up on login independent of the daemon, with its
+own journald logs and restart policy.</td>
+<td>dedicated unit</td>
+</tr>
+</tbody>
+</table>
+<p>Pick <strong>one</strong> — running both simultaneously makes the
+daemon's autostart path race the dedicated unit for the same port. When
+the dedicated unit is active, leave
+<code>VOICELAYER_WHISPER_SERVER_AUTO_START</code> unset or
+<code>false</code>.</p>
+<h3 id="enable-the-dedicated-unit">Enable the dedicated unit</h3>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Required env keys (uncomment in ~/.config/voicelayer/voicelayerd.env):</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">#   VOICELAYER_WHISPER_SERVER_BIN=/absolute/path/to/whisper-server</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">#   VOICELAYER_WHISPER_MODEL_PATH=/absolute/path/to/ggml-base.en.bin</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">#   VOICELAYER_WHISPER_SERVER_PORT=8188</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable <span class="at">--now</span> voicelayer-whisper-server</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> status voicelayer-whisper-server</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">--user</span> <span class="at">-u</span> voicelayer-whisper-server</span></code></pre></div>
+<p>The unit invokes <code>voicelayer-whisper-server-run.sh</code>
+(installed to <code>~/.local/bin/</code>), which validates the env,
+reads <code>VOICELAYER_WHISPER_SERVER_HOST</code> / <code>_PORT</code> /
+<code>_ARGS</code>, and <code>exec</code>s the binary so systemd tracks
+the server PID directly.</p>
+<p><code>vl doctor</code> reports the current mode under
+<code>whisper_mode</code>: <code>"server"</code> once the daemon
+successfully probes <code>http://$HOST:$PORT/</code>, otherwise
+<code>"cli"</code> or <code>"unconfigured"</code>.</p>
+<p>It also reports both unit files separately so a misconfigured install
+(daemon up, whisper-server unit missing or stopped) can be diagnosed
+without an extra <code>systemctl --user status</code> round trip:</p>
+<ul>
+<li><code>systemd_unit_installed</code> /
+<code>systemd_unit_active</code> — the daemon unit
+(<code>voicelayerd.service</code>).</li>
+<li><code>whisper_server_unit_installed</code> /
+<code>whisper_server_unit_active</code> — the optional persistent server
+unit (<code>voicelayer-whisper-server.service</code>).
+<code>installed=true</code> plus <code>active=false</code> is the
+expected state when you let the daemon autostart whisper-server lazily;
+both <code>true</code> is the dedicated-unit setup; both
+<code>false</code> is the cli-only fallback.</li>
+</ul>
+<h3 id="docker-alternative">Docker alternative</h3>
+<p>The shipped unit runs a native <code>whisper-server</code> binary. To
+use the prebuilt <code>ghcr.io/ggml-org/whisper.cpp:main</code> image
+instead, add a drop-in override:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/.config/systemd/user/voicelayer-whisper-server.service.d</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> ~/.config/systemd/user/voicelayer-whisper-server.service.d/docker.conf <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="st">[Service]</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="st"># Clear the native ExecStart and swap in docker.</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="st">ExecStart=</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="st">ExecStart=/usr/bin/docker run --rm --name voicelayer-whisper-server \</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="st">  -p 127.0.0.1:8188:8188 \</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="st">  -v %h/.cache/voicelayer/models:/models:ro \</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="st">  --entrypoint whisper-server \</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="st">  ghcr.io/ggml-org/whisper.cpp:main \</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="st">  -m /models/ggml-base.en.bin \</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="st">  --host 0.0.0.0 --port 8188 -ng</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="st">ExecStop=/usr/bin/docker stop voicelayer-whisper-server</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> restart voicelayer-whisper-server</span></code></pre></div>
+<p>Adjust the model filename and port to match your
+<code>voicelayerd.env</code>.</p>
+<h2 id="manual-install">Manual install</h2>
+<p>If you prefer not to run <code>scripts/install.sh</code>:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> build <span class="at">--release</span> <span class="at">--bin</span> vl <span class="at">--bin</span> vl-desktop</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-m</span> 0755 target/release/vl ~/.local/bin/vl</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-m</span> 0755 target/release/vl-desktop ~/.local/bin/vl-desktop</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-m</span> 0755 scripts/voicelayer-whisper-server-run.sh <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  ~/.local/bin/voicelayer-whisper-server-run.sh</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> ~/.config/systemd/user ~/.config/voicelayer</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-m</span> 0644 systemd/voicelayerd.service ~/.config/systemd/user/voicelayerd.service</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-m</span> 0644 systemd/voicelayer-whisper-server.service <span class="dt">\</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  ~/.config/systemd/user/voicelayer-whisper-server.service</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">[[</span> <span class="ot">-f</span> ~/.config/voicelayer/voicelayerd.env <span class="kw">]]</span> <span class="kw">||</span> <span class="dt">\</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0600 systemd/voicelayerd.env.example ~/.config/voicelayer/voicelayerd.env</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable <span class="at">--now</span> voicelayerd</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Optional: also enable whisper-server if you want server-mode ASR.</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="co"># systemctl --user enable --now voicelayer-whisper-server</span></span></code></pre></div>
+<h2 id="uninstall">Uninstall</h2>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> disable <span class="at">--now</span> voicelayerd voicelayer-whisper-server</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> ~/.config/systemd/user/voicelayerd.service <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>      ~/.config/systemd/user/voicelayer-whisper-server.service</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> ~/.local/bin/vl <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>      ~/.local/bin/vl-desktop <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>      ~/.local/bin/voicelayer-whisper-server-run.sh</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span></code></pre></div>
+<p>Environment files under <code>~/.config/voicelayer/</code> are left
+in place so a later reinstall can reuse them.</p>
+<footer class="vl-footer">
+  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
+  <span>This page is generated from the matching Markdown source.</span>
+</footer>
+</body>
+</html>

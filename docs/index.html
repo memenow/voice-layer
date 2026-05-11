@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VoiceLayer Documentation</title>
+<meta name="description" content="Local-first voice composition layer for Ubuntu desktops: dictation, composition, rewrite, and translation through a daemon, CLI/TUI, and host adapters." />
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+<header class="vl-header">
+  <a class="vl-brand" href="./">VoiceLayer Docs</a>
+  <nav>
+    <a href="./">Home</a>
+    <a href="architecture/overview.html">Architecture</a>
+    <a href="guides/development.html">Development</a>
+    <a href="guides/systemd.html">Systemd</a>
+    <a href="guides/local-asr-provider.html">ASR providers</a>
+    <a href="guides/local-llm-provider.html">LLM provider</a>
+    <a href="guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+
+<main>
+
+<h1>VoiceLayer</h1>
+<p>
+  <strong>VoiceLayer</strong> is a local-first voice composition layer for Ubuntu
+  desktop workflows. It packages low-latency dictation, structured text
+  composition, rewriting, and translation behind a single daemon, a CLI / TUI,
+  an optional GUI shell, and a small set of host adapters that route the result
+  into whichever editor, browser, IDE, or terminal application currently has
+  focus.
+</p>
+
+<div class="vl-callout">
+  <strong>Scope.</strong> VoiceLayer targets browser text areas, document and
+  IDE editors, terminal multiplexers (tmux, WezTerm, Kitty), and drafting
+  workflows that benefit from a preview-then-insert step. It is not a
+  traditional IME candidate window, a subtitle-only transcriber, a
+  browser-only extension, or a cloud-only voice assistant.
+</div>
+
+<h2>What ships today</h2>
+<ul>
+  <li>Rust workspace with <code>voicelayer-core</code> (domain),
+      <code>voicelayerd</code> (daemon and <code>/v1</code> HTTP API over a
+      Unix domain socket), <code>vl</code> (operator CLI / TUI), and
+      <code>vl-desktop</code> (interactive iced GUI shell that shares the
+      daemon socket).</li>
+  <li>Live dictation with one-shot, fixed-duration segmented, and silero-vad
+      gated capture; per-session ASR provider routing; per-segment Server-Sent
+      Events on <code>/v1/events/stream</code>.</li>
+  <li>Optional silero-vad pre-pass that trims non-speech inside the Python
+      worker before transcription, applied uniformly across whisper.cpp,
+      MiMo-V2.5-ASR, and Qwen3-ASR-1.7B.</li>
+  <li>Real ASR through <code>whisper.cpp</code>: one-shot
+      <code>whisper-cli</code> with an opt-in persistent <code>whisper-server</code>
+      endpoint for warm-model reuse and lazy autostart.</li>
+  <li>Optional GPU ASR providers, opt-in per-request via
+      <code>provider_id</code>: Xiaomi MiMo-V2.5-ASR for multilingual / quality
+      priority workloads; Alibaba Qwen3-ASR-1.7B for Apache-2.0 30-language
+      coverage including Mandarin and Cantonese.</li>
+  <li>Real composition / rewrite / translation through an
+      OpenAI-compatible chat completion endpoint, with optional
+      <code>llama-server</code> autostart for local endpoints.</li>
+  <li>Persistent Rust&nbsp;&harr;&nbsp;Python stdio JSON-RPC bridge — the daemon
+      keeps a single Python worker subprocess alive across every request so
+      multi-GB GPU model loads pay their cold start only once per daemon
+      lifetime.</li>
+  <li>systemd user units for <code>voicelayerd</code> and the optional
+      <code>voicelayer-whisper-server</code>, plus a
+      <code>scripts/install.sh</code> one-shot installer.</li>
+  <li><code>vl doctor</code> surfaces recorder diagnostics, whisper mode
+      (<code>cli</code> / <code>server</code> / <code>unconfigured</code>), LLM
+      reachability, GlobalShortcuts portal status, and systemd unit state.</li>
+</ul>
+
+<h2>Documentation</h2>
+
+<section>
+  <h3>Architecture references</h3>
+  <div class="vl-card-grid">
+    <article class="vl-card">
+      <h3><a href="architecture/overview.html">Architecture Overview</a></h3>
+      <p>Runtime topology, component responsibilities, domain vocabulary,
+         configuration precedence, recorder backends, and dictation
+         segmentation modes (one-shot, fixed, VAD-gated).</p>
+    </article>
+    <article class="vl-card">
+      <h3><a href="architecture/python-worker-protocol.html">Python Worker Protocol</a></h3>
+      <p>JSON-RPC method set, persistent-worker semantics, provider routing,
+         silero-vad pre-pass, sidecar cleanup, and the
+         <code>providers/*.py</code> module layout.</p>
+    </article>
+    <article class="vl-card">
+      <h3><a href="architecture/host-injection-strategy.html">Host Injection Strategy</a></h3>
+      <p>Insertion priority for GUI targets (AT-SPI, clipboard, keyboard
+         simulation) and terminal targets (bracketed paste, terminal-specific
+         adapters). Why submit-by-default is unsafe.</p>
+    </article>
+  </div>
+</section>
+
+<section>
+  <h3>Operator guides</h3>
+  <div class="vl-card-grid">
+    <article class="vl-card">
+      <h3><a href="guides/development.html">Development Guide</a></h3>
+      <p>Repository layout, the authoritative verification chain
+         (<code>cargo</code> + <code>uv</code>), worker discovery, and live
+         dictation runtime commands.</p>
+    </article>
+    <article class="vl-card">
+      <h3><a href="guides/systemd.html">Systemd User Service</a></h3>
+      <p><code>scripts/install.sh</code>, the <code>voicelayerd</code> unit,
+         the optional persistent <code>voicelayer-whisper-server</code> unit,
+         environment file structure, and the Docker drop-in override.</p>
+    </article>
+    <article class="vl-card">
+      <h3><a href="guides/local-asr-provider.html">Local ASR Provider</a></h3>
+      <p>Setup for <code>whisper-cli</code>, persistent
+         <code>whisper-server</code>, the silero-vad pre-pass, and the opt-in
+         MiMo-V2.5-ASR and Qwen3-ASR-1.7B GPU providers.</p>
+    </article>
+    <article class="vl-card">
+      <h3><a href="guides/local-llm-provider.html">Local LLM Provider</a></h3>
+      <p>Configuring an OpenAI-compatible endpoint, optional
+         <code>llama-server</code> autostart, and the supported
+         <code>VOICELAYER_LLM_*</code> environment variables.</p>
+    </article>
+    <article class="vl-card">
+      <h3><a href="guides/desktop.html">Desktop Shell</a></h3>
+      <p>How <code>vl-desktop</code> shares the daemon socket, its two
+         client-side environment variables, and how it relates to the systemd
+         unit.</p>
+    </article>
+  </div>
+</section>
+
+<h2>Quick start</h2>
+
+<p>Build the workspace, sync the Python environment, and start the daemon from
+   the repository root:</p>
+
+<pre><code>cargo build --release --bin vl --bin vl-desktop --bin voicelayerd
+uv sync --group dev
+cargo run -p vl -- daemon run --project-root "$(pwd)"
+</code></pre>
+
+<p>Inspect the running environment, providers, and supported transcript
+   provider ids:</p>
+
+<pre><code>cargo run -p vl -- doctor
+cargo run -p vl -- providers
+</code></pre>
+
+<p>Record a short clip and transcribe it through the configured ASR backend:</p>
+
+<pre><code>cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto
+</code></pre>
+
+<p>For longer sessions, drive the daemon's live dictation control plane:</p>
+
+<pre><code>cargo run -p vl -- dictation start --backend pipewire --language auto
+cargo run -p vl -- dictation stop &lt;session-id&gt;
+</code></pre>
+
+<p>Open a terminal-local push-to-talk panel with hold-to-record, scrolling
+   transcript review, clipboard restore, and optional tmux / WezTerm / Kitty
+   targets:</p>
+
+<pre><code>cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto
+</code></pre>
+
+<h2>Verification chain</h2>
+
+<p>Every change must pass the same chain before merge — see
+   <a href="guides/development.html">Development Guide</a> for the full
+   discussion:</p>
+
+<pre><code>cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+uv sync --group dev
+uv run ruff check python tests/python
+uv run ruff format --check python tests/python
+uv run pytest -q tests/python
+</code></pre>
+
+<h2>Maintainer-facing sources</h2>
+
+<p>The HTML pages on this site are generated from Markdown sources under
+   <code>docs/</code>. Open the Markdown directly when you need the literal
+   text the contributor guard tests scan — for example
+   <code>docs/architecture/overview.md</code>,
+   <code>docs/guides/local-asr-provider.md</code>, or the repo-root
+   <code>README.md</code>, <code>CLAUDE.md</code>, and
+   <code>systemd/voicelayerd.env.example</code>.</p>
+
+</main>
+
+<footer class="vl-footer">
+  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
+  <span>Repository: <a href="https://github.com/memenow/voice-layer"><code>memenow/voice-layer</code></a></span>
+</footer>
+</body>
+</html>

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Python Worker Protocol</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/systemd.html">Systemd</a>
+    <a href="../guides/local-asr-provider.html">ASR providers</a>
+    <a href="../guides/local-llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+<header id="title-block-header">
+<h1 class="title">Python Worker Protocol — VoiceLayer</h1>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#python-worker-protocol"
+id="toc-python-worker-protocol">Python Worker Protocol</a>
+<ul>
+<li><a href="#purpose" id="toc-purpose">Purpose</a></li>
+<li><a href="#transport" id="toc-transport">Transport</a></li>
+<li><a href="#required-methods" id="toc-required-methods">Required
+Methods</a></li>
+<li><a href="#current-behavior" id="toc-current-behavior">Current
+Behavior</a></li>
+<li><a href="#error-policy" id="toc-error-policy">Error Policy</a></li>
+<li><a href="#preview-payload-shape"
+id="toc-preview-payload-shape">Preview Payload Shape</a></li>
+<li><a href="#module-layout" id="toc-module-layout">Module
+Layout</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="python-worker-protocol">Python Worker Protocol</h1>
+<h2 id="purpose">Purpose</h2>
+<p>The Python worker boundary exists so provider-specific logic can move
+faster without destabilizing the Rust daemon.</p>
+<h2 id="transport">Transport</h2>
+<ul>
+<li>Protocol: JSON-RPC 2.0</li>
+<li>Medium: stdio (line-delimited)</li>
+<li>Ownership: Rust spawns one long-lived worker subprocess per
+<code>WorkerCommand</code> and serializes every JSON-RPC line through a
+shared <code>tokio::sync::Mutex</code>. The same Python child handles
+every request the daemon issues; <code>WorkerCommand::call</code> only
+respawns when the child crashes, EOFs unexpectedly, or times out.
+Operator env var changes (<code>VOICELAYER_*</code>) are read at worker
+spawn time and therefore require a daemon restart (or an explicit worker
+kill) to apply mid-session — the trade-off the persistent mode pays for
+the warm GPU model caches in <code>providers/mimo_asr.py</code> and
+<code>providers/qwen3_asr.py</code>. The last
+<code>STDERR_TAIL_MAX_LINES</code> lines of stderr are buffered in the
+daemon and surfaced in <code>WorkerCallError::ProcessExited</code> so a
+worker crash report still includes the Python-side traceback even though
+the daemon no longer reads stderr to EOF per call.</li>
+<li>Runtime environment: the worker must execute through the
+repository's <code>uv</code> environment, not the system
+interpreter</li>
+</ul>
+<h2 id="required-methods">Required Methods</h2>
+<ul>
+<li><code>health</code></li>
+<li><code>list_providers</code></li>
+<li><code>compose</code></li>
+<li><code>rewrite</code></li>
+<li><code>translate</code></li>
+<li><code>transcribe</code></li>
+<li><code>segment_probe</code></li>
+<li><code>stitch_wav_segments</code></li>
+</ul>
+<h2 id="current-behavior">Current Behavior</h2>
+<p>The worker implements every required method with real providers:</p>
+<ul>
+<li><code>health</code> reports ASR and LLM readiness, probes the
+configured LLM endpoint, and surfaces <code>asr_configured</code>,
+<code>asr_error</code>, <code>llm_configured</code>,
+<code>llm_reachable</code>, and <code>llm_error</code>.</li>
+<li><code>list_providers</code> returns the whisper.cpp ASR descriptor
+plus the configured LLM descriptor, or a stub LLM descriptor when no
+endpoint is set.</li>
+<li><code>transcribe</code> prefers a persistent
+<code>whisper-server</code> endpoint when
+<code>VOICELAYER_WHISPER_SERVER_*</code> is configured (see
+<code>providers/whisper_server.py</code>), falling back to one-shot
+<code>whisper-cli</code> via <code>providers/whisper_cli.py</code> when
+the server is unreachable or returns an error. Both paths are
+independent; configuring only the cli variables keeps the legacy
+behavior. When the optional silero-vad pre-pass is enabled
+(<code>VOICELAYER_WHISPER_VAD_ENABLED=true</code>, see
+<code>providers/vad_segmenter.py</code>), the worker runs VAD on the
+input WAV before dispatching to whisper, trims non-speech, and
+short-circuits with an empty-transcript response when no speech is
+detected. VAD failure falls back to the raw WAV without losing the
+request. When the request body sets
+<code>provider_id="mimo_v2_5_asr"</code> and the optional Xiaomi
+MiMo-V2.5-ASR provider is configured (see
+<code>providers/mimo_asr.py</code> and <code>VOICELAYER_MIMO_*</code>),
+or sets <code>provider_id="qwen3_asr_1_7b"</code> and the optional
+Alibaba Qwen3-ASR-1.7B provider is configured (see
+<code>providers/qwen3_asr.py</code> and
+<code>VOICELAYER_QWEN3_ASR_*</code>), the worker bypasses the whisper
+chain entirely and dispatches to the selected backend; an unknown
+<code>provider_id</code> returns <code>-32004</code> rather than
+silently routing to whisper, and an explicit backend failure returns
+<code>-32005</code> without whisper fallback. The same
+<code>provider_id</code> is plumbed through every transcribe call a
+dictation session emits — the daemon stores it on the active session at
+<code>POST /v1/sessions/dictation</code> (or
+<code>POST /v1/dictation/capture</code>) and forwards it on every
+fixed-segment, vad-gated speech-unit, and one-shot stop transcribe call,
+so a caller that selects MiMo or Qwen3-ASR at session start never
+silently falls back to whisper for a subset of segments. The silero-vad
+pre-pass also applies on both opt-in paths: when
+<code>VOICELAYER_WHISPER_VAD_ENABLED=true</code> the same
+trim/short-circuit/fall-back-to-raw-WAV behavior runs before backend
+inference, which avoids paying the cold-load cost on pure-silence
+captures and prevents the causal LMs in MiMo / Qwen3-ASR from
+hallucinating transcripts on detected-silence audio. After
+<code>transcribe</code> returns — on success, on whisper / MiMo /
+Qwen3-ASR failure, and on the no-speech short-circuit — the dispatcher
+unlinks the per-call sidecar files it produced under
+<code>runtime_dir/</code>: the <code>.vad-trimmed.wav</code> /
+<code>.vad-empty.wav</code> written by the silero-vad pre-pass, plus the
+<code>mimo-segment-&lt;ts&gt;-&lt;idx&gt;.wav</code> and
+<code>qwen3-segment-&lt;ts&gt;-&lt;idx&gt;.wav</code> chunks emitted by
+the (optional) long-audio splitters. The original capture is left intact
+for the caller (the dictation pipeline owns its lifetime via
+<code>keep_audio</code>).</li>
+<li><code>compose</code>, <code>rewrite</code>, and
+<code>translate</code> call the configured OpenAI-compatible chat
+completion endpoint through
+<code>providers/llm_openai_compatible.py</code>, optionally
+auto-starting <code>llama-server</code> via
+<code>providers/llama_autostart.py</code> when
+<code>VOICELAYER_LLM_AUTO_START=true</code>.</li>
+<li><code>segment_probe</code> runs a silero-vad pass on a single WAV
+file (typically a 1–2 s probe) and returns
+<code>{has_speech, speech_ratio, regions, notes}</code> where
+<code>regions</code> is a list of <code>{start_secs, end_secs}</code>
+speech spans. Intended as the classification primitive for VAD-gated
+segmentation: the daemon orchestrator feeds each physical probe through
+this method and uses the response to decide whether to keep accumulating
+or to flush the pending buffer to <code>transcribe</code>. Returns
+<code>-32004</code> when VAD is not configured and <code>-32005</code>
+when silero-vad itself fails. See
+<code>providers/vad_segmenter.py::probe_audio_file</code>.</li>
+<li><code>stitch_wav_segments</code> concatenates a list of WAV files
+into a single output WAV and returns
+<code>{audio_file, segment_count, duration_secs}</code>. Used by the
+VAD-gated orchestrator to merge the pending speech probes before handing
+the unit to <code>transcribe</code>. All inputs must share sample rate,
+sample width, and channel count; mismatches raise <code>-32005</code>.
+Invalid requests (empty <code>audio_files</code>, non-string entries,
+missing <code>out_file</code>) return <code>-32600</code>. See
+<code>providers/audio_stitch.py</code>.</li>
+</ul>
+<p>The Rust daemon and CLI invoke every method through a live stdio
+bridge. <code>health</code> and <code>list_providers</code> are
+exercised end-to-end in Rust integration tests; transcription, chat
+completion, llama-server auto-start, and URL normalization are covered
+by Python unit tests in <code>tests/python/test_worker.py</code>.</p>
+<p>When a provider is not configured, the worker returns
+<code>-32004</code> (provider unavailable) rather than fabricating
+output. When a configured provider fails at runtime, it returns
+<code>-32005</code> (provider request failed).</p>
+<h2 id="error-policy">Error Policy</h2>
+<ul>
+<li>Invalid JSON-RPC request: <code>-32600</code></li>
+<li>Method not found: <code>-32601</code></li>
+<li>Parse error: <code>-32700</code></li>
+<li>Provider unavailable: <code>-32004</code></li>
+<li>Provider request failed: <code>-32005</code></li>
+</ul>
+<h2 id="preview-payload-shape">Preview Payload Shape</h2>
+<p><code>compose</code>, <code>rewrite</code>, and
+<code>translate</code> return a preview payload shaped as:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;title&quot;</span><span class="fu">:</span> <span class="st">&quot;string&quot;</span><span class="fu">,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;generated_text&quot;</span><span class="fu">:</span> <span class="st">&quot;string&quot;</span><span class="fu">,</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;notes&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;string&quot;</span><span class="ot">]</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<h2 id="module-layout">Module Layout</h2>
+<p>Provider-specific logic lives under
+<code>python/voicelayer_orchestrator/providers/</code>:</p>
+<ul>
+<li><code>llm_openai_compatible.py</code> — chat completion HTTP client,
+endpoint URL normalization, preview payload builders.</li>
+<li><code>llama_autostart.py</code> — optional background launch and
+readiness polling for <code>llama-server</code>.</li>
+<li><code>whisper_cli.py</code> — validation and invocation of the
+<code>whisper-cli</code> subprocess.</li>
+<li><code>whisper_server.py</code> — HTTP client, readiness probe,
+optional autostart, and <code>/inference</code> multipart encoder for
+the persistent <code>whisper-server</code> path.</li>
+<li><code>mimo_asr.py</code> — optional Xiaomi MiMo-V2.5-ASR provider.
+Lazy-loads the <code>MimoAudio</code> wrapper on first call and caches
+it in a module-level dict keyed by
+<code>(model_path, tokenizer_path, device)</code>. Precision is fixed to
+bf16 by the upstream wrapper and intentionally not part of the cache
+key. Splits inputs longer than
+<code>VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS</code> into WAV chunks
+via the stdlib <code>wave</code> module so upstream issue #6 (decoder
+repetition past ~3 minutes) does not surface in operator-facing
+transcripts.</li>
+<li><code>qwen3_asr.py</code> — optional Alibaba Qwen3-ASR-1.7B
+provider. Lazy-loads the <code>qwen-asr</code> package's
+<code>Qwen3ASRModel</code> wrapper on first call and caches it in a
+module-level dict keyed by
+<code>(model_path, device, torch_dtype)</code>. The wrapper handles
+audio preprocessing and long-audio chunking internally, so worker-side
+splitting is opt-in via
+<code>VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS</code> (default
+<code>0</code> = disabled). Apache-2.0; the <code>qwen3-asr</code> extra
+is independent of the <code>mimo</code> extra so each provider can
+evolve its transformers floor without breaking the other.</li>
+<li><code>vad_segmenter.py</code> — optional silero-vad pre-pass (v4 or
+v5 ONNX) that trims non-speech out of the input WAV before
+transcription, plus <code>probe_audio_file</code> for the
+<code>segment_probe</code> RPC that backs VAD-gated segmentation.
+Lazy-imports <code>numpy</code> and <code>onnxruntime</code> so the
+<code>vad</code> extra stays optional.</li>
+<li><code>audio_stitch.py</code> — stdlib <code>wave</code>-based WAV
+concatenator backing the <code>stitch_wav_segments</code> RPC. Rejects
+format mismatches between inputs so the orchestrator never silently
+produces a malformed output WAV.</li>
+</ul>
+<p>Shared utilities live in <code>providers/__init__.py</code>
+(<code>ProviderInvocationError</code>,
+<code>provider_runtime_dir</code>, <code>supported_providers</code>).
+Environment-backed dataclasses and loaders live in
+<code>config.py</code>. <code>worker.py</code> is protocol-only:
+JSON-RPC constants, <code>handle_request</code>, <code>serve</code>, and
+<code>main</code>.</p>
+<footer class="vl-footer">
+  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
+  <span>This page is generated from the matching Markdown source.</span>
+</footer>
+</body>
+</html>

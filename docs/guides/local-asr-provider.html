@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Local ASR Provider Guide</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/systemd.html">Systemd</a>
+    <a href="../guides/local-asr-provider.html">ASR providers</a>
+    <a href="../guides/local-llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+<header id="title-block-header">
+<h1 class="title">Local ASR Provider Guide — VoiceLayer</h1>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#local-asr-provider-guide"
+id="toc-local-asr-provider-guide">Local ASR Provider Guide</a>
+<ul>
+<li><a href="#recommended-baseline"
+id="toc-recommended-baseline">Recommended Baseline</a></li>
+<li><a href="#example-whispercpp-startup"
+id="toc-example-whispercpp-startup">Example <code>whisper.cpp</code>
+Startup</a></li>
+<li><a href="#voicelayer-environment-variables"
+id="toc-voicelayer-environment-variables">VoiceLayer Environment
+Variables</a>
+<ul>
+<li><a
+href="#persistent-whisper-server-preferred-for-phase-3-segmented-workflows"
+id="toc-persistent-whisper-server-preferred-for-phase-3-segmented-workflows">Persistent
+<code>whisper-server</code> (preferred for Phase 3 segmented
+workflows)</a></li>
+</ul></li>
+<li><a href="#example-source-workflow"
+id="toc-example-source-workflow">Example Source Workflow</a></li>
+<li><a href="#recorder-backends" id="toc-recorder-backends">Recorder
+Backends</a>
+<ul>
+<li><a href="#optional-silero-vad-pre-pass-phase-3d"
+id="toc-optional-silero-vad-pre-pass-phase-3d">Optional silero-vad
+Pre-pass (Phase 3D)</a></li>
+<li><a href="#vad-gated-live-dictation-phase-3d-b"
+id="toc-vad-gated-live-dictation-phase-3d-b">VAD-gated Live Dictation
+(Phase 3D-B)</a></li>
+</ul></li>
+<li><a href="#mimo-v25-asr-optional-gpu-provider"
+id="toc-mimo-v25-asr-optional-gpu-provider">MiMo-V2.5-ASR (optional GPU
+provider)</a>
+<ul>
+<li><a href="#what-you-get" id="toc-what-you-get">What you get</a></li>
+<li><a href="#what-you-give-up" id="toc-what-you-give-up">What you give
+up</a></li>
+<li><a href="#one-time-setup" id="toc-one-time-setup">One-time
+setup</a></li>
+<li><a href="#environment-variables"
+id="toc-environment-variables">Environment variables</a></li>
+<li><a href="#select-the-provider-per-request"
+id="toc-select-the-provider-per-request">Select the provider per
+request</a></li>
+<li><a href="#select-the-provider-per-dictation-session"
+id="toc-select-the-provider-per-dictation-session">Select the provider
+per dictation session</a></li>
+<li><a href="#trade-off-summary" id="toc-trade-off-summary">Trade-off
+summary</a></li>
+</ul></li>
+<li><a href="#qwen3-asr-17b-optional-apache-20-gpucpu-provider"
+id="toc-qwen3-asr-17b-optional-apache-20-gpucpu-provider">Qwen3-ASR-1.7B
+(optional Apache-2.0 GPU/CPU provider)</a>
+<ul>
+<li><a href="#what-you-get-1" id="toc-what-you-get-1">What you
+get</a></li>
+<li><a href="#what-you-give-up-1" id="toc-what-you-give-up-1">What you
+give up</a></li>
+<li><a href="#one-time-setup-1" id="toc-one-time-setup-1">One-time
+setup</a></li>
+<li><a href="#environment-variables-1"
+id="toc-environment-variables-1">Environment variables</a></li>
+<li><a href="#select-the-provider-per-request-1"
+id="toc-select-the-provider-per-request-1">Select the provider per
+request</a></li>
+<li><a href="#select-the-provider-per-dictation-session-1"
+id="toc-select-the-provider-per-dictation-session-1">Select the provider
+per dictation session</a></li>
+</ul></li>
+<li><a href="#current-scope" id="toc-current-scope">Current
+Scope</a></li>
+<li><a href="#phase-3-pre-flight-cold-start-measurement"
+id="toc-phase-3-pre-flight-cold-start-measurement">Phase 3 Pre-flight:
+Cold-start Measurement</a>
+<ul>
+<li><a href="#baseline-measurement-cpu-ggml-baseenbin"
+id="toc-baseline-measurement-cpu-ggml-baseenbin">Baseline measurement
+(CPU, ggml-base.en.bin)</a></li>
+<li><a href="#warm-server-baseline"
+id="toc-warm-server-baseline">Warm-server baseline</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="local-asr-provider-guide">Local ASR Provider Guide</h1>
+<h2 id="recommended-baseline">Recommended Baseline</h2>
+<p>The first real ASR provider in VoiceLayer targets
+<code>whisper.cpp</code>. The current implementation uses the official
+<code>whisper-cli</code> file transcription path.</p>
+<p>The official <code>whisper.cpp</code> CLI supports:</p>
+<ul>
+<li><code>flac</code></li>
+<li><code>mp3</code></li>
+<li><code>ogg</code></li>
+<li><code>wav</code></li>
+</ul>
+<p>The current VoiceLayer integration invokes <code>whisper-cli</code>
+directly and expects a local model file.</p>
+<h2 id="example-whispercpp-startup">Example <code>whisper.cpp</code>
+Startup</h2>
+<p>Build and run manually:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/ggml-org/whisper.cpp.git</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> whisper.cpp</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">-B</span> build</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">--build</span> build <span class="at">-j</span> <span class="at">--config</span> Release</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/bin/whisper-cli</span> <span class="at">-m</span> models/ggml-base.en.bin <span class="at">-f</span> samples/jfk.wav</span></code></pre></div>
+<h2 id="voicelayer-environment-variables">VoiceLayer Environment
+Variables</h2>
+<p>VoiceLayer reads the following ASR variables inside the Python
+worker:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_BIN</span><span class="op">=</span>whisper-cli</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_MODEL_PATH</span><span class="op">=</span>/absolute/path/to/ggml-base.en.bin</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_TIMEOUT_SECONDS</span><span class="op">=</span>300</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_NO_GPU</span><span class="op">=</span>false</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_ARGS</span><span class="op">=</span></span></code></pre></div>
+<p><code>VOICELAYER_WHISPER_MODEL_PATH</code> is required for the
+<code>whisper-cli</code> path.</p>
+<h3
+id="persistent-whisper-server-preferred-for-phase-3-segmented-workflows">Persistent
+<code>whisper-server</code> (preferred for Phase 3 segmented
+workflows)</h3>
+<p>Launching <code>whisper-cli</code> once per transcription pays the
+full model-init cost every call (measured at ~0.84 s on CPU, see Phase 3
+Pre-flight below). A long-lived <code>whisper-server</code> process
+keeps the model mmapped and drops per-request latency by roughly the
+cold-start cost — the Warm-server baseline subsection below documents
+the reproduction command and the maintainer-reported saving. The worker
+auto-selects the server whenever the configured endpoint is reachable
+and falls back to <code>whisper-cli</code> otherwise.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_HOST</span><span class="op">=</span>127.0.0.1</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_PORT</span><span class="op">=</span>8188</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS</span><span class="op">=</span>60</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_AUTO_START</span><span class="op">=</span>false</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_BIN</span><span class="op">=</span>/abs/path/to/whisper-server</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_ARGS</span><span class="op">=</span>-t <span class="ex">4</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS</span><span class="op">=</span>30</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS</span><span class="op">=</span>0.5</span></code></pre></div>
+<p>Set any of those variables to opt into the server path; the worker
+returns to <code>whisper-cli</code> when none are set. When
+<code>VOICELAYER_WHISPER_SERVER_AUTO_START=true</code> the worker
+launches a background <code>whisper-server</code> process against
+<code>VOICELAYER_WHISPER_MODEL_PATH</code> and waits up to
+<code>LAUNCH_TIMEOUT_SECONDS</code> for <code>GET /</code> to respond.
+PID, command, and endpoint are written under
+<code>$XDG_RUNTIME_DIR/voicelayer/providers/</code> so doctor tooling
+can recover state.</p>
+<p>You can also run the server manually:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Host binary (requires a local whisper.cpp build):</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">whisper-server</span> <span class="at">-m</span> /path/to/ggml-base.en.bin <span class="at">--host</span> 127.0.0.1 <span class="at">--port</span> 8188 <span class="at">-t</span> 4</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Docker (no host build):</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="at">--name</span> voicelayer-whisper-server <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-v</span> /path/to/ggml-base.en.bin:/model.bin:ro <span class="dt">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> 127.0.0.1:8188:8080 <span class="dt">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--entrypoint</span> whisper-server <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  ghcr.io/ggml-org/whisper.cpp:main <span class="dt">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-m</span> /model.bin <span class="at">--host</span> 0.0.0.0 <span class="at">--port</span> 8080 <span class="at">-t</span> 4</span></code></pre></div>
+<p>After either path, configure VoiceLayer to point at it:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_SERVER_HOST</span><span class="op">=</span>127.0.0.1</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_SERVER_PORT</span><span class="op">=</span>8188</span></code></pre></div>
+<p>Both paths use the same <code>POST /inference</code> multipart
+contract (fields <code>file</code>, <code>language</code>,
+<code>translate</code>, <code>response_format=json</code>). The worker
+sends <code>response_format=json</code> and parses
+<code>{"text": "...", "language": "..."}</code>.</p>
+<h2 id="example-source-workflow">Example Source Workflow</h2>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_PROJECT_ROOT</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$(</span><span class="bu">pwd</span><span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_BIN</span><span class="op">=</span><span class="st">&quot;/path/to/whisper-cli&quot;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_MODEL_PATH</span><span class="op">=</span><span class="st">&quot;/path/to/ggml-base.en.bin&quot;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> doctor</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> transcribe-file /path/to/sample.wav <span class="at">--language</span> auto</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> record-transcribe <span class="at">--duration-seconds</span> 8 <span class="at">--language</span> auto</span></code></pre></div>
+<h2 id="recorder-backends">Recorder Backends</h2>
+<p>The current CLI recording path is intentionally minimal:</p>
+<ul>
+<li>preferred backend: <code>pw-record</code> wrapped by
+<code>timeout --signal=INT</code></li>
+<li>fallback backend: <code>arecord -d</code></li>
+</ul>
+<p>This recording path writes a temporary WAV file and then forwards
+that file to <code>whisper-cli</code>. The same path is now exposed
+through the daemon-side <code>dictation capture</code> flow, so future
+global hotkey and tray integrations can reuse it without re-implementing
+recording logic.</p>
+<h3 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad
+Pre-pass (Phase 3D)</h3>
+<p>The Python worker can run a silero-vad pre-pass before handing audio
+to the configured ASR backend. When enabled it detects speech regions in
+the captured WAV, concatenates them into a trimmed 16-bit mono WAV, and
+feeds that file to the transcription provider. The JSON-RPC
+<code>transcribe</code> contract is unchanged — VAD is invisible to the
+daemon.</p>
+<p>The pre-pass applies to the default whisper.cpp chain and to
+<strong>every</strong> opt-in ASR provider — MiMo-V2.5-ASR and
+Qwen3-ASR-1.7B both honor it. Silero-vad is ASR-backend agnostic, so the
+same <code>VOICELAYER_WHISPER_VAD_*</code> variables control every path
+— the <code>WHISPER_</code> prefix is a historical artefact from the
+whisper-only days. On the MiMo and Qwen3-ASR sides the pre-pass also
+short-circuits inference when no speech is detected, which matters more
+than on whisper because both backends use causal LMs that can
+hallucinate plausible-looking transcripts on pure silence.</p>
+<p>VAD pulls in <code>onnxruntime</code> and <code>numpy</code>, which
+are shipped as the optional <code>vad</code> extra to keep the default
+worker stdlib-only. Install the extra once and download a silero-vad
+ONNX model:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> sync <span class="at">--extra</span> vad</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-L</span> <span class="at">-o</span> /abs/path/to/silero_vad.onnx <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx</span></code></pre></div>
+<p>Environment variables:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_ENABLED</span><span class="op">=</span>true</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_MODEL_PATH</span><span class="op">=</span>/abs/path/to/silero_vad.onnx</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_THRESHOLD</span><span class="op">=</span>0.5</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS</span><span class="op">=</span>250</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS</span><span class="op">=</span>100</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS</span><span class="op">=</span>30</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS</span><span class="op">=</span>30</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_WHISPER_VAD_SAMPLE_RATE</span><span class="op">=</span>16000</span></code></pre></div>
+<p>The worker only enables the pre-pass when both
+<code>VOICELAYER_WHISPER_VAD_ENABLED</code> is truthy and
+<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code> points at an existing
+ONNX file. If import of <code>onnxruntime</code> or <code>numpy</code>
+fails at runtime, the worker annotates the transcribe response with the
+error and falls back to transcribing the raw WAV — no request is lost.
+Silero-vad v4 (<code>h</code> + <code>c</code> state) and v5
+(<code>state</code> tensor) ONNX exports are both supported; the sample
+rate must be 16000 Hz or 8000 Hz.</p>
+<h3 id="vad-gated-live-dictation-phase-3d-b">VAD-gated Live Dictation
+(Phase 3D-B)</h3>
+<p>The pre-pass above runs <em>after</em> whisper has already received a
+fixed-duration WAV. The <strong>VAD-gated</strong> segmentation mode
+goes further: the recorder rolls at a short <code>probe_secs</code>
+cadence, each probe is classified by silero-vad through the worker's
+<code>segment_probe</code> JSON-RPC method, and the orchestrator only
+flushes a buffered speech unit to <code>transcribe</code> when it sees
+<code>silence_gap_probes</code> consecutive silent probes (default
+<code>1</code>) or when the buffered duration would exceed
+<code>max_segment_secs</code>. Speaker pauses, not the wall-clock, bound
+each transcription input.</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_VAD_ENABLED</span><span class="op">=</span>true</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_VAD_MODEL_PATH</span><span class="op">=</span>/abs/path/to/silero_vad.onnx</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Same VAD tunables as the pre-pass apply.</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> daemon run <span class="at">--project-root</span> <span class="st">&quot;</span><span class="va">$(</span><span class="bu">pwd</span><span class="va">)</span><span class="st">&quot;</span>           <span class="co"># in one shell</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation start <span class="dt">\</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--mode</span> vad-gated <span class="at">--probe-secs</span> 2 <span class="at">--max-segment-secs</span> 30 <span class="dt">\</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--language</span> auto                                               <span class="co"># in another</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="co"># (speak, pausing naturally between phrases)</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation stop <span class="op">&lt;</span>session-id-from-start<span class="op">&gt;</span></span></code></pre></div>
+<p>Smoke / benchmark loop: pass <code>--duration-seconds N</code> to
+record-and-stop in one command. The CLI sleeps <code>N</code> seconds
+after the daemon confirms the session is listening, issues stop, and
+prints the final <code>DictationCaptureResult</code> (with the stitched
+transcript) instead of the listening session.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation start <span class="dt">\</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--mode</span> vad-gated <span class="at">--probe-secs</span> 2 <span class="at">--max-segment-secs</span> 30 <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration-seconds</span> 12 <span class="at">--language</span> auto</span></code></pre></div>
+<p>While a VAD-gated session is live the daemon streams these per-probe
+/ per-unit events on <code>GET /v1/events/stream</code> alongside the
+existing lifecycle events:</p>
+<ul>
+<li><code>dictation.vad_gated_started</code> — emitted once when the
+orchestrator begins.</li>
+<li><code>dictation.probe_analyzed</code> — once per physical probe with
+the speech/silence verdict and <code>speech_ratio</code>.</li>
+<li><code>dictation.speech_unit_flushed</code> — once per flushed
+pending buffer (silence-triggered or max-duration-triggered).</li>
+<li><code>dictation.speech_unit_failed</code> — emitted instead of
+<code>speech_unit_flushed</code> when the
+<code>stitch_wav_segments</code> RPC errors during a flush; the session
+ultimately surfaces as <code>dictation.failed</code> with
+<code>failure_kind: asr_failed</code>.</li>
+<li><code>dictation.speech_unit_transcribed</code> — once per flushed
+unit's background transcribe task.</li>
+<li><code>dictation.completed</code> / <code>dictation.failed</code> —
+same shape as fixed mode; <code>text</code> is the concatenated
+transcripts of every flushed speech unit.</li>
+</ul>
+<p>If the <code>segment_probe</code> RPC itself errors (silero-vad
+crash, ONNX import failure, etc.) the orchestrator falls back to a
+pessimistic "speech" verdict per probe so live dictation never silently
+drops audio. The synthetic verdict carries a note explaining the
+failure, and the operator can inspect it in the SSE stream.</p>
+<p>When VAD is <strong>not</strong> configured
+(<code>VOICELAYER_WHISPER_VAD_ENABLED</code> unset or
+<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code> missing), the daemon
+still accepts <code>--mode vad-gated</code> requests but every probe
+falls back to "speech". Silence-triggered flushes never fire, so
+<code>max_segment_secs</code> becomes the only remaining flush trigger —
+the effective cadence is the buffered-duration cap, not
+<code>probe_secs</code>. Configure VAD properly before relying on the
+gating to bound transcribe inputs.</p>
+<h2 id="mimo-v25-asr-optional-gpu-provider">MiMo-V2.5-ASR (optional GPU
+provider)</h2>
+<p>The whisper.cpp chain above is the default ASR backend and is
+intentionally CPU-friendly. For multilingual or quality-priority
+workflows, VoiceLayer ships an opt-in Xiaomi MiMo-V2.5-ASR provider that
+the worker selects when callers send
+<code>TranscribeRequest.provider_id = "mimo_v2_5_asr"</code>. The
+whisper chain remains the default for any request that omits
+<code>provider_id</code>.</p>
+<h3 id="what-you-get">What you get</h3>
+<ul>
+<li>Native multilingual recognition: zh / en / yue / wuu / nan /
+Sichuanese, plus zh-en code-switch.</li>
+<li>Significantly better quality than whisper-large-v3 on the
+maintainer-published benchmarks.</li>
+<li>Lower-latency on a single CUDA GPU once the model is warm;
+<strong>higher</strong> absolute latency than whisper.cpp on the same
+hardware because MiMo decodes a full causal LM per utterance with no
+streaming.</li>
+</ul>
+<h3 id="what-you-give-up">What you give up</h3>
+<ul>
+<li>CUDA-only inference today. The audio tokenizer hardcodes
+<code>from flash_attn import flash_attn_varlen_func</code>, so
+flash-attn is a hard runtime requirement (not just the recommended
+optimisation the model card implies).</li>
+<li>~16 GB VRAM minimum at bf16 (model weights are ~15 GB on disk).</li>
+<li>No streaming, no partial hypotheses, no timestamps.</li>
+<li>Upstream issue #6 reports decoder repetition on continuous audio
+past ~3 minutes; the worker splits inputs at 180 s by default to avoid
+the regime.</li>
+<li>First-call cold start is on the order of tens of seconds while the
+wrapper loads weights into VRAM. Subsequent calls reuse the cached
+instance for the worker's lifetime.</li>
+</ul>
+<h3 id="one-time-setup">One-time setup</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Install torch + torchaudio from the PyTorch index that matches your GPU compute</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">#    capability. Use cu128 for Blackwell (RTX 50 series, sm_120); cu126 / cu124 for</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">#    Hopper / Ada (sm_90 / sm_89). Pin to torch 2.10 because that is the latest version</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">#    Dao-AILab ships a prebuilt flash-attn wheel for; jumping to torch 2.11+ lands you on</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">#    a flash-attn source build that needs nvcc plus a long compile.</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> sync <span class="at">--group</span> dev</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> pip install <span class="at">--index-url</span> https://download.pytorch.org/whl/cu128 <span class="dt">\</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;torch==2.10.0&quot;</span> <span class="st">&quot;torchaudio==2.10.0&quot;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Install the rest of the wrapper-side runtime from PyPI.</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> pip install <span class="at">-e</span> <span class="st">&quot;.[mimo]&quot;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Install flash-attn from the matching Dao-AILab GitHub wheel. There is no PyPI binary;</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co">#    the source build needs nvcc and ~1 hour of compute, so prefer the prebuilt wheel.</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="co">#    Match the cxx11abi flag (TRUE on modern Linux), the torch version line (2.10), the</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="co">#    Python version (cp312), and the platform (linux_x86_64). Update the URL to a newer</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="co">#    flash-attn release once one ships a torch 2.11+ wheel; until then this combination</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co">#    is the working pin.</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> pip install <span class="dt">\</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl&quot;</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. Download both model artifacts. The audio tokenizer is mandatory; the LM weights alone</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="co">#    will not transcribe. The new `hf` CLI replaces the deprecated `huggingface-cli`.</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="ex">hf</span> download XiaomiMiMo/MiMo-V2.5-ASR <span class="dt">\</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>  <span class="at">--local-dir</span> ~/.cache/voicelayer/models/mimo-v2.5-asr</span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="ex">hf</span> download XiaomiMiMo/MiMo-Audio-Tokenizer <span class="dt">\</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>  <span class="at">--local-dir</span> ~/.cache/voicelayer/models/mimo-audio-tokenizer</span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. Clone Xiaomi&#39;s source tree to expose the `MimoAudio` wrapper class. There is no published</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="co">#    wheel today; VoiceLayer prepends the repo root to sys.path so the upstream-canonical</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a><span class="co">#    `from src.mimo_audio.mimo_audio import MimoAudio` import resolves on first transcribe.</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/XiaomiMiMo/MiMo-V2.5-ASR.git <span class="dt">\</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a>  ~/.cache/voicelayer/sources/MiMo-V2.5-ASR</span></code></pre></div>
+<h3 id="environment-variables">Environment variables</h3>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_MODEL_PATH</span><span class="op">=</span>/abs/path/to/MiMo-V2.5-ASR</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_TOKENIZER_PATH</span><span class="op">=</span>/abs/path/to/MiMo-Audio-Tokenizer</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_REPO_PATH</span><span class="op">=</span>/abs/path/to/MiMo-V2.5-ASR-source-checkout</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_DEVICE</span><span class="op">=</span>cuda:0</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_AUDIO_TAG</span><span class="op">=</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_TIMEOUT_SECONDS</span><span class="op">=</span>600</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS</span><span class="op">=</span>180</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_MIMO_ARGS</span><span class="op">=</span></span></code></pre></div>
+<p>The two required keys are <code>VOICELAYER_MIMO_MODEL_PATH</code> and
+<code>VOICELAYER_MIMO_TOKENIZER_PATH</code>. Set
+<code>VOICELAYER_MIMO_REPO_PATH</code> until the wrapper class becomes
+pip-installable. Precision is intentionally not exposed here: the
+upstream wrapper hardcodes <code>torch_dtype=torch.bfloat16</code>, so a
+<code>dtype</code> knob would lie about what actually happens. Leave
+<code>VOICELAYER_MIMO_AUDIO_TAG</code> empty to let MiMo auto-detect the
+language; explicit values are <code>&lt;chinese&gt;</code> and
+<code>&lt;english&gt;</code>. The worker also auto-translates the
+request <code>language</code> field (<code>zh</code>,
+<code>zh-cn</code>, <code>yue</code>, <code>en</code>,
+<code>en-us</code>, ...) into the matching tag at dispatch time.</p>
+<h3 id="select-the-provider-per-request">Select the provider per
+request</h3>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="va">SOCKET</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${XDG_RUNTIME_DIR</span><span class="op">:-</span>/run/user/<span class="va">$UID}</span><span class="st">/voicelayer/daemon.sock&quot;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">--unix-socket</span> <span class="st">&quot;</span><span class="va">$SOCKET</span><span class="st">&quot;</span> <span class="at">-s</span> <span class="at">-X</span> POST http://d/v1/transcriptions <span class="dt">\</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;content-type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;audio_file&quot;:&quot;/abs/path/sample-zh.wav&quot;,&quot;provider_id&quot;:&quot;mimo_v2_5_asr&quot;,&quot;language&quot;:&quot;zh&quot;}&#39;</span></span></code></pre></div>
+<p><code>vl doctor</code> reports <code>mimo_configured</code> /
+<code>mimo_error</code> once the env vars are set, and
+<code>vl providers</code> lists the new descriptor as
+<code>mimo_v2_5_asr</code> with
+<code>experimental=true, default_enabled=false</code> so the whisper.cpp
+chain remains the default.</p>
+<h3 id="select-the-provider-per-dictation-session">Select the provider
+per dictation session</h3>
+<p><code>provider_id</code> is also a session-level knob on the
+dictation endpoints. The daemon stores it on the active session at
+<code>POST /v1/sessions/dictation</code> (or
+<code>POST /v1/dictation/capture</code>) and forwards the same value on
+every transcribe call the session emits — the OneShot stop call, each
+fixed-mode segment, each VAD-gated speech unit, and the ad-hoc capture
+path. Selecting MiMo at session start therefore opts the entire session
+into MiMo with no risk of a partial fallback to whisper. The CLI
+surfaces the same flag on the Start, RecordTranscribe, TranscribeFile,
+and ForegroundPtt commands:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Live segmented dictation backed entirely by MiMo</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation start <span class="dt">\</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--mode</span> fixed <span class="dt">\</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--segment-secs</span> 8 <span class="dt">\</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--provider-id</span> mimo_v2_5_asr</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co"># One-command record + capture + transcribe through MiMo</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> record-transcribe <span class="dt">\</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration-seconds</span> 8 <span class="dt">\</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--provider-id</span> mimo_v2_5_asr</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Foreground PTT TUI loop pinned to MiMo for every press-release cycle</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation foreground-ptt <span class="dt">\</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--provider-id</span> mimo_v2_5_asr</span></code></pre></div>
+<p>The PTT default can be persisted in
+<code>~/.config/voicelayer/config.toml</code>:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vl</span> config set foreground_ptt.provider_id mimo_v2_5_asr</span></code></pre></div>
+<p>An unrecognized <code>provider_id</code> surfaces as
+<code>provider unavailable</code> rather than falling back to whisper,
+so a typo or missing optional dependency is loud at the first transcribe
+rather than silently degraded across the session.</p>
+<h3 id="trade-off-summary">Trade-off summary</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Backend</th>
+<th>Cold load</th>
+<th>Latency (warm)</th>
+<th>Languages</th>
+<th>Hardware</th>
+<th>Streaming</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>whisper_cpp</code> (server)</td>
+<td>seconds (mmapped ggml)</td>
+<td>~0.65 s / call (base.en, CPU)</td>
+<td>en (base.en) or multilingual (large-v3)</td>
+<td>CPU sufficient</td>
+<td>No</td>
+</tr>
+<tr class="even">
+<td><code>mimo_v2_5_asr</code></td>
+<td>~30 s (LM + audio tokenizer into VRAM)</td>
+<td>~0.27 s / 3 s clip (RTX 5090, cu128, flash-attn 2.8.1)</td>
+<td>zh / en / yue / wuu / nan / sc / mixed</td>
+<td>CUDA, ~16 GB VRAM</td>
+<td>No</td>
+</tr>
+<tr class="odd">
+<td><code>qwen3_asr_1_7b</code></td>
+<td>seconds (4.7 GB weights into VRAM)</td>
+<td>sub-second / ≤15 s clip on a modern CUDA GPU at bf16</td>
+<td>30 languages incl. Chinese (mainland + Cantonese), English, Arabic,
+German, French, Spanish, Portuguese, Indonesian, Italian, Korean,
+Russian, Thai, Vietnamese, Japanese, Turkish, Hindi, Malay, Dutch,
+Swedish, Danish, Finnish, Polish, Czech, Filipino, Persian, Greek,
+Romanian, Hungarian, Macedonian</td>
+<td>CUDA recommended (~6 GB VRAM at bf16); CPU works but 10-30×
+realtime</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>The MiMo warm-call number above was measured on the maintainer's
+reference workstation against the 3-second silent fixture; expect a
+similar order of magnitude for short utterances and linear growth with
+longer audio. The Qwen3-ASR latency figure is the upstream-published
+expectation rather than a maintainer-measured number; rerun a benchmark
+on your own hardware before relying on the figure.</p>
+<p><strong>Cold-start applies once per daemon lifetime.</strong> The
+daemon keeps one Python worker subprocess alive across every JSON-RPC
+request (see
+<code>crates/voicelayerd/src/worker.rs::WorkerCommand::call</code>), so
+the module-level model cache inside the worker stays warm for the
+daemon's lifetime. The first transcribe call against
+<code>mimo_v2_5_asr</code> or <code>qwen3_asr_1_7b</code> pays the
+multi-GB cold load; every subsequent call — fixed-mode segments,
+VAD-gated speech units, the stop-time transcript, repeated
+<code>/v1/transcriptions</code> calls, the next dictation session —
+reuses the cached model with no reload cost. A worker crash or daemon
+restart is the only thing that triggers a fresh cold load.
+<strong>Operator env var changes</strong>
+(<code>VOICELAYER_MIMO_*</code>, <code>VOICELAYER_QWEN3_ASR_*</code>,
+<code>VOICELAYER_WHISPER_*</code>, ...) are read by the worker at spawn
+time and therefore only take effect on the next worker spawn — restart
+the daemon (or, equivalently, force a worker respawn by SIGTERM-ing the
+Python child) to apply changes mid-session.</p>
+<p>When in doubt, route long-form / multilingual / quality-priority
+captures through MiMo or Qwen3-ASR by passing
+<code>--provider-id mimo_v2_5_asr</code> /
+<code>--provider-id qwen3_asr_1_7b</code> to the relevant CLI command or
+by setting it on the HTTP request body. Cold load is one-time per
+daemon, so the per-utterance cost is just inference.</p>
+<p>The MiMo provider lives at
+<code>python/voicelayer_orchestrator/providers/mimo_asr.py</code>
+(lazy-loaded model cache + per-segment dispatch); long-audio splitting
+is performed in-process via the stdlib <code>wave</code> module to
+mitigate upstream issue #6.</p>
+<h2 id="qwen3-asr-17b-optional-apache-20-gpucpu-provider">Qwen3-ASR-1.7B
+(optional Apache-2.0 GPU/CPU provider)</h2>
+<p>For Apache-2.0-friendly multilingual workflows VoiceLayer ships an
+opt-in <a href="https://huggingface.co/Qwen/Qwen3-ASR-1.7B">Alibaba
+Qwen3-ASR-1.7B</a> provider. The whisper.cpp chain remains the default;
+callers select Qwen3-ASR by setting
+<code>TranscribeRequest.provider_id = "qwen3_asr_1_7b"</code>.</p>
+<h3 id="what-you-get-1">What you get</h3>
+<ul>
+<li>Native multilingual recognition across 30 languages including
+Mandarin Chinese, Cantonese, English, Arabic, German, French, Spanish,
+Portuguese, Indonesian, Italian, Korean, Russian, Thai, Vietnamese,
+Japanese, Turkish, Hindi, Malay, Dutch, Swedish, Danish, Finnish,
+Polish, Czech, Filipino, Persian, Greek, Romanian, Hungarian, and
+Macedonian.</li>
+<li>Apache-2.0 weights — usable in environments where MiMo's
+MIT-with-source-tree-only distribution is awkward.</li>
+<li>~4.7 GB fp16 weights on disk; ~6 GB VRAM at bf16. No flash-attn
+requirement.</li>
+<li>Sub-second latency on a modern CUDA accelerator for ≤15 s clips at
+bf16.</li>
+</ul>
+<h3 id="what-you-give-up-1">What you give up</h3>
+<ul>
+<li>No timestamps, no streaming, no partial hypotheses (timestamps
+require the separate Qwen3-ForcedAligner-0.6B model, which VoiceLayer
+does not ship today).</li>
+<li>No translation. The model is transcription-only; combining
+<code>provider_id="qwen3_asr_1_7b"</code> with
+<code>translate_to_english=true</code> is rejected at the daemon
+layer.</li>
+<li>CPU inference works but is roughly 10-30× realtime. The worker
+prints a one-shot stderr warning when first transcribe runs on CPU;
+consider a GPU before relying on this path.</li>
+</ul>
+<h3 id="one-time-setup-1">One-time setup</h3>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Install torch + torchaudio from the PyTorch index that matches your GPU compute</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="co">#    capability. Use cu128 for Blackwell (RTX 50 series, sm_120); cu126 / cu124 for</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="co">#    Hopper / Ada. The qwen3-asr extra accepts torch &gt;= 2.7 &lt; 3.0.</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> sync <span class="at">--group</span> dev</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> pip install <span class="at">--index-url</span> https://download.pytorch.org/whl/cu128 <span class="dt">\</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;torch&gt;=2.7,&lt;3.0&quot;</span> <span class="st">&quot;torchaudio&gt;=2.7,&lt;3.0&quot;</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Install the provider runtime. Brings in the official `qwen-asr` pip wrapper and its</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="co">#    transformers floor.</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> pip install <span class="at">-e</span> <span class="st">&quot;.[qwen3-asr]&quot;</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Stage the weights locally. The new `hf` CLI replaces the deprecated `huggingface-cli`.</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="ex">hf</span> download Qwen/Qwen3-ASR-1.7B <span class="dt">\</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--local-dir</span> ~/.cache/voicelayer/models/qwen3-asr-1.7b</span></code></pre></div>
+<p>The <code>qwen3-asr</code> extra is intentionally independent from
+<code>mimo</code>. MiMo pins <code>transformers==4.49.0</code> while
+qwen-asr's transformers floor tracks the version the model card was
+saved against (4.57.6 at time of writing); installing both extras into
+the same virtualenv will fight over <code>transformers</code>. Pick one
+provider per environment, or run separate venvs.</p>
+<h3 id="environment-variables-1">Environment variables</h3>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_QWEN3_ASR_MODEL_PATH</span><span class="op">=</span>/abs/path/to/qwen3-asr-1.7b</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_QWEN3_ASR_DEVICE</span><span class="op">=</span>cuda:0</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_QWEN3_ASR_DTYPE</span><span class="op">=</span>bfloat16</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS</span><span class="op">=</span>600</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS</span><span class="op">=</span>0</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="va">VOICELAYER_QWEN3_ASR_ARGS</span><span class="op">=</span></span></code></pre></div>
+<p>The only required key is
+<code>VOICELAYER_QWEN3_ASR_MODEL_PATH</code>. Set
+<code>VOICELAYER_QWEN3_ASR_DTYPE</code> to <code>float16</code> on GPUs
+that lack bf16 support (pre-Ampere) or to <code>float32</code> to debug
+numerical issues.
+<code>VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS</code> defaults to
+<code>0</code> (disabled) because the upstream wrapper handles long
+audio internally; set a positive value to force worker-side chunking
+when you want to bound peak VRAM on extremely long captures.
+<code>VOICELAYER_QWEN3_ASR_ARGS</code> is <strong>reserved</strong> for
+future passthrough into <code>model.transcribe</code> keyword arguments;
+the current upstream <code>qwen-asr</code> wrapper exposes only
+<code>audio</code> and <code>language</code>, so any value set here is
+parsed for forward compatibility but ignored at dispatch time. The
+worker translates the request <code>language</code> field
+(<code>zh</code>, <code>zh-cn</code>, <code>yue</code>, <code>en</code>,
+<code>en-us</code>, ...) into the wrapper's English language name
+(<code>Chinese</code>, <code>Cantonese</code>, <code>English</code>,
+...) automatically; unknown codes fall through to the wrapper's
+auto-detector.</p>
+<h3 id="select-the-provider-per-request-1">Select the provider per
+request</h3>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="va">SOCKET</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${XDG_RUNTIME_DIR</span><span class="op">:-</span>/run/user/<span class="va">$UID}</span><span class="st">/voicelayer/daemon.sock&quot;</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">--unix-socket</span> <span class="st">&quot;</span><span class="va">$SOCKET</span><span class="st">&quot;</span> <span class="at">-s</span> <span class="at">-X</span> POST http://d/v1/transcriptions <span class="dt">\</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;content-type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;audio_file&quot;:&quot;/abs/path/sample-zh.wav&quot;,&quot;provider_id&quot;:&quot;qwen3_asr_1_7b&quot;,&quot;language&quot;:&quot;zh&quot;}&#39;</span></span></code></pre></div>
+<p><code>vl doctor</code> reports <code>qwen3_asr_configured</code> /
+<code>qwen3_asr_error</code> once the env var is set, and
+<code>vl providers</code> lists the descriptor as
+<code>qwen3_asr_1_7b</code> with
+<code>experimental=true, default_enabled=false</code>, license
+<code>Apache-2.0</code>, so the whisper.cpp chain remains the
+default.</p>
+<h3 id="select-the-provider-per-dictation-session-1">Select the provider
+per dictation session</h3>
+<p><code>provider_id</code> is a session-level knob on every dictation
+endpoint, so a session that picks Qwen3-ASR at start uses Qwen3-ASR for
+every transcribe call (one-shot stop, fixed-mode segments, vad-gated
+speech units, ad-hoc captures):</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Live segmented dictation backed entirely by Qwen3-ASR-1.7B</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation start <span class="dt">\</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--mode</span> fixed <span class="dt">\</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--segment-secs</span> 8 <span class="dt">\</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--provider-id</span> qwen3_asr_1_7b</span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="co"># One-command record + capture + transcribe through Qwen3-ASR</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> record-transcribe <span class="dt">\</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration-seconds</span> 8 <span class="dt">\</span></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--provider-id</span> qwen3_asr_1_7b</span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Foreground PTT TUI loop pinned to Qwen3-ASR for every press-release cycle</span></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> vl <span class="at">--</span> dictation foreground-ptt <span class="dt">\</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--provider-id</span> qwen3_asr_1_7b</span></code></pre></div>
+<p>The PTT default can be persisted in
+<code>~/.config/voicelayer/config.toml</code>:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vl</span> config set foreground_ptt.provider_id qwen3_asr_1_7b</span></code></pre></div>
+<p>The provider lives at
+<code>python/voicelayer_orchestrator/providers/qwen3_asr.py</code>
+(lazy-loaded model cache + dispatch); the upstream <code>qwen-asr</code>
+package handles audio preprocessing and long-audio chunking, so
+worker-side splitting is opt-in.</p>
+<h2 id="current-scope">Current Scope</h2>
+<p>The current ASR integration covers file transcription,
+short-recording transcription, Phase 3B fixed-duration segmented live
+dictation (recorder rolled every <em>N</em> seconds with background
+transcription), the optional silero-vad pre-pass, and Phase 3D-B
+VAD-gated segmentation (probe-cadence recording with silence-triggered
+flush). It does not yet cover:</p>
+<ul>
+<li>always-on live microphone capture</li>
+<li>partial transcripts streamed mid-utterance</li>
+<li>background ASR daemonization</li>
+</ul>
+<p>Those belong to later stages of the VoiceLayer runtime.</p>
+<h2 id="phase-3-pre-flight-cold-start-measurement">Phase 3 Pre-flight:
+Cold-start Measurement</h2>
+<p>Phase 3 of the roadmap (near-real-time ASR) depends on a concrete
+measurement of <code>whisper-cli</code> cold-start latency on the
+operator's own hardware and model. The decision gate is:</p>
+<ul>
+<li>mean cold-start under ~0.25 s → proceed directly with fixed-duration
+segment transcription (Phase 3B).</li>
+<li>mean cold-start ≥ ~0.25 s → introduce a persistent
+<code>whisper-server</code> provider first (new
+<code>python/voicelayer_orchestrator/providers/whisper_server.py</code>);
+segmenting without it is strictly slower than the existing one-shot
+transcription.</li>
+</ul>
+<p>The repository ships three helpers for running that measurement
+reproducibly:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Generate a deterministic 3-second silent fixture (96 KB, 16 kHz mono PCM).</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/generate_silent_fixture.py</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2a. Measure cold-start against a host whisper-cli binary.</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">VOICELAYER_WHISPER_MODEL_PATH</span><span class="op">=</span>/abs/path/to/ggml-base.en.bin</span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="va">RUNS</span><span class="op">=</span>5 <span class="ex">scripts/benchmark-whisper-cold-start.sh</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 2b. OR measure against the official container without installing anything on the host.</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a><span class="co">#     Pulls ghcr.io/ggml-org/whisper.cpp:main and caches the model under</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="co">#     ~/.cache/voicelayer/models.</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a><span class="va">RUNS</span><span class="op">=</span>5 <span class="ex">scripts/benchmark-whisper-cold-start-docker.sh</span></span></code></pre></div>
+<p>Both scripts print each run's wall-clock seconds plus mean/min/max
+and a decision line. If a different threshold is wanted for the call,
+override <code>THRESHOLD_SECONDS</code> on the command line.</p>
+<p>The fixture contains only silence, so its transcription is empty;
+that is intentional — cold-start here measures how long whisper-cli
+spends mapping the model and initializing the graph before producing any
+tokens.</p>
+<h3 id="baseline-measurement-cpu-ggml-baseenbin">Baseline measurement
+(CPU, ggml-base.en.bin)</h3>
+<p>Recorded via
+<code>scripts/benchmark-whisper-cold-start-docker.sh</code> with
+<code>IMAGE=ghcr.io/ggml-org/whisper.cpp:main</code>,
+<code>ggml-base.en.bin</code>, 5 runs, on an Ubuntu 24 workstation with
+an RTX 5090 laptop GPU (GPU was not enabled for this measurement because
+the CPU image was used):</p>
+<ul>
+<li>mean: 0.8446 s</li>
+<li>min : 0.8083 s</li>
+<li>max : 0.8962 s</li>
+</ul>
+<p>The mean is ~3.4× the 0.25 s gate, so the roadmap takes the
+<code>whisper-server</code> detour before Phase 3B. The figure includes
+<code>docker exec</code> overhead (~10–30 ms); host
+<code>whisper-cli</code> cold-start is at most that much faster and
+still far above the threshold. Operators with a different hardware/model
+combination should re-run the script and update this section when the
+value changes meaningfully.</p>
+<h3 id="warm-server-baseline">Warm-server baseline</h3>
+<p>The cold-start row above is only half the Phase 3 decision. The other
+half — how much per-call wall-clock the persistent server actually saves
+once the ggml context stays warm across requests — is measured against
+an already-running <code>whisper-server</code>. Start one with the
+Docker command earlier in this guide, or let the worker auto-start it
+via <code>VOICELAYER_WHISPER_SERVER_AUTO_START=true</code>, then:</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="va">COLD_START_SECONDS</span><span class="op">=</span>0.8446 <span class="dt">\</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>  <span class="va">HOST</span><span class="op">=</span>127.0.0.1 <span class="va">PORT</span><span class="op">=</span>8188 <span class="dt">\</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>  <span class="va">RUNS</span><span class="op">=</span>10 <span class="va">WARMUP_RUNS</span><span class="op">=</span>2 <span class="dt">\</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a>  <span class="ex">scripts/benchmark-whisper-warm-server.sh</span></span></code></pre></div>
+<p>The script sends <code>WARMUP_RUNS</code> untimed
+<code>POST /inference</code> requests so per-connection caches settle,
+times the next <code>RUNS</code>, and reports mean/min/max. When
+<code>COLD_START_SECONDS</code> is passed (use the mean printed by the
+cold-start script above), the output also includes the absolute and
+relative saving per transcribe call. There is no proceed/stop gate here
+because the tradeoff is configuration-specific: even a small warm-path
+saving compounds inside segmented dictation (one transcribe per
+segment), while one-shot transcription amortises the cold-start cost
+across a single call.</p>
+<p>On the maintainer's reference workstation (Ubuntu 24, CPU-only,
+<code>ggml-base.en.bin</code>,
+<code>ghcr.io/ggml-org/whisper.cpp:main</code> server container on port
+8188) real voice captures measured ~0.65 s/call via the warm server and
+~0.98 s/call via one-shot <code>whisper-cli-docker</code>, for a ~0.26 s
+daemon-mediated saving per transcribe call. The saving is what drives
+VoiceLayer preferring the server path whenever an endpoint is
+configured: segmented live dictation runs one transcribe per segment, so
+a ~260 ms per-call delta flows straight into user-visible end-to-end
+latency. Operators with different hardware or model sizes will see
+different deltas; rerun the script to confirm before relying on the
+ratio.</p>
+<footer class="vl-footer">
+  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
+  <span>This page is generated from the matching Markdown source.</span>
+</footer>
+</body>
+</html>
