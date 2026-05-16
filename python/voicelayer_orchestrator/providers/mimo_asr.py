@@ -25,7 +25,7 @@ code-switch). Crashes drop the worker; the next call respawns and
 pays one fresh cold load before warming again. Operator env changes
 (`VOICELAYER_MIMO_*`) take effect on the next worker spawn — restart
 the daemon to apply them mid-session. See
-`docs/guides/local-asr-provider.md` for the hardware preconditions
+`docs/guides/local-asr-provider.html` for the hardware preconditions
 and the comparison table.
 
 Optional. The whisper.cpp chain remains the default ASR provider.

@@ -35,7 +35,7 @@ vad = [
 # a recommended optimisation as the model card implies. flash-attn does
 # not ship binary wheels on PyPI today; operators install one of
 # Dao-AILab's GitHub release wheels manually after torch is in place
-# (the wheels are tagged `cu12torch2.{X}`). docs/guides/local-asr-provider.md
+# (the wheels are tagged `cu12torch2.{X}`). docs/guides/local-asr-provider.html
 # tracks the working combination — currently
 # `flash-attn==2.8.1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64`
 # against `torch==2.10.0+cu128` for Blackwell.

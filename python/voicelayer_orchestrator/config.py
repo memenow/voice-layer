@@ -96,7 +96,7 @@ class MimoAsrConfig:
     spawn — restart the daemon to apply them mid-session. Both the LM
     weights (``model_path``) and the companion MiMo-Audio-Tokenizer
     (``tokenizer_path``) are required. See
-    ``docs/guides/local-asr-provider.md`` for the hardware envelope
+    ``docs/guides/local-asr-provider.html`` for the hardware envelope
     and the comparison table.
 
     The wrapper class lives in Xiaomi's source tree and is not
@@ -155,7 +155,7 @@ class Qwen3AsrConfig:
     ``hf download Qwen/Qwen3-ASR-1.7B --local-dir <path>`` and point
     ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` at that directory; the worker
     never triggers HuggingFace downloads on its own. See
-    ``docs/guides/local-asr-provider.md`` for the hardware envelope
+    ``docs/guides/local-asr-provider.html`` for the hardware envelope
     and the comparison table.
 
     ``extra_args`` is reserved for future passthrough into

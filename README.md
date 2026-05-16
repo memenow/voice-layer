@@ -22,14 +22,14 @@ VoiceLayer is not designed as:
 ## Architecture
 
 - `crates/voicelayer-core`: shared domain types and injection planning
-- `crates/voicelayer-doc-test-utils`: dev-only helpers shared by the workspace's repository-wide markdown guard tests
+- `crates/voicelayer-doc-test-utils`: dev-only helpers shared by the workspace's repository-wide documentation guard tests
 - `crates/voicelayerd`: Unix-socket daemon and `/v1` control API
 - `crates/vl`: CLI/TUI entry point and operator tooling
 - `crates/vl-desktop`: interactive GUI shell that talks to the daemon over the same socket
 - `python/voicelayer_orchestrator`: JSON-RPC worker protocol and provider orchestration entry point
 - `systemd/`: user-service templates for the daemon and the optional persistent `whisper-server`
 - `scripts/install.sh`: one-shot installer that builds release binaries and seeds `~/.local/bin/`, `~/.config/systemd/user/`, and `~/.config/voicelayer/`
-- `docs/`: architecture, host strategy, and operations documentation. The Markdown sources stay authoritative for guard tests; open [`docs/index.html`](docs/index.html) for the rendered, navigation-friendly version.
+- `docs/`: architecture, host strategy, and operations documentation. HTML pages are the authoritative docs format; open [`docs/index.html`](docs/index.html) for the navigation-friendly entry point.
 - `openapi/`: local API contract
 
 ## Current Status
@@ -43,8 +43,8 @@ Shipped today:
 - `vl-desktop` GUI overlay that shares the same socket, session state, and event stream as the CLI
 - Real ASR via `whisper.cpp`: one-shot `whisper-cli` plus an optional persistent `whisper-server` endpoint (with autostart) for warm-model reuse
 - Optional silero-vad pre-pass inside the Python worker that trims non-speech before every transcribe backend (whisper.cpp, MiMo-V2.5-ASR, Qwen3-ASR-1.7B)
-- Optional Xiaomi MiMo-V2.5-ASR backend (CUDA-only, opt-in via `provider_id`) for multilingual and quality-priority transcription, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id mimo_v2_5_asr`, `vl record-transcribe --provider-id ...`, `vl dictation foreground-ptt --provider-id ...`); see [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md)
-- Optional Alibaba Qwen3-ASR-1.7B backend (Apache-2.0, GPU recommended, opt-in via `provider_id`) for 30-language transcription including Mandarin and Cantonese, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id qwen3_asr_1_7b`, ...); see [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md)
+- Optional Xiaomi MiMo-V2.5-ASR backend (CUDA-only, opt-in via `provider_id`) for multilingual and quality-priority transcription, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id mimo_v2_5_asr`, `vl record-transcribe --provider-id ...`, `vl dictation foreground-ptt --provider-id ...`); see [docs/guides/local-asr-provider.html](docs/guides/local-asr-provider.html)
+- Optional Alibaba Qwen3-ASR-1.7B backend (Apache-2.0, GPU recommended, opt-in via `provider_id`) for 30-language transcription including Mandarin and Cantonese, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id qwen3_asr_1_7b`, ...); see [docs/guides/local-asr-provider.html](docs/guides/local-asr-provider.html)
 - Real LLM integration via OpenAI-compatible chat completions, with optional `llama-server` autostart for local endpoints
 - Live Rust↔Python stdio JSON-RPC bridge through the `uv`-managed project environment
 - systemd user units for `voicelayerd` and the optional `whisper-server`, plus `scripts/install.sh`
@@ -121,19 +121,19 @@ cargo run -p vl -- providers
 
 ### Configure a Local LLM Endpoint
 
-See [docs/guides/local-llm-provider.md](docs/guides/local-llm-provider.md) for the `llama.cpp server` path and environment variables.
+See [docs/guides/local-llm-provider.html](docs/guides/local-llm-provider.html) for the `llama.cpp server` path and environment variables.
 
 ### Configure a Local ASR Provider
 
-See [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md) for the `whisper.cpp` file transcription path, the optional persistent `whisper-server` deployment, and the optional silero-vad pre-pass.
+See [docs/guides/local-asr-provider.html](docs/guides/local-asr-provider.html) for the `whisper.cpp` file transcription path, the optional persistent `whisper-server` deployment, and the optional silero-vad pre-pass.
 
 ### Launch the Desktop Shell
 
-See [docs/guides/desktop.md](docs/guides/desktop.md) for `vl-desktop` usage and the two client-side environment variables (`VOICELAYER_VL_BIN`, `VOICELAYER_LOG`).
+See [docs/guides/desktop.html](docs/guides/desktop.html) for `vl-desktop` usage and the two client-side environment variables (`VOICELAYER_VL_BIN`, `VOICELAYER_LOG`).
 
 ### Install as a systemd User Service
 
-See [docs/guides/systemd.md](docs/guides/systemd.md) for `scripts/install.sh`, the `voicelayerd` unit, and the optional dedicated `voicelayer-whisper-server` unit (with a Docker drop-in).
+See [docs/guides/systemd.html](docs/guides/systemd.html) for `scripts/install.sh`, the `voicelayerd` unit, and the optional dedicated `voicelayer-whisper-server` unit (with a Docker drop-in).
 
 ### Render a Bracketed Paste Payload
 
