@@ -2,7 +2,6 @@
 <html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
 <head>
   <meta charset="utf-8" />
-  <meta name="generator" content="pandoc" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <title>Architecture Overview</title>
   <style>
@@ -293,7 +292,7 @@ is the input the GPU backend actually sees.</p>
 ONNX export (v4 or v5). Runtime dependencies (<code>numpy</code>,
 <code>onnxruntime</code>) ship as the optional <code>vad</code> extra;
 import failures are caught and downgraded to "transcribe the raw WAV" so
-no request is lost. See <code>docs/guides/local-asr-provider.md</code>
+no request is lost. See <code>docs/guides/local-asr-provider.html</code>
 for the full list of tunables.</p>
 <h2 id="deferred-work">Deferred Work</h2>
 <p>This scaffold deliberately defers:</p>
@@ -314,14 +313,14 @@ only daemon health, start/stop, and a read-only transcript pane.</li>
 <code>org.freedesktop.portal.GlobalShortcuts</code>), and the systemd
 user units (one for the daemon, one optional unit for
 <code>whisper-server</code>) are no longer deferred; see
-<code>docs/guides/desktop.md</code> and
-<code>docs/guides/systemd.md</code>.</p>
+<code>docs/guides/desktop.html</code> and
+<code>docs/guides/systemd.html</code>.</p>
 <p>The repository already defines the seams for the remaining additions
 so the first implementation does not need to redesign the public
 interfaces.</p>
 <footer class="vl-footer">
   <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
-  <span>This page is generated from the matching Markdown source.</span>
+  <span>Documentation source: HTML files under <code>docs/</code>.</span>
 </footer>
 </body>
 </html>

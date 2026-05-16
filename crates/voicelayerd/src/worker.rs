@@ -764,15 +764,37 @@ mod tests {
         methods
     }
 
-    /// Walk a Markdown body of `docs/architecture/python-worker-protocol.md`
-    /// and pull the JSON-RPC method names listed under the
-    /// `## Required Methods` heading. Each entry is a bullet line of
-    /// shape `- \`<name>\``, where `<name>` is lowercase letters and
-    /// underscores only. The section terminates at the next heading
-    /// (`## ...`) so prose mentions of method names later in the doc
-    /// (e.g. under `## Current Behavior`) are not re-captured.
+    /// Walk `docs/architecture/python-worker-protocol.html` and pull
+    /// the JSON-RPC method names listed under the Required Methods
+    /// heading. Each entry is a code literal whose value is lowercase
+    /// letters and underscores only. The section terminates at the
+    /// next `<h2>` so prose mentions of method names later in the doc
+    /// (e.g. under Current Behavior) are not re-captured.
+    ///
+    /// Markdown input is still accepted for the unit fixture so the
+    /// section-boundary behavior stays easy to read.
     fn extract_protocol_doc_method_names(contents: &str) -> std::collections::BTreeSet<String> {
         let mut methods = std::collections::BTreeSet::new();
+
+        if let Some(start) = contents.find("<h2 id=\"required-methods\"") {
+            let after_heading = &contents[start..];
+            let section_start = after_heading
+                .find("</h2>")
+                .map_or(0, |idx| idx + "</h2>".len());
+            let section = &after_heading[section_start..];
+            let section = section
+                .find("<h2")
+                .map_or(section, |next_heading| &section[..next_heading]);
+            for literal in voicelayer_doc_test_utils::extract_doc_code_literals(section) {
+                if !literal.is_empty()
+                    && literal.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                {
+                    methods.insert(literal);
+                }
+            }
+            return methods;
+        }
+
         let mut in_section = false;
         for line in contents.lines() {
             let trimmed = line.trim();
@@ -918,6 +940,29 @@ the bullet list above and must not be captured.
                 .collect(),
             "later prose mentions of `transcribe` must not leak into the set",
         );
+
+        let html = "\
+<h1 id=\"python-worker-protocol\">Python Worker Protocol</h1>
+<h2 id=\"transport\">Transport</h2>
+<p><code>health</code> in prose before the list must not count.</p>
+<h2 id=\"required-methods\">Required Methods</h2>
+<ul>
+<li><code>health</code></li>
+<li><code>compose</code></li>
+<li><code>rewrite</code></li>
+</ul>
+<h2 id=\"current-behavior\">Current Behavior</h2>
+<p>The <code>transcribe</code> method is mentioned only in prose here.</p>
+";
+        let html_methods = extract_protocol_doc_method_names(html);
+        assert_eq!(
+            html_methods,
+            ["compose", "health", "rewrite"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "HTML prose outside the Required Methods section must not leak into the set",
+        );
     }
 
     /// Cross-check the protocol doc's enumerated method list against
@@ -936,9 +981,9 @@ the bullet list above and must not be captured.
     fn every_protocol_doc_method_is_dispatched_in_python_worker() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let doc_source = std::fs::read_to_string(format!(
-            "{manifest}/../../docs/architecture/python-worker-protocol.md"
+            "{manifest}/../../docs/architecture/python-worker-protocol.html"
         ))
-        .expect("read python-worker-protocol.md");
+        .expect("read python-worker-protocol.html");
         let python_source = std::fs::read_to_string(format!(
             "{manifest}/../../python/voicelayer_orchestrator/worker.py"
         ))
@@ -947,7 +992,7 @@ the bullet list above and must not be captured.
         let doc_methods = extract_protocol_doc_method_names(&doc_source);
         assert!(
             !doc_methods.is_empty(),
-            "expected at least one method in `## Required Methods` — \
+            "expected at least one method in the Required Methods section — \
              extract_protocol_doc_method_names may be misparsing or \
              the heading may have moved",
         );
@@ -959,16 +1004,16 @@ the bullet list above and must not be captured.
             "protocol doc lists methods the Python worker does not dispatch: \
              {missing:?}\n\nEither add the dispatch arm in \
              python/voicelayer_orchestrator/worker.py or drop the entry from \
-             the `## Required Methods` bullet list in \
-             docs/architecture/python-worker-protocol.md.",
+             the Required Methods list in \
+             docs/architecture/python-worker-protocol.html.",
         );
 
         let undocumented: Vec<&String> = dispatched.difference(&doc_methods).collect();
         assert!(
             undocumented.is_empty(),
             "Python worker dispatches methods not listed in the protocol doc: \
-             {undocumented:?}\n\nAdd a `- \\`<name>\\`` entry under \
-             `## Required Methods` in docs/architecture/python-worker-protocol.md \
+             {undocumented:?}\n\nAdd a `<code>&lt;name&gt;</code>` entry under \
+             the Required Methods list in docs/architecture/python-worker-protocol.html \
              so the doc reflects what the worker actually accepts.",
         );
     }

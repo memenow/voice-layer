@@ -31,7 +31,7 @@ ENV_EXAMPLE = PROJECT_ROOT / "systemd" / "voicelayerd.env.example"
 # Client-side env vars that legitimately do not belong in the daemon
 # env example. The keys here are read by vl-desktop (an interactive
 # GUI process, not a systemd user service) and documented in
-# docs/guides/desktop.md. Adding a new client-only knob requires
+# docs/guides/desktop.html. Adding a new client-only knob requires
 # updating both this set and the desktop guide in the same PR.
 CLIENT_ONLY_ENV_VARS: frozenset[str] = frozenset(
     {
@@ -136,7 +136,7 @@ class EnvExampleCoverageTest(unittest.TestCase):
                 "`KEY=` or `#KEY=` line — or, if the knob is legitimately "
                 "client-side-only (read by vl-desktop, not the daemon), add "
                 "it to CLIENT_ONLY_ENV_VARS in this test and document it in "
-                "docs/guides/desktop.md."
+                "docs/guides/desktop.html."
             ),
         )
 

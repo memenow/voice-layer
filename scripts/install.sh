@@ -37,7 +37,7 @@ install -m 0644 "${REPO_ROOT}/systemd/voicelayerd.service" "${UNIT_DIR}/voicelay
 # voicelayer-whisper-server.service is installed but not enabled. Enable
 # it explicitly with `systemctl --user enable --now voicelayer-whisper-server`
 # when you want the daemon to reach whisper-server instead of spawning
-# whisper-cli per request. See docs/guides/systemd.md.
+# whisper-cli per request. See docs/guides/systemd.html.
 install -m 0644 "${REPO_ROOT}/systemd/voicelayer-whisper-server.service" \
   "${UNIT_DIR}/voicelayer-whisper-server.service"
 
@@ -84,7 +84,7 @@ Next steps:
   3. (Optional) Run whisper-server as a persistent unit instead of
      one-shot whisper-cli per capture:
        systemctl --user enable --now voicelayer-whisper-server
-     See docs/guides/systemd.md for when to pick this over the
+     See docs/guides/systemd.html for when to pick this over the
      VOICELAYER_WHISPER_SERVER_AUTO_START path.
   4. Launch the desktop shell:
        vl-desktop

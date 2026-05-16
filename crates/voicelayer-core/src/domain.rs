@@ -1267,32 +1267,27 @@ mod tests {
         codes
     }
 
-    /// Walk a Markdown doc string and collect every backtick-quoted
-    /// JSON-RPC error code (`` `-3XXXX` ``). Returns the dedup'd set
-    /// of values; the doc may mention the same code in several
-    /// passages (e.g. an Error Policy enumeration plus inline usage
-    /// notes), but for the drift guard only presence matters. Same
-    /// JSON-RPC range filter as `extract_python_jsonrpc_error_codes`.
+    /// Walk a documentation string and collect every JSON-RPC error
+    /// code token (`-3XXXX`). Returns the dedup'd set of values; the
+    /// doc may mention the same code in several passages (e.g. an
+    /// Error Policy enumeration plus inline usage notes), but for
+    /// the drift guard only presence matters. Same JSON-RPC range
+    /// filter as `extract_python_jsonrpc_error_codes`.
     fn extract_doc_jsonrpc_error_codes(contents: &str) -> std::collections::BTreeSet<i32> {
         let mut codes = std::collections::BTreeSet::new();
-        for line in contents.lines() {
-            let mut search = line;
-            while let Some(idx) = search.find("`-") {
-                let after = &search[idx + 1..]; // start at "-..."
-                let token: String = after
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '-')
-                    .collect();
-                if let Ok(value) = token.parse::<i32>()
-                    && (-32700..=-32000).contains(&value)
-                {
-                    codes.insert(value);
-                }
-                search = &after[token.len()..];
-                if search.is_empty() {
-                    break;
-                }
+        let mut search = contents;
+        while let Some(idx) = search.find('-') {
+            let after = &search[idx..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            if let Ok(value) = token.parse::<i32>()
+                && (-32700..=-32000).contains(&value)
+            {
+                codes.insert(value);
             }
+            search = &after[token.len().max(1)..];
         }
         codes
     }
@@ -1350,74 +1345,110 @@ mod tests {
         None
     }
 
-    /// Walk a Markdown body and pull out every backtick-quoted file
+    /// Walk documentation prose and pull out every code-styled file
     /// path that contains at least one `/` and ends in a recognised
-    /// source extension. Filters out runtime paths
+    /// source or documentation extension. Filters out runtime paths
     /// (`~/.config/...`, `/usr/local/...`, `${HOME}/...`) by
     /// requiring the first character to be an ASCII lowercase
     /// letter — every repo-relative path the docs reference today
     /// starts with one of `crates/`, `docs/`, `openapi/`, `python/`,
-    /// `providers/`, `scripts/`, `systemd/`, or `tests/`. Returns
-    /// the raw path text — callers are responsible for resolving
-    /// shorthand conventions (e.g. `providers/foo.py` →
+    /// `providers/`, `scripts/`, `systemd/`, or `tests/`. Markdown
+    /// inline code and HTML `<code>` elements are both supported.
+    /// Returns the raw path text; callers are responsible for
+    /// resolving shorthand conventions (e.g. `providers/foo.py` →
     /// `python/voicelayer_orchestrator/providers/foo.py`).
     fn extract_doc_file_path_refs(contents: &str) -> std::collections::BTreeSet<String> {
-        let exts = [".rs", ".py", ".toml", ".sh", ".yaml", ".md", ".service"];
+        let exts = [
+            ".rs", ".py", ".toml", ".sh", ".yaml", ".html", ".md", ".service",
+        ];
         let mut paths = std::collections::BTreeSet::new();
-        let mut search = contents;
-        while let Some(idx) = search.find('`') {
-            let after = &search[idx + 1..];
-            let Some(close) = after.find('`') else {
-                break;
-            };
-            let inner = &after[..close];
-            search = &after[close + 1..];
-            if !inner.contains('/') {
-                continue;
+        for literal in voicelayer_doc_test_utils::extract_doc_code_literals(contents) {
+            for candidate in literal.split_whitespace() {
+                let inner = candidate.trim_matches(|c: char| {
+                    matches!(
+                        c,
+                        '"' | '\'' | '(' | ')' | '[' | ']' | ',' | '.' | ';' | ':'
+                    )
+                });
+                let inner = inner.split('#').next().unwrap_or(inner);
+                if !inner.contains('/') || inner.contains('*') {
+                    continue;
+                }
+                if !exts.iter().any(|ext| inner.ends_with(ext)) {
+                    continue;
+                }
+                if !inner.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                    continue;
+                }
+                paths.insert(inner.to_owned());
             }
-            if !exts.iter().any(|ext| inner.ends_with(ext)) {
-                continue;
-            }
-            if inner.chars().any(char::is_whitespace) {
-                continue;
-            }
-            if !inner.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
-                continue;
-            }
-            paths.insert(inner.to_owned());
         }
         paths
     }
 
-    /// Walk a Markdown body and pull out every `[text](path.md)` or
-    /// `[text](path.md#fragment)` link target whose path component
-    /// ends in `.md`. Skips absolute URLs (`http://`, `https://`,
-    /// `mailto:`) — those are not local cross-references and live
-    /// outside the repo's drift surface. The fragment is stripped
-    /// before matching the `.md` suffix so anchored links resolve
-    /// to the same file.
-    fn extract_markdown_md_links(contents: &str) -> Vec<String> {
+    /// Walk Markdown and HTML documentation bodies and pull out local
+    /// documentation link targets ending in `.html` or `.md`. The
+    /// `.md` branch remains intentional: any stale Markdown link
+    /// should fail once the `docs/` tree is HTML-only. Skips
+    /// absolute URLs (`http://`, `https://`, `mailto:`) because
+    /// those live outside the repo's drift surface. Fragments are
+    /// stripped so anchored links resolve to the same file.
+    fn extract_doc_local_links(contents: &str) -> Vec<String> {
         let mut links = Vec::new();
-        let mut search = contents;
-        while let Some(idx) = search.find("](") {
-            let after = &search[idx + "](".len()..];
+
+        let mut markdown = contents;
+        while let Some(idx) = markdown.find("](") {
+            let after = &markdown[idx + "](".len()..];
             let Some(close) = after.find(')') else {
                 break;
             };
             let link = &after[..close];
-            search = &after[close + 1..];
-            if link.starts_with("http://")
-                || link.starts_with("https://")
-                || link.starts_with("mailto:")
-            {
-                continue;
-            }
-            let path_part = link.split('#').next().unwrap_or(link);
-            if path_part.ends_with(".md") {
+            markdown = &after[close + 1..];
+            let path_part = link
+                .split('#')
+                .next()
+                .unwrap_or(link)
+                .split('?')
+                .next()
+                .unwrap_or(link);
+            if is_local_doc_link(path_part) {
                 links.push(path_part.to_owned());
             }
         }
+
+        let mut html = contents;
+        while let Some(idx) = html.find("href=\"") {
+            let after = &html[idx + "href=\"".len()..];
+            let Some(close) = after.find('"') else {
+                break;
+            };
+            let link = &after[..close];
+            html = &after[close + 1..];
+            let path_part = link
+                .split('#')
+                .next()
+                .unwrap_or(link)
+                .split('?')
+                .next()
+                .unwrap_or(link);
+            if is_local_doc_link(path_part) {
+                links.push(path_part.to_owned());
+            }
+        }
+
         links
+    }
+
+    fn is_local_doc_link(path: &str) -> bool {
+        if path.is_empty()
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+            || path.starts_with("mailto:")
+            || path.starts_with('#')
+        {
+            return false;
+        }
+        path.ends_with(".html") || path.ends_with(".md")
     }
 
     /// Walk an `install.sh` shell script and pull out every basename
@@ -1706,40 +1737,27 @@ mod tests {
         Some((name.to_owned(), kind))
     }
 
-    /// Walk a Markdown body and pull out every backtick-quoted
-    /// `VOICELAYER_<NAME>` literal where `<NAME>` is uppercase
-    /// letters, digits, and underscores. Rejects two prose
-    /// patterns the docs use today:
-    /// - `` `VOICELAYER_FOO_*` `` — wildcard mentions where the
-    ///   trailing `*` is dropped during scan and the captured text
-    ///   ends in `_`.
-    /// - Any literal containing whitespace, which is prose, not a
-    ///   real env var name.
+    /// Walk documentation prose and pull out every `VOICELAYER_<NAME>`
+    /// token where `<NAME>` is uppercase letters, digits, and
+    /// underscores. Rejects wildcard mentions such as
+    /// `VOICELAYER_FOO_*`, where the trailing `*` is dropped during
+    /// scan and the captured text ends in `_`.
     fn extract_doc_voicelayer_env_var_mentions(
         contents: &str,
     ) -> std::collections::BTreeSet<String> {
         let mut mentions = std::collections::BTreeSet::new();
         let mut search = contents;
-        while let Some(idx) = search.find('`') {
-            let after = &search[idx + 1..];
-            let Some(close) = after.find('`') else {
-                break;
-            };
-            let inner = &after[..close];
-            search = &after[close + 1..];
-            if inner.chars().any(char::is_whitespace) {
-                continue;
-            }
-            let Some(rest) = inner.strip_prefix("VOICELAYER_") else {
+        while let Some(idx) = search.find("VOICELAYER_") {
+            let after = &search[idx..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            search = &after[token.len().max(1)..];
+            let Some(rest) = token.strip_prefix("VOICELAYER_") else {
                 continue;
             };
             if rest.is_empty() || rest.ends_with('_') {
-                continue;
-            }
-            if !rest
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-            {
                 continue;
             }
             mentions.insert(format!("VOICELAYER_{rest}"));
@@ -2156,27 +2174,27 @@ mod tests {
         }
     }
 
-    /// Walk a Markdown doc string and pull out every backtick-quoted
-    /// `voicelayer.<word>` literal. Excludes `dictation.*` SSE event
-    /// names (different prefix) and any other non-shortcut content.
-    /// The contents-rejection on whitespace and emptiness keeps a
-    /// trailing prose match (`\`voicelayer prefix\``) from polluting
-    /// the set.
+    /// Walk documentation prose and pull out every `voicelayer.<word>`
+    /// literal. Excludes `dictation.*` SSE event names (different
+    /// prefix) and any other non-shortcut content.
     fn collect_doc_shortcut_ids(contents: &str) -> std::collections::BTreeSet<String> {
-        let needle = "`voicelayer.";
         let mut ids = std::collections::BTreeSet::new();
         let mut search = contents;
+        let needle = "voicelayer.";
         while let Some(idx) = search.find(needle) {
-            let after = &search[idx + 1..]; // skip the opening backtick
-            let inner: String = after.chars().take_while(|c| *c != '`').collect();
-            if !inner.is_empty() && !inner.contains(' ') {
-                ids.insert(inner.clone());
+            let after = &search[idx..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '_' || *c == '.')
+                .collect();
+            search = &after[token.len().max(1)..];
+            let Some(rest) = token.strip_prefix(needle) else {
+                continue;
+            };
+            if rest.is_empty() || rest.contains('.') {
+                continue;
             }
-            let consumed = inner.len() + 1; // backtick + content
-            if consumed >= search.len() - idx {
-                break;
-            }
-            search = &search[idx + consumed..];
+            ids.insert(token);
         }
         ids
     }
@@ -2757,33 +2775,40 @@ components:
     fn extract_doc_file_path_refs_filters_to_path_shaped_tokens() {
         let md = concat!(
             "See `crates/voicelayerd/src/lib.rs` and `providers/foo.py`.\n",
+            "<p>Read <code>docs/guides/systemd.html</code>.</p>\n",
             "Bare identifier `compose_payload` is not a path.\n",
             "Single-segment basename `whisper-cli` has no slash.\n",
             "Spaces inside backticks `not a path.py` should be skipped.\n",
+            "Wildcard paths `providers/*.py` should be skipped.\n",
             "Wrong extension `path/to/data.txt` should be skipped.\n",
             "Runtime paths `~/.config/voicelayer/config.toml`, `/usr/bin/foo.sh`, \n",
             "`${HOME}/foo.py` must not be classified as repo refs.\n",
         );
         let paths = extract_doc_file_path_refs(md);
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 3);
         assert!(paths.contains("crates/voicelayerd/src/lib.rs"));
+        assert!(paths.contains("docs/guides/systemd.html"));
         assert!(paths.contains("providers/foo.py"));
     }
 
     #[test]
-    fn extract_markdown_md_links_strips_fragments_and_skips_urls() {
+    fn extract_doc_local_links_strips_fragments_and_skips_urls() {
         let md = concat!(
-            "See [Desktop](./desktop.md) and [Setup](./setup.md#install).\n",
+            "See [Desktop](./desktop.html) and [Setup](./setup.html#install).\n",
             "External: [crates.io](https://crates.io/crates/voicelayerd).\n",
             "Mailto: [team](mailto:team@example.com).\n",
-            "Repo path: [overview](docs/architecture/overview.md).\n",
+            "Repo path: [overview](docs/architecture/overview.html).\n",
+            "Stale md path: [old](./old.md).\n",
+            "<a href=\"../index.html#top\">Home</a>\n",
             "Non-md link: [readme](./README.txt).\n",
         );
-        let links = extract_markdown_md_links(md);
-        assert_eq!(links.len(), 3);
-        assert!(links.contains(&"./desktop.md".to_owned()));
-        assert!(links.contains(&"./setup.md".to_owned()));
-        assert!(links.contains(&"docs/architecture/overview.md".to_owned()));
+        let links = extract_doc_local_links(md);
+        assert_eq!(links.len(), 5);
+        assert!(links.contains(&"./desktop.html".to_owned()));
+        assert!(links.contains(&"./setup.html".to_owned()));
+        assert!(links.contains(&"docs/architecture/overview.html".to_owned()));
+        assert!(links.contains(&"./old.md".to_owned()));
+        assert!(links.contains(&"../index.html".to_owned()));
     }
 
     #[test]
@@ -2834,6 +2859,7 @@ components:
         let md = concat!(
             "the GUI registers `voicelayer.dictation_toggle` via portal.\n",
             "later: `vl-desktop` registers `voicelayer.dictation_toggle` again.\n",
+            "<code>voicelayer.dictation_toggle</code> in HTML also counts once.\n",
             "an SSE event like `dictation.completed` does not match the prefix.\n",
         );
         let ids = collect_doc_shortcut_ids(md);
@@ -3842,9 +3868,9 @@ components:
         ))
         .expect("read python worker.py");
         let doc_source = std::fs::read_to_string(format!(
-            "{repo_root}/docs/architecture/python-worker-protocol.md",
+            "{repo_root}/docs/architecture/python-worker-protocol.html",
         ))
-        .expect("read python-worker-protocol.md");
+        .expect("read python-worker-protocol.html");
 
         let python_codes = extract_python_jsonrpc_error_codes(&python_source);
         let doc_codes = extract_doc_jsonrpc_error_codes(&doc_source);
@@ -3856,15 +3882,15 @@ components:
         );
         assert!(
             !doc_codes.is_empty(),
-            "python-worker-protocol.md must mention at least one `\\`-3XXXX\\`` code; \
+            "python-worker-protocol.html must mention at least one `-3XXXX` code; \
              extract_doc_jsonrpc_error_codes may be misparsing",
         );
 
         for code in &python_codes {
             assert!(
                 doc_codes.contains(code),
-                "python worker emits `{code}` but no matching `\\`{code}\\`` mention \
-                 in docs/architecture/python-worker-protocol.md. Add a line under the \
+                "python worker emits `{code}` but no matching `{code}` mention \
+                 in docs/architecture/python-worker-protocol.html. Add a line under the \
                  Error Policy enumeration so operators reading the doc can identify \
                  the code they receive.",
             );
@@ -3872,7 +3898,7 @@ components:
         for code in &doc_codes {
             assert!(
                 python_codes.contains(code),
-                "docs/architecture/python-worker-protocol.md mentions `\\`{code}\\`` \
+                "docs/architecture/python-worker-protocol.html mentions `{code}` \
                  but no matching `_CODE = {code}` constant exists in worker.py. \
                  Either drop the mention from the doc or add the constant on the \
                  python side.",
@@ -4077,7 +4103,7 @@ components:
 
     /// Pin every `pub const SHORTCUT_*: &str = "..."` value in
     /// `vl-desktop::portal` against the corresponding mention in
-    /// `docs/architecture/overview.md`. The shortcut id flows in
+    /// `docs/architecture/overview.html`. The shortcut id flows in
     /// both directions: the Rust constant feeds
     /// `org.freedesktop.portal.GlobalShortcuts.bind_shortcuts`, and
     /// the doc explains the resulting hotkey to operators. A rename
@@ -4091,8 +4117,8 @@ components:
             std::fs::read_to_string(format!("{repo_root}/crates/vl-desktop/src/portal.rs"))
                 .expect("read vl-desktop portal.rs");
         let overview =
-            std::fs::read_to_string(format!("{repo_root}/docs/architecture/overview.md"))
-                .expect("read overview.md");
+            std::fs::read_to_string(format!("{repo_root}/docs/architecture/overview.html"))
+                .expect("read overview.html");
 
         let rust_ids = collect_rust_shortcut_ids(&portal_src);
         let doc_ids = collect_doc_shortcut_ids(&overview);
@@ -4104,7 +4130,7 @@ components:
         );
         assert!(
             !doc_ids.is_empty(),
-            "overview.md must mention at least one `\\`voicelayer.<id>\\`` shortcut; \
+            "overview.html must mention at least one `voicelayer.<id>` shortcut; \
              collect_doc_shortcut_ids may be misparsing",
         );
 
@@ -4112,14 +4138,14 @@ components:
             assert!(
                 doc_ids.contains(id),
                 "Rust constant SHORTCUT_*=\"{id}\" is never mentioned in \
-                 docs/architecture/overview.md. Add a backtick-quoted reference \
+                 docs/architecture/overview.html. Add a code-styled reference \
                  so operators can match the portal UI against the doc.",
             );
         }
         for id in &doc_ids {
             assert!(
                 rust_ids.contains(id),
-                "overview.md mentions `\\`{id}\\`` but no matching \
+                "overview.html mentions `{id}` but no matching \
                  `pub const SHORTCUT_*: &str = \"{id}\";` exists in \
                  crates/vl-desktop/src/portal.rs. Either drop the doc \
                  mention or add the Rust constant.",
@@ -4177,45 +4203,47 @@ components:
         }
     }
 
-    /// Walk every `.md` file under `docs/` plus the repo-root
-    /// `README.md`, pull out every relative `[text](path.md)` link
-    /// (fragments stripped), and assert each resolves to an existing
-    /// file. Markdown convention: link targets are relative to the
-    /// containing file's parent directory, so a link from
-    /// `docs/guides/systemd.md` to `./desktop.md` resolves to
-    /// `docs/guides/desktop.md`.
+    /// Walk every standalone HTML page under `docs/` plus the
+    /// repo-root `README.md`, pull out every relative documentation
+    /// link (fragments stripped), and assert each resolves to an
+    /// existing file. Link targets are relative to the containing
+    /// file's parent directory, so a link from
+    /// `docs/guides/systemd.html` to `./desktop.html` resolves to
+    /// `docs/guides/desktop.html`.
     ///
     /// Catches: a doc renamed without updating inbound links, or a
     /// new link typo that points at a nonexistent file. Either would
-    /// produce a 404 in any rendered view (GitHub, mdBook, etc.).
+    /// produce a 404 in the docs site or the README.
     #[test]
-    fn every_markdown_doc_cross_reference_resolves_to_an_existing_file() {
+    fn every_doc_cross_reference_resolves_to_an_existing_file() {
         let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
 
-        let mut md_files = vec![repo_root.join("README.md")];
-        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut md_files)
+        let mut doc_files = vec![repo_root.join("README.md")];
+        voicelayer_doc_test_utils::collect_html_doc_files(&repo_root.join("docs"), &mut doc_files)
             .expect("walk docs/ directory");
         assert!(
-            md_files.len() > 1,
-            "expected README.md plus at least one doc under docs/; \
-             collect_markdown_files may be misparsing",
+            doc_files.len() > 1,
+            "expected README.md plus at least one HTML doc under docs/; \
+             collect_html_doc_files may be misparsing",
         );
 
         let mut broken: Vec<String> = Vec::new();
-        for md_file in &md_files {
-            let contents = match std::fs::read_to_string(md_file) {
+        for doc_file in &doc_files {
+            let contents = match std::fs::read_to_string(doc_file) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let parent = md_file.parent().unwrap_or_else(|| std::path::Path::new(""));
-            for link in extract_markdown_md_links(&contents) {
+            let parent = doc_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""));
+            for link in extract_doc_local_links(&contents) {
                 let resolved = parent.join(&link);
                 if !resolved.exists() {
                     broken.push(format!(
                         "{} → `{link}` (resolved to {})",
-                        md_file
+                        doc_file
                             .strip_prefix(&repo_root)
-                            .unwrap_or(md_file)
+                            .unwrap_or(doc_file)
                             .display(),
                         resolved.display(),
                     ));
@@ -4224,39 +4252,39 @@ components:
         }
         assert!(
             broken.is_empty(),
-            "broken markdown cross-references:\n  - {}\n\n\
+            "broken documentation cross-references:\n  - {}\n\n\
              Either rename the link target back, drop the reference, \
              or add a stub doc at the target path.",
             broken.join("\n  - "),
         );
     }
 
-    /// Walk every `.md` under `docs/` plus the repo-root `README.md`,
-    /// collect every backtick-quoted file path with a path
-    /// separator and a recognised source extension, and assert each
-    /// resolves to an existing file. The check tolerates the
-    /// shorthand convention used in
-    /// `docs/architecture/python-worker-protocol.md`: a path
+    /// Walk every standalone HTML page under `docs/` plus the
+    /// repo-root `README.md`, collect every code-styled file path
+    /// with a path separator and a recognised source or
+    /// documentation extension, and assert each resolves to an
+    /// existing file. The check tolerates the shorthand convention
+    /// used in `docs/architecture/python-worker-protocol.html`: a path
     /// starting with `providers/` is implicitly anchored under
     /// `python/voicelayer_orchestrator/`. Anything else is resolved
     /// against the repo root.
     ///
     /// Catches: a renamed source file (`scripts/foo.sh`) or doc
-    /// (`docs/guides/desktop.md`) whose inbound prose references
-    /// were missed during the rename — Markdown's `()` link form is
-    /// already covered by #69, but bare backtick references are
-    /// not, and contributors use those just as often.
+    /// (`docs/guides/desktop.html`) whose inbound prose references
+    /// were missed during the rename. Link targets are already
+    /// covered by `every_doc_cross_reference_resolves_to_an_existing_file`;
+    /// code-styled prose references need this separate pass.
     #[test]
     fn every_doc_file_path_reference_resolves_to_an_existing_file() {
         let repo_root = std::path::PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
 
-        let mut md_files = vec![repo_root.join("README.md")];
-        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut md_files)
+        let mut doc_files = vec![repo_root.join("README.md")];
+        voicelayer_doc_test_utils::collect_html_doc_files(&repo_root.join("docs"), &mut doc_files)
             .expect("walk docs/ directory");
 
         let mut broken: Vec<String> = Vec::new();
-        for md_file in &md_files {
-            let contents = match std::fs::read_to_string(md_file) {
+        for doc_file in &doc_files {
+            let contents = match std::fs::read_to_string(doc_file) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -4271,9 +4299,9 @@ components:
                 }
                 broken.push(format!(
                     "{} → `{path}`",
-                    md_file
+                    doc_file
                         .strip_prefix(&repo_root)
-                        .unwrap_or(md_file)
+                        .unwrap_or(doc_file)
                         .display(),
                 ));
             }
@@ -5309,20 +5337,24 @@ dev = [\"pytest>=9.0.3,<10\"]
     }
 
     #[test]
-    fn extract_doc_voicelayer_env_var_mentions_drops_wildcard_and_prose_forms() {
+    fn extract_doc_voicelayer_env_var_mentions_drops_wildcards() {
         let md = "\
 - `VOICELAYER_LLM_ENDPOINT` is the chat completion URL.
 - `VOICELAYER_WHISPER_SERVER_*` is shorthand for several knobs.
-- `VOICELAYER_FOO BAR` looks like prose, not a real var.
+- <code>VOICELAYER_PROJECT_ROOT</code> controls worker resolution.
 - The `VOICELAYER_LLM_TIMEOUT_SECONDS` knob bounds requests.
 ";
         let mentions = extract_doc_voicelayer_env_var_mentions(md);
         assert_eq!(
             mentions,
-            ["VOICELAYER_LLM_ENDPOINT", "VOICELAYER_LLM_TIMEOUT_SECONDS"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
+            [
+                "VOICELAYER_LLM_ENDPOINT",
+                "VOICELAYER_LLM_TIMEOUT_SECONDS",
+                "VOICELAYER_PROJECT_ROOT"
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
         );
     }
 
@@ -5352,8 +5384,8 @@ VOICELAYER_LIVE_KNOB=hello
         );
     }
 
-    /// Every backtick-quoted `VOICELAYER_<NAME>` mention in any
-    /// `docs/**/*.md` file must either:
+    /// Every `VOICELAYER_<NAME>` mention in any standalone
+    /// `docs/**/*.html` page must either:
     ///
     /// - Appear as a `KEY=` (or `#KEY=`) line in
     ///   `systemd/voicelayerd.env.example`, OR
@@ -5376,12 +5408,12 @@ VOICELAYER_LIVE_KNOB=hello
         const ALLOWLIST: &[&str] = &[
             // vl-desktop client-side knobs — read by the GUI
             // process, not the daemon. Documented in
-            // docs/guides/desktop.md.
+            // docs/guides/desktop.html.
             "VOICELAYER_LOG",
             "VOICELAYER_VL_BIN",
             // scripts/install.sh internal overrides — read by the
             // installer, not the daemon. Documented in
-            // docs/guides/systemd.md.
+            // docs/guides/systemd.html.
             "VOICELAYER_INSTALL_BIN_DIR",
             "VOICELAYER_INSTALL_ENV_DIR",
             "VOICELAYER_INSTALL_UNIT_DIR",
@@ -5404,7 +5436,7 @@ VOICELAYER_LIVE_KNOB=hello
         );
 
         let mut docs = Vec::new();
-        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
+        voicelayer_doc_test_utils::collect_html_doc_files(&repo_root.join("docs"), &mut docs)
             .expect("walk docs/ directory");
 
         let mut violations: Vec<String> = Vec::new();

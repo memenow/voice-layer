@@ -438,10 +438,10 @@ mod tests {
     }
 
     mod readme_config_key_alignment {
-        //! Cross-check that every backtick-quoted
-        //! `foreground_ptt.<key>` mention in any operator-facing doc
-        //! (the project README plus everything under `docs/`)
-        //! resolves to an entry in `SUPPORTED_CONFIG_KEYS`.
+        //! Cross-check that every `foreground_ptt.<key>` mention in
+        //! any operator-facing doc (the project README plus the
+        //! standalone HTML pages under `docs/`) resolves to an entry
+        //! in `SUPPORTED_CONFIG_KEYS`.
         //!
         //! The drift mode is silent and operator-facing: a doc
         //! invites a contributor to run
@@ -457,28 +457,25 @@ mod tests {
         //! would be too aggressive.
         use std::collections::BTreeSet;
 
-        /// Walk a Markdown body and pull every backtick-quoted
+        /// Walk documentation prose and pull every
         /// `foreground_ptt.<key>` literal where `<key>` is lowercase
-        /// letters and underscores. Rejects whitespace-bearing
-        /// tokens (prose) and shapes with an extra `.` (deeper
-        /// nesting), keeping the captured set aligned with what
-        /// `vl config set` actually accepts.
+        /// letters and underscores. Rejects shapes with an extra `.`
+        /// (deeper nesting), keeping the captured set aligned with
+        /// what `vl config set` actually accepts.
         pub(super) fn extract_doc_foreground_ptt_config_key_mentions(
             contents: &str,
         ) -> BTreeSet<String> {
             let mut mentions = BTreeSet::new();
             let mut search = contents;
-            while let Some(idx) = search.find('`') {
-                let after = &search[idx + 1..];
-                let Some(close) = after.find('`') else {
-                    break;
-                };
-                let inner = &after[..close];
-                search = &after[close + 1..];
-                if inner.chars().any(char::is_whitespace) {
-                    continue;
-                }
-                let Some(rest) = inner.strip_prefix("foreground_ptt.") else {
+            let needle = "foreground_ptt.";
+            while let Some(idx) = search.find(needle) {
+                let after = &search[idx..];
+                let token: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '_' || *c == '.')
+                    .collect();
+                search = &after[token.len().max(1)..];
+                let Some(rest) = token.strip_prefix(needle) else {
                     continue;
                 };
                 if rest.is_empty() || rest.contains('.') {
@@ -526,8 +523,8 @@ mod tests {
         fn extract_doc_foreground_ptt_config_key_mentions_filters_to_single_segment_keys() {
             let md = "\
 - `foreground_ptt.default_stop_action` is the canonical name.
+- <code>foreground_ptt.provider_id</code> selects an ASR backend.
 - `foreground_ptt.nested.too.deep` is not a real config key shape.
-- `foreground_ptt.has spaces` is prose, not a key.
 - The `foreground_ptt.copy_on_stop` knob copies on stop.
 ";
             let mentions = extract_doc_foreground_ptt_config_key_mentions(md);
@@ -535,12 +532,13 @@ mod tests {
                 mentions,
                 [
                     "foreground_ptt.copy_on_stop",
-                    "foreground_ptt.default_stop_action"
+                    "foreground_ptt.default_stop_action",
+                    "foreground_ptt.provider_id"
                 ]
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
-                "deeper-nested and whitespace-bearing tokens must be rejected",
+                "deeper-nested tokens must be rejected",
             );
         }
 
@@ -584,7 +582,7 @@ fn elsewhere() {
             );
 
             let mut docs = vec![repo_root.join("README.md")];
-            voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
+            voicelayer_doc_test_utils::collect_html_doc_files(&repo_root.join("docs"), &mut docs)
                 .expect("walk docs/ directory");
 
             let mut violations: Vec<String> = Vec::new();

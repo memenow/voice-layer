@@ -10,7 +10,7 @@
 # Requirements:
 #   - curl on PATH
 #   - A whisper-server instance already reachable at HOST:PORT. Start one
-#     with the Docker command documented in docs/guides/local-asr-provider.md,
+#     with the Docker command documented in docs/guides/local-asr-provider.html,
 #     or rely on VOICELAYER_WHISPER_SERVER_AUTO_START inside the worker.
 #   - tests/fixtures/small.wav (create with `python3 scripts/generate_silent_fixture.py`)
 #
@@ -86,7 +86,7 @@ if ! status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$base_url/");
 fi
 if [[ "$status" -ge 500 || "$status" -eq 000 ]]; then
   echo "error: $base_url/ returned HTTP $status" >&2
-  echo "       start whisper-server first (see docs/guides/local-asr-provider.md)" >&2
+  echo "       start whisper-server first (see docs/guides/local-asr-provider.html)" >&2
   exit 64
 fi
 

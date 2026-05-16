@@ -32,7 +32,7 @@
 #       --host 0.0.0.0 --port ${VOICELAYER_WHISPER_SERVER_PORT} -ng
 #     ExecStop=/usr/bin/docker stop voicelayer-whisper-server
 #
-#   See docs/guides/systemd.md for the full docker recipe.
+#   See docs/guides/systemd.html for the full docker recipe.
 #
 # VOICELAYER_WHISPER_SERVER_ARGS is tokenised through Python's
 # shlex.split (via python3) so quoting rules match the Python autostart

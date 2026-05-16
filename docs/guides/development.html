@@ -2,7 +2,6 @@
 <html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
 <head>
   <meta charset="utf-8" />
-  <meta name="generator" content="pandoc" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <title>Development Guide</title>
   <style>
@@ -184,7 +183,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="
 <p>For real composition / rewrite / translation, configure
 <code>VOICELAYER_LLM_ENDPOINT</code> and
 <code>VOICELAYER_LLM_MODEL</code> as described in
-<code>docs/guides/local-llm-provider.md</code>. When the endpoint is
+<code>docs/guides/local-llm-provider.html</code>. When the endpoint is
 unset or unreachable, the worker returns a
 <code>provider-unavailable</code> JSON-RPC error instead of fabricating
 output. If you also set <code>VOICELAYER_LLM_AUTO_START=true</code>,
@@ -192,7 +191,7 @@ VoiceLayer can auto-launch <code>llama-server</code> for a local
 endpoint. For file-based ASR, configure
 <code>VOICELAYER_WHISPER_BIN</code> and
 <code>VOICELAYER_WHISPER_MODEL_PATH</code> as described in
-<code>docs/guides/local-asr-provider.md</code>. For warm-model reuse
+<code>docs/guides/local-asr-provider.html</code>. For warm-model reuse
 across transcribe calls, point at a persistent
 <code>VOICELAYER_WHISPER_SERVER_*</code> endpoint (see the same
 guide).</p>
@@ -330,12 +329,12 @@ systemd unit state (<code>installed</code> / <code>active</code>).</li>
 runtime files are written under
 <code>$XDG_RUNTIME_DIR/voicelayer/providers</code>.</li>
 <li><code>vl-desktop</code> is an interactive GUI shell; see
-<code>docs/guides/desktop.md</code> for its two client-side env vars. It
+<code>docs/guides/desktop.html</code> for its two client-side env vars. It
 shares the same daemon socket, session store, and SSE stream as the
 CLI.</li>
 <li>To install VoiceLayer as a systemd user service, run
 <code>scripts/install.sh</code> (see
-<code>docs/guides/systemd.md</code>). The installer builds release
+<code>docs/guides/systemd.html</code>). The installer builds release
 binaries, copies units into <code>~/.config/systemd/user/</code>, and
 leaves the optional <code>voicelayer-whisper-server</code> unit disabled
 by default.</li>
@@ -344,7 +343,7 @@ interpreter.</li>
 </ul>
 <footer class="vl-footer">
   <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
-  <span>This page is generated from the matching Markdown source.</span>
+  <span>Documentation source: HTML files under <code>docs/</code>.</span>
 </footer>
 </body>
 </html>

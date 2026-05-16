@@ -423,7 +423,7 @@ components:
             whisper-cli fallback). Selecting `mimo_v2_5_asr` opts the
             entire session into the Xiaomi MiMo-V2.5-ASR backend, and
             `qwen3_asr_1_7b` opts into the Alibaba Qwen3-ASR-1.7B
-            backend; see `docs/guides/local-asr-provider.md` for the
+            backend; see `docs/guides/local-asr-provider.html` for the
             hardware preconditions and the opt-in environment variables
             for each. The value is shared by every `TranscribeRequest`
             the daemon issues for this session — fixed/vad-gated
@@ -638,7 +638,7 @@ components:
             fallback). The optional `mimo_v2_5_asr` provider routes to
             the Xiaomi MiMo-V2.5-ASR backend, and `qwen3_asr_1_7b`
             routes to the Alibaba Qwen3-ASR-1.7B backend, both through
-            the Python worker; see `docs/guides/local-asr-provider.md`
+            the Python worker; see `docs/guides/local-asr-provider.html`
             for the hardware preconditions and the opt-in environment
             variables. An unrecognized provider id surfaces as a
             `provider unavailable` error rather than falling back to

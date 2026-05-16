@@ -4962,8 +4962,8 @@ mod openapi_route_alignment_tests {
 #[cfg(test)]
 mod doc_v1_endpoint_alignment_tests {
     //! Cross-check that every `/v1/<path>` URL mentioned in any
-    //! operator-facing markdown (the project README plus everything
-    //! under `docs/`) resolves to either a real axum route in
+    //! operator-facing documentation (the project README plus every
+    //! standalone HTML page under `docs/`) resolves to either a real axum route in
     //! `build_app_router` or an external OpenAI-compatible LLM
     //! endpoint the daemon talks *to* (e.g.
     //! `/v1/chat/completions`, `/v1/models`).
@@ -4987,11 +4987,11 @@ mod doc_v1_endpoint_alignment_tests {
     //! Reverse direction (every axum route is mentioned in some
     //! doc) is intentionally not enforced — the openapi document
     //! is the canonical surface contract (see
-    //! `openapi_route_alignment_tests`); markdown prose is merely
-    //! a guide.
+    //! `openapi_route_alignment_tests`); docs prose is merely a
+    //! guide.
     use std::collections::BTreeSet;
 
-    /// Walk a Markdown body and pull every `/v1/<path>` URL token.
+    /// Walk a documentation body and pull every `/v1/<path>` URL token.
     /// Anchors on the literal `/v1/` prefix and walks forward
     /// taking ASCII alphanumerics, hyphens, underscores, and
     /// internal `/` separators. Stops at any other character (a
@@ -5020,7 +5020,7 @@ mod doc_v1_endpoint_alignment_tests {
                 continue;
             }
             // Trim a trailing `/` so `POST /v1/sessions/dictation/`
-            // (markdown-prose form) collapses onto the bare path.
+            // (docs prose form) collapses onto the bare path.
             let cleaned = token.trim_end_matches('/');
             if cleaned.is_empty() {
                 continue;
@@ -5262,7 +5262,7 @@ mod tests {
     /// which is the single source of truth for the suffixes the
     /// daemon dials on the configured `VOICELAYER_LLM_ENDPOINT`
     /// host. The same URLs are operator-documented in
-    /// `docs/guides/local-llm-provider.md`.
+    /// `docs/guides/local-llm-provider.html`.
     #[test]
     fn every_doc_v1_endpoint_mention_resolves_to_an_axum_route_or_llm_allowlist() {
         let manifest = env!("CARGO_MANIFEST_DIR");
@@ -5289,7 +5289,7 @@ mod tests {
         );
 
         let mut docs = vec![repo_root.join("README.md")];
-        voicelayer_doc_test_utils::collect_markdown_files(&repo_root.join("docs"), &mut docs)
+        voicelayer_doc_test_utils::collect_html_doc_files(&repo_root.join("docs"), &mut docs)
             .expect("walk docs/");
 
         let mut allowed: BTreeSet<String> = routes;
@@ -5330,8 +5330,8 @@ mod tests {
 
 #[cfg(test)]
 mod sse_event_doc_alignment_tests {
-    //! Cross-check that every backtick-quoted SSE event name in
-    //! `docs/architecture/overview.md` corresponds to an
+    //! Cross-check that every code-styled SSE event name in
+    //! `docs/architecture/overview.html` corresponds to an
     //! `EventEnvelope::new("<name>", ...)` emission somewhere in
     //! `crates/voicelayerd/src/lib.rs`. Forward direction only: the
     //! doc enumerates the dictation-pipeline events that operators
@@ -5382,24 +5382,25 @@ mod sse_event_doc_alignment_tests {
         names
     }
 
-    /// Walk a Markdown body and pull every backtick-quoted token of
-    /// shape `dictation.<word>` (lowercase letters and underscores
-    /// only after the dot). Designed for the SSE event mentions in
-    /// `docs/architecture/overview.md`. Excludes the `worker.*`,
-    /// `compose.*`, and `transcription.*` namespaces, which the
-    /// doc does not enumerate today and the forward-direction
-    /// guard does not require to be enumerated.
+    /// Walk documentation prose and pull every token of shape
+    /// `dictation.<word>` (lowercase letters and underscores only
+    /// after the dot). Designed for the SSE event mentions in
+    /// `docs/architecture/overview.html`. Excludes the `worker.*`,
+    /// `compose.*`, and `transcription.*` namespaces, which the doc
+    /// does not enumerate today and the forward-direction guard does
+    /// not require to be enumerated.
     fn collect_doc_dictation_event_names(contents: &str) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         let mut search = contents;
-        while let Some(idx) = search.find('`') {
-            let after = &search[idx + 1..];
-            let Some(close) = after.find('`') else {
-                break;
-            };
-            let inner = &after[..close];
-            search = &after[close + 1..];
-            let Some(rest) = inner.strip_prefix("dictation.") else {
+        let needle = "dictation.";
+        while let Some(idx) = search.find(needle) {
+            let after = &search[idx..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '_' || *c == '.')
+                .collect();
+            search = &after[token.len().max(1)..];
+            let Some(rest) = token.strip_prefix(needle) else {
                 continue;
             };
             if rest.is_empty() {
@@ -5443,7 +5444,7 @@ mod tests {
 - `dictation.session_created` — fired when the session is created.
 - `dictation.completed` / `dictation.failed` — terminal pair.
 - `compose.job_created` — out of scope for this guard.
-- The `dictation.with space` token is not an event.
+- The `dictation` namespace is prose when it has no event suffix.
 ";
         let names = collect_doc_dictation_event_names(md);
         assert_eq!(
@@ -5463,8 +5464,8 @@ mod tests {
     /// enumerates must correspond to a real `EventEnvelope::new(...)`
     /// emission in the daemon. Scans the architecture overview AND
     /// the project README, since both are operator-facing and either
-    /// can drift independently — a contributor renaming an event
-    /// might fix overview.md but forget the README example, or vice
+    /// can drift independently; a contributor renaming an event
+    /// might fix overview.html but forget the README example, or vice
     /// versa.
     ///
     /// Reverse direction (every emitted event is documented) is
@@ -5483,7 +5484,9 @@ mod tests {
             "expected at least one EventEnvelope::new emission in lib.rs",
         );
 
-        let doc_paths: &[&str] = &["../../docs/architecture/overview.md", "../../README.md"];
+        let overview_doc = "../../docs/architecture/overview.html";
+        let readme_doc = "../../README.md";
+        let doc_paths: &[&str] = &[overview_doc, readme_doc];
         let mut total_doc_events = 0usize;
         let mut undocumented_in_code: Vec<String> = Vec::new();
         for rel in doc_paths {
@@ -5500,7 +5503,7 @@ mod tests {
         assert!(
             total_doc_events > 0,
             "expected at least one dictation event reference across the scanned docs \
-             (overview.md, README.md) — `collect_doc_dictation_event_names` may have \
+             (overview.html, README.md) — `collect_doc_dictation_event_names` may have \
              lost its anchor",
         );
         assert!(
