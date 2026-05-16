@@ -209,14 +209,20 @@ inference, which avoids paying the cold-load cost on pure-silence
 captures and prevents the causal LMs in MiMo / Qwen3-ASR from
 hallucinating transcripts on detected-silence audio. After
 <code>transcribe</code> returns — on success, on whisper / MiMo /
-Qwen3-ASR failure, and on the no-speech short-circuit — the dispatcher
-unlinks the per-call sidecar files it produced under
-<code>runtime_dir/</code>: the <code>.vad-trimmed.wav</code> /
-<code>.vad-empty.wav</code> written by the silero-vad pre-pass, plus the
-<code>mimo-segment-&lt;ts&gt;-&lt;idx&gt;.wav</code> and
-<code>qwen3-segment-&lt;ts&gt;-&lt;idx&gt;.wav</code> chunks emitted by
-the (optional) long-audio splitters. The original capture is left intact
-for the caller (the dictation pipeline owns its lifetime via
+Qwen3-ASR failure, and on the no-speech short-circuit — each transcribe
+path unlinks the per-call sidecar files it produced under
+<code>runtime_dir/</code> in a <code>finally</code> block. The whisper
+dispatcher (<code>worker.py</code>) cleans up the
+<code>.vad-trimmed.wav</code> / <code>.vad-empty.wav</code> files
+written by the silero-vad pre-pass it ran; the MiMo and Qwen3-ASR
+routines (<code>providers/mimo_asr.py</code>,
+<code>providers/qwen3_asr.py</code>) each track their own
+<code>worker_owned_files</code> list and unlink both the VAD output they
+ran internally and the
+<code>mimo-segment-&lt;ts&gt;-&lt;idx&gt;.wav</code> /
+<code>qwen3-segment-&lt;ts&gt;-&lt;idx&gt;.wav</code> chunks their
+(optional) long-audio splitters emitted. The original capture is left
+intact for the caller (the dictation pipeline owns its lifetime via
 <code>keep_audio</code>).</li>
 <li><code>compose</code>, <code>rewrite</code>, and
 <code>translate</code> call the configured OpenAI-compatible chat

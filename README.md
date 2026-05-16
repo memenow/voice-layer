@@ -42,7 +42,7 @@ Shipped today:
 - `vl dictation foreground-ptt` alternate-screen panel with hold-to-record, transcript scrolling, clipboard restore, and tmux / WezTerm / Kitty targets
 - `vl-desktop` GUI overlay that shares the same socket, session state, and event stream as the CLI
 - Real ASR via `whisper.cpp`: one-shot `whisper-cli` plus an optional persistent `whisper-server` endpoint (with autostart) for warm-model reuse
-- Optional silero-vad pre-pass inside the Python worker that trims non-speech before whisper
+- Optional silero-vad pre-pass inside the Python worker that trims non-speech before every transcribe backend (whisper.cpp, MiMo-V2.5-ASR, Qwen3-ASR-1.7B)
 - Optional Xiaomi MiMo-V2.5-ASR backend (CUDA-only, opt-in via `provider_id`) for multilingual and quality-priority transcription, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id mimo_v2_5_asr`, `vl record-transcribe --provider-id ...`, `vl dictation foreground-ptt --provider-id ...`); see [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md)
 - Optional Alibaba Qwen3-ASR-1.7B backend (Apache-2.0, GPU recommended, opt-in via `provider_id`) for 30-language transcription including Mandarin and Cantonese, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id qwen3_asr_1_7b`, ...); see [docs/guides/local-asr-provider.md](docs/guides/local-asr-provider.md)
 - Real LLM integration via OpenAI-compatible chat completions, with optional `llama-server` autostart for local endpoints
