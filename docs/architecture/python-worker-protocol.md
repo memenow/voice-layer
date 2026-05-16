@@ -73,13 +73,18 @@ The worker implements every required method with real providers:
   captures and prevents the causal LMs in MiMo / Qwen3-ASR from
   hallucinating transcripts on detected-silence audio.
   After `transcribe` returns — on success, on whisper / MiMo /
-  Qwen3-ASR failure, and on the no-speech short-circuit — the
-  dispatcher unlinks the per-call sidecar files it produced under
-  `runtime_dir/`: the `.vad-trimmed.wav` / `.vad-empty.wav` written by
-  the silero-vad pre-pass, plus the `mimo-segment-<ts>-<idx>.wav` and
-  `qwen3-segment-<ts>-<idx>.wav` chunks emitted by the (optional)
-  long-audio splitters. The original capture is left intact for the
-  caller (the dictation pipeline owns its lifetime via `keep_audio`).
+  Qwen3-ASR failure, and on the no-speech short-circuit — each
+  transcribe path unlinks the per-call sidecar files it produced under
+  `runtime_dir/` in a `finally` block. The whisper dispatcher
+  (`worker.py`) cleans up the `.vad-trimmed.wav` / `.vad-empty.wav`
+  files written by the silero-vad pre-pass it ran; the MiMo and
+  Qwen3-ASR routines (`providers/mimo_asr.py`,
+  `providers/qwen3_asr.py`) each track their own `worker_owned_files`
+  list and unlink both the VAD output they ran internally and the
+  `mimo-segment-<ts>-<idx>.wav` / `qwen3-segment-<ts>-<idx>.wav` chunks
+  their (optional) long-audio splitters emitted. The original capture
+  is left intact for the caller (the dictation pipeline owns its
+  lifetime via `keep_audio`).
 - `compose`, `rewrite`, and `translate` call the configured OpenAI-compatible chat completion
   endpoint through `providers/llm_openai_compatible.py`, optionally auto-starting `llama-server`
   via `providers/llama_autostart.py` when `VOICELAYER_LLM_AUTO_START=true`.

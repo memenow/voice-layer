@@ -274,15 +274,19 @@ directly against a single WAV.</p>
 <h2 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad
 Pre-pass (Phase 3D)</h2>
 <p>A silero-vad pre-pass can run inside the Python worker before any
-whisper call. When enabled it detects speech regions in the captured
+<code>transcribe</code> call, regardless of which ASR backend the
+request targets. When enabled it detects speech regions in the captured
 WAV, writes a trimmed 16-bit mono WAV containing only the concatenated
-speech spans, and feeds that file to the configured whisper provider.
-The pre-pass applies uniformly to all transcribe-bearing endpoints —
-live dictation (one-shot and segmented),
+speech spans, and feeds that file to the selected provider (whisper.cpp,
+MiMo-V2.5-ASR, or Qwen3-ASR-1.7B). The pre-pass applies uniformly to all
+transcribe-bearing endpoints — live dictation (one-shot and segmented),
 <code>POST /v1/dictation/capture</code>, and
 <code>POST /v1/transcriptions</code> — because the VAD layer sits inside
 the <code>transcribe</code> JSON-RPC call and is invisible to the daemon
-and to the OpenAPI contract.</p>
+and to the OpenAPI contract. The whisper path runs VAD in the dispatcher
+(<code>worker.py</code>) before whisper inference; the MiMo and
+Qwen3-ASR paths run the same VAD inside each provider so the trimmed WAV
+is the input the GPU backend actually sees.</p>
 <p>The pre-pass is gated on
 <code>VOICELAYER_WHISPER_VAD_ENABLED=true</code> plus a valid
 <code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code> pointing at a silero-vad
