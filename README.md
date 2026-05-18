@@ -29,7 +29,9 @@ VoiceLayer is not designed as:
 - `python/voicelayer_orchestrator`: JSON-RPC worker protocol and provider orchestration entry point
 - `systemd/`: user-service templates for the daemon and the optional persistent `whisper-server`
 - `scripts/install.sh`: one-shot installer that builds release binaries and seeds `~/.local/bin/`, `~/.config/systemd/user/`, and `~/.config/voicelayer/`
-- `docs/`: architecture, host strategy, and operations documentation. HTML pages are the authoritative docs format; open [`docs/index.html`](docs/index.html) for the navigation-friendly entry point.
+- `docs/`: architecture, host strategy, and operations documentation. HTML pages are the authoritative docs format; open [`docs/index.html`](docs/index.html) for the navigation-friendly entry point. The site is organized into:
+    - Architecture references — [`docs/architecture/overview.html`](docs/architecture/overview.html) (runtime topology, recorder backends, dictation segmentation), [`docs/architecture/python-worker-protocol.html`](docs/architecture/python-worker-protocol.html) (JSON-RPC methods, persistent worker semantics, provider routing), and [`docs/architecture/host-injection-strategy.html`](docs/architecture/host-injection-strategy.html) (AT-SPI / clipboard / keyboard simulation priority).
+    - Operator guides — [`docs/guides/development.html`](docs/guides/development.html) (repository layout and verification chain), [`docs/guides/systemd.html`](docs/guides/systemd.html) (`scripts/install.sh`, user units, env file), [`docs/guides/local-asr-provider.html`](docs/guides/local-asr-provider.html) (`whisper-cli` / `whisper-server`, silero-vad pre-pass, MiMo-V2.5-ASR, Qwen3-ASR-1.7B), [`docs/guides/local-llm-provider.html`](docs/guides/local-llm-provider.html) (OpenAI-compatible endpoint, optional `llama-server` autostart), and [`docs/guides/desktop.html`](docs/guides/desktop.html) (`vl-desktop` client-side env vars).
 - `openapi/`: local API contract
 
 ## Current Status

@@ -662,6 +662,68 @@ class WorkerProtocolTest(FakeOpenAIServerMixin, unittest.TestCase):
         self.assertEqual(response["error"]["code"], PARSE_ERROR_CODE)
 
 
+class WorkerServeLifecycleTest(unittest.TestCase):
+    """Pin the stdio loop's lifecycle so the Rust daemon's persistent
+    worker mode never blocks on a closed stdin or crashes on a single
+    malformed line.
+    """
+
+    def test_serve_exits_on_stdin_eof(self) -> None:
+        # An empty stdin must let :func:`serve` walk the for-loop to
+        # completion and return ``0`` so the daemon's reaper sees a
+        # clean shutdown rather than a stuck worker.
+        stdin = io.StringIO("")
+        stdout = io.StringIO()
+
+        exit_code = serve(stdin, stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_serve_skips_blank_lines(self) -> None:
+        # Operators sometimes send a heartbeat newline; the loop must
+        # treat it as a no-op and stay open for the next real request.
+        stdin = io.StringIO("\n\n")
+        stdout = io.StringIO()
+
+        exit_code = serve(stdin, stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_serve_handles_invalid_json_line(self) -> None:
+        # A single unparseable line must surface as a -32700 envelope
+        # without aborting the loop. The line below is JSON-syntactically
+        # broken (missing quotes); the loop then hits EOF and returns 0.
+        stdin = io.StringIO("{not json\n")
+        stdout = io.StringIO()
+
+        exit_code = serve(stdin, stdout)
+
+        self.assertEqual(exit_code, 0)
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual(envelope["error"]["code"], PARSE_ERROR_CODE)
+        # Parse errors cannot recover the caller id, so the envelope
+        # carries id=null per JSON-RPC 2.0.
+        self.assertIsNone(envelope["id"])
+
+    def test_serve_dispatches_valid_request_and_writes_response(self) -> None:
+        # End-to-end pin: a well-formed ``list_providers`` request must
+        # land on :func:`handle_request` and the response must be a
+        # single JSON line terminated with ``\n``.
+        stdin = io.StringIO('{"jsonrpc": "2.0", "id": 1, "method": "list_providers"}\n')
+        stdout = io.StringIO()
+
+        exit_code = serve(stdin, stdout)
+
+        self.assertEqual(exit_code, 0)
+        raw = stdout.getvalue()
+        self.assertTrue(raw.endswith("\n"))
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["id"], 1)
+        self.assertIn("providers", envelope["result"])
+
+
 class FakeWhisperServerHandler(BaseHTTPRequestHandler):
     text_payload = " hello world\n"
     language_payload: str | None = "en"

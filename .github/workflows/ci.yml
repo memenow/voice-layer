@@ -13,10 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: verify
+  rust:
+    name: rust
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout source
         uses: actions/checkout@v5
@@ -74,6 +74,13 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
+      # `cargo test --all` exercises the daemon's persistent Python
+      # worker bridge in `voicelayerd::worker` tests, which spawn the
+      # real `python -m voicelayer_orchestrator.worker` (or the mock
+      # JSON-RPC fixture under `crates/voicelayerd/tests/fixtures/`)
+      # via `uv run`. The job therefore needs uv + Python 3.12 +
+      # the synced dev env on PATH, otherwise the worker tests fail
+      # with `Io(NotFound)` even though every other rust test passes.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -94,6 +101,25 @@ jobs:
       - name: cargo test --all
         run: cargo test --all
 
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Sync Python dev environment
+        run: uv sync --group dev
+
       - name: uv run ruff check python tests/python
         run: uv run ruff check python tests/python
 
@@ -102,3 +128,75 @@ jobs:
 
       - name: uv run pytest -q tests/python
         run: uv run pytest -q tests/python
+
+  shell-lint:
+    name: shell-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh
+
+  openapi-lint:
+    name: openapi-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # `redocly.yaml` extends Redocly's `minimal` ruleset and
+      # disables checks that assume a public HTTP API: `voicelayerd`
+      # serves over a Unix domain socket with socket-permission
+      # access control, so transport-level `security:` blocks
+      # would advertise an authentication scheme that does not
+      # exist.
+      - name: redocly lint openapi/voicelayerd.v1.yaml
+        run: npx -y @redocly/cli@1.34.2 lint --config redocly.yaml openapi/voicelayerd.v1.yaml
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Audit gates on real safety findings. Vulnerabilities are
+      # fatal by default (cargo-audit exits non-zero whenever the
+      # advisory DB lists an active CVE for any compiled crate);
+      # `--deny unsound` lifts soundness advisories to the same
+      # bar. Maintenance-status warnings (unmaintained, yanked,
+      # notice) are not auto-failed because VoiceLayer pulls a
+      # number of GUI / GPU crates transitively and has no
+      # upstream path to retire every unmaintained macro crate the
+      # moment RustSec flags it. Such warnings are logged for the
+      # maintainer to triage; the explicit allow-list with
+      # justification lives in `audit.toml`.
+      - name: cargo audit --deny unsound
+        run: cargo audit --deny unsound

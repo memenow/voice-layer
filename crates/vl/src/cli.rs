@@ -35,29 +35,37 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage the long-running VoiceLayer daemon (start, supervise).
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Inspect and edit the operator-local VoiceLayer config file.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Drive dictation sessions: start, stop, foreground-PTT, list.
     Dictation {
         #[command(subcommand)]
         command: DictationCommand,
     },
+    /// Probe desktop hotkey integration (global shortcuts portal).
     Hotkeys {
         #[command(subcommand)]
         command: HotkeysCommand,
     },
+    /// Print runtime diagnostics: socket, providers, recorder, env.
     Doctor,
+    /// List host adapters and worker provider descriptors as JSON.
     Providers,
+    /// Emit bracketed-paste-wrapped text for piping into a terminal.
     PrintBracketedPaste {
         text: String,
         #[arg(long, default_value_t = false)]
         auto_submit: bool,
     },
+    /// Record from the microphone and transcribe in a single call.
     RecordTranscribe {
         #[arg(long, default_value_t = 8)]
         duration_seconds: u32,
@@ -75,6 +83,7 @@ enum Command {
         #[arg(long)]
         provider_id: Option<String>,
     },
+    /// Transcribe an existing audio file via the daemon's ASR chain.
     TranscribeFile {
         audio_file: String,
         #[arg(long)]
@@ -86,6 +95,7 @@ enum Command {
         #[arg(long)]
         provider_id: Option<String>,
     },
+    /// Generate text previews via compose, rewrite, or translate.
     Preview {
         #[command(subcommand)]
         command: PreviewCommand,
@@ -94,6 +104,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Run the VoiceLayer daemon in the foreground until interrupted.
     Run {
         #[arg(long, env = "VOICELAYER_SOCKET_PATH")]
         socket_path: Option<PathBuf>,
@@ -218,19 +229,25 @@ enum DictationCommand {
 
 #[derive(Debug, Subcommand)]
 enum HotkeysCommand {
+    /// Report the XDG Global Shortcuts portal availability and version.
     PortalStatus,
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Print the resolved path of the VoiceLayer CLI config file.
     Path,
+    /// Show the effective CLI config as JSON.
     Show,
+    /// Write the default CLI config to disk if no file exists yet.
     InitDefaults,
+    /// Set a single dotted-key value in the CLI config file.
     Set { key: String, value: String },
 }
 
 #[derive(Debug, Subcommand)]
 enum PreviewCommand {
+    /// Compose long-form text from a spoken prompt via the LLM worker.
     Compose {
         spoken_prompt: String,
         #[arg(long)]
@@ -238,6 +255,7 @@ enum PreviewCommand {
         #[arg(long)]
         output_language: Option<String>,
     },
+    /// Rewrite existing text under a chosen style (formal, shorter, ...).
     Rewrite {
         source_text: String,
         #[arg(long)]
@@ -245,6 +263,7 @@ enum PreviewCommand {
         #[arg(long)]
         output_language: Option<String>,
     },
+    /// Translate source text into the given target language.
     Translate {
         source_text: String,
         #[arg(long)]
@@ -1497,6 +1516,41 @@ mod tests {
             // request reaching the daemon and surfacing as a 500.
             try_parse(&["vl", "dictation", "stop", "not-a-uuid"])
                 .expect_err("dictation stop must reject a non-UUID session_id at parse time");
+        }
+
+        /// `vl --help` is the binary's discovery surface. Pin the
+        /// top-level about string so a future refactor that strips or
+        /// rewrites the `#[command(about = ...)]` attribute surfaces
+        /// at `cargo test` rather than after operators report a stale
+        /// header.
+        #[test]
+        fn top_level_help_renders_voicelayer_operator_cli_about() {
+            let error = try_parse(&["vl", "--help"])
+                .expect_err("clap exits with DisplayHelp when --help is passed");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("VoiceLayer operator CLI"),
+                "top-level help should advertise the binary; got {rendered}",
+            );
+        }
+
+        /// Duplicate of `fixed_mode_requires_segment_secs` from a
+        /// caller-shape angle: drive the parser through the same
+        /// `Args::try_parse_from` entry point operators hit via
+        /// `main()`'s `Args::parse()`, and pin that the missing-flag
+        /// error message names `--segment-secs` (the user-facing
+        /// remediation) so the `required_if_eq` wiring cannot be
+        /// quietly dropped.
+        #[test]
+        fn start_fixed_mode_error_message_names_segment_secs_flag() {
+            let result: Result<Args, clap::Error> =
+                Args::try_parse_from(["vl", "dictation", "start", "--mode", "fixed"]);
+            let error = result.expect_err("fixed mode without --segment-secs must error");
+            assert!(
+                error.to_string().contains("--segment-secs"),
+                "missing-required error must name --segment-secs; got {error}",
+            );
         }
     }
 

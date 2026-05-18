@@ -120,7 +120,14 @@ def _apply_vad_prepass_if_configured(
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
-    """Handle a single JSON-RPC request."""
+    """Dispatch a single JSON-RPC request to the matching worker handler.
+
+    Routes ``method`` to ``health``, ``list_providers``, ``transcribe``,
+    ``segment_probe``, ``stitch_wav_segments``, ``compose``, ``rewrite``,
+    or ``translate``, and returns a JSON-RPC envelope built by
+    :func:`make_result` or :func:`make_error`. Unknown methods surface as
+    ``METHOD_NOT_FOUND``; malformed envelopes as ``INVALID_REQUEST``.
+    """
 
     if request.get("jsonrpc") != JSONRPC_VERSION or "method" not in request:
         return make_error(None, INVALID_REQUEST_CODE, "Invalid JSON-RPC request.")
@@ -479,7 +486,14 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def serve(stdin: TextIO, stdout: TextIO) -> int:
-    """Serve JSON-RPC requests over stdio."""
+    """Run the stdio JSON-RPC loop until ``stdin`` reaches EOF.
+
+    Each iteration reads one newline-delimited request, dispatches it via
+    :func:`handle_request`, and writes the response back as a single
+    JSON line followed by ``\\n``. Unparseable input is reported as
+    ``PARSE_ERROR_CODE``; blank lines are skipped. Returns the worker's
+    exit code (``0`` on a clean EOF shutdown).
+    """
 
     for raw_line in stdin:
         line = raw_line.strip()
@@ -501,7 +515,12 @@ def serve(stdin: TextIO, stdout: TextIO) -> int:
 
 
 def main() -> int:
-    """Program entry point."""
+    """Program entry point for the persistent stdio worker.
+
+    Binds :func:`serve` to the process-wide ``sys.stdin`` and
+    ``sys.stdout`` so the Rust daemon's worker mode can drive it as a
+    long-running child via line-delimited JSON-RPC.
+    """
 
     return serve(sys.stdin, sys.stdout)
 

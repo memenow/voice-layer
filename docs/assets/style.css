@@ -275,3 +275,46 @@ footer.vl-footer {
   color: var(--vl-muted);
   margin: 0 0 0.5rem;
 }
+
+/*
+ * Accessibility skip link. Hidden until keyboard focus; then surfaces in
+ * the top-left so keyboard and screen-reader users can bypass the header
+ * nav. Used by every standalone page under docs/.
+ */
+.vl-skip-link {
+  position: absolute;
+  left: -10000px;
+  top: auto;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.vl-skip-link:focus {
+  position: fixed;
+  left: 1rem;
+  top: 1rem;
+  width: auto;
+  height: auto;
+  padding: 0.5rem 0.75rem;
+  background: var(--vl-surface);
+  color: var(--vl-fg);
+  border: 1px solid var(--vl-rule);
+  border-radius: var(--vl-radius);
+  z-index: 100;
+  text-decoration: none;
+  font-size: 0.95rem;
+  outline: 2px solid var(--vl-accent);
+}
+
+/*
+ * Current-page indicator inside the header nav. Pages set
+ * aria-current="page" on the link that matches their location so the
+ * active section stands out without an extra wrapper.
+ */
+header.vl-header nav a[aria-current="page"] {
+  color: var(--vl-fg);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 0.25em;
+}

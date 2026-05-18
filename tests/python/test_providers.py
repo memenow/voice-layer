@@ -355,5 +355,65 @@ class SupportedProvidersTest(unittest.TestCase):
         self.assertEqual(whisper["transport"], "stdio_worker")
 
 
+class SupportedProvidersCatalogBoundariesTest(unittest.TestCase):
+    """Pin structural invariants of the catalog returned by
+    :func:`supported_providers`. The catalog is a literal list rather
+    than a register API, so the invariants below guard against drift
+    introduced by future literal edits (duplicate id, dropped key,
+    typo'd kind).
+    """
+
+    REQUIRED_KEYS = frozenset(
+        {
+            "id",
+            "kind",
+            "transport",
+            "local",
+            "default_enabled",
+            "experimental",
+            "license",
+        }
+    )
+    ALLOWED_KINDS = frozenset({"asr", "llm"})
+
+    def test_catalog_has_no_duplicate_ids(self) -> None:
+        # A duplicate id would shadow earlier descriptors in any caller
+        # that builds a dict by id (``vl providers`` does this); pin so
+        # an accidental copy-paste in the literal surface immediately.
+        catalog = supported_providers({"_test_marker": "1"})
+        ids = [entry["id"] for entry in catalog]
+        self.assertEqual(len(ids), len(set(ids)), msg=f"duplicate provider ids in {ids!r}")
+
+    def test_every_descriptor_has_required_keys_and_valid_kind(self) -> None:
+        # The Rust catalog consumer reads each of these keys; a missing
+        # key would surface as a deserialization error far from the
+        # source change. Verify the contract here at the boundary.
+        catalog = supported_providers({"_test_marker": "1"})
+        for entry in catalog:
+            with self.subTest(provider_id=entry.get("id")):
+                missing = self.REQUIRED_KEYS - entry.keys()
+                self.assertFalse(missing, msg=f"missing keys: {missing!r}")
+                self.assertIn(entry["kind"], self.ALLOWED_KINDS)
+                self.assertIsInstance(entry["local"], bool)
+                self.assertIsInstance(entry["default_enabled"], bool)
+                self.assertIsInstance(entry["experimental"], bool)
+
+    def test_configured_llm_replaces_default_without_introducing_duplicates(self) -> None:
+        # When the operator wires a real LLM endpoint, the configured
+        # descriptor must take the slot of ``gemma_4_local`` rather than
+        # appending alongside it — otherwise the catalog would briefly
+        # have two ``kind=llm`` entries with conflicting transports.
+        catalog = supported_providers(
+            {
+                "VOICELAYER_LLM_ENDPOINT": "http://127.0.0.1:8080/v1",
+                "VOICELAYER_LLM_MODEL": "gpt-oss-20b",
+            }
+        )
+        ids = [entry["id"] for entry in catalog]
+        self.assertEqual(len(ids), len(set(ids)))
+        llm_entries = [entry for entry in catalog if entry["kind"] == "llm"]
+        self.assertEqual(len(llm_entries), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

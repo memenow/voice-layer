@@ -1,3 +1,7 @@
+//! Thin entry point for the `voicelayerd` binary; the daemon's real
+//! lifecycle lives in [`voicelayerd::run_daemon`] inside the library
+//! crate so integration tests can drive it without a process boundary.
+
 use std::path::PathBuf;
 
 use clap::Parser;
