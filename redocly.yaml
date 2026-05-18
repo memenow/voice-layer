@@ -1,0 +1,40 @@
+# Redocly CLI configuration for VoiceLayer's local control API.
+#
+# `voicelayerd` serves its `/v1` HTTP control surface over a Unix
+# domain socket bound to `$XDG_RUNTIME_DIR/voicelayer/daemon.sock`.
+# There is no remote attack surface and no transport-level auth:
+# socket file permissions are the access boundary, exactly the way
+# `docker.sock` or `systemd` user sockets work. Redocly's default
+# "recommended" ruleset assumes a public HTTP API and gates on
+# transport-security and example-server rules that do not apply
+# here.
+#
+# We lift the closest baseline (`minimal`) and only re-enable the
+# rules whose findings VoiceLayer can act on without lying about
+# its threat model. Adjust this file when adding a new endpoint
+# pattern; do not silence individual findings in CI.
+
+extends:
+  - minimal
+
+rules:
+  # Every operation needs a 4XX response so client SDKs know how
+  # the daemon reports validation or busy-session errors.
+  operation-4xx-response: warn
+
+  # The spec already carries `info.license` via the OpenAPI document.
+  info-license: warn
+  info-license-url: off
+
+  # `voicelayerd` has no transport-level authentication. The socket
+  # file mode is the access boundary. Forcing a `security:` block
+  # would advertise an authentication scheme that does not exist.
+  security-defined: off
+
+  # The single declared server is `http://localhost`, which is a
+  # placeholder for "served over a Unix domain socket". It is not
+  # an example.com leak.
+  no-server-example.com: off
+
+  # Operation summary length, server-variable defaults, and tag
+  # consistency are useful — keep the minimal defaults.
