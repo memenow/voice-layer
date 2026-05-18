@@ -22,7 +22,10 @@ rules:
   # the daemon reports validation or busy-session errors.
   operation-4xx-response: warn
 
-  # The spec already carries `info.license` via the OpenAPI document.
+  # The spec declares `info.license` (Apache-2.0). The corresponding
+  # `info.license.url` is intentionally omitted: SPDX-identifier
+  # licenses are looked up by `license.identifier`, not by URL, and
+  # adding a URL would shadow the SPDX field.
   info-license: warn
   info-license-url: off
 

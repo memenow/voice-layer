@@ -3,9 +3,11 @@
 #
 # Scope: this file only governs warnings that have no upstream fix
 # path from VoiceLayer's direct dependencies. Vulnerabilities and
-# unsoundness advisories are NEVER ignored here — CI gates on them
-# unconditionally via `cargo audit --deny vulnerabilities
-# --deny unsound`.
+# unsoundness advisories are NEVER ignored here. `cargo audit`
+# exits non-zero on any vulnerability by default; CI lifts soundness
+# advisories to the same bar with `cargo audit --deny unsound`. The
+# `--deny` flag does not accept a `vulnerabilities` kind because
+# vulnerabilities are already fatal without it.
 
 [advisories]
 # Advisories listed here surface as warnings in the audit output but
