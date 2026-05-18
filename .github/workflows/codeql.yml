@@ -31,7 +31,7 @@ jobs:
         language: [rust, python]
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install system dependencies for Rust build graph
         if: matrix.language == 'rust'
