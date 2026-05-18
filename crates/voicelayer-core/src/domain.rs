@@ -4,9 +4,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Control sequence that opens a terminal bracketed-paste span so the
+/// receiving shell treats the wrapped bytes as inert text.
 pub const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+/// Companion to [`BRACKETED_PASTE_START`] that closes the bracketed-paste
+/// span and returns the shell to its normal input mode.
 pub const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
+/// Top-level workflow a [`CaptureSession`] is running, used to route the
+/// captured audio or text through the matching provider chain.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
@@ -16,6 +22,9 @@ pub enum SessionMode {
     Translate,
 }
 
+/// Lifecycle state of a [`CaptureSession`] inside the daemon. The
+/// terminal variants (`Completed`, `Failed`) are sticky so clients can
+/// poll session history after the orchestrator has moved on.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
@@ -28,6 +37,9 @@ pub enum SessionState {
     Failed,
 }
 
+/// How the user initiated a [`CaptureSession`]. Diagnostics and event
+/// payloads carry this so we can attribute usage and tune defaults per
+/// entry point.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerKind {
@@ -38,6 +50,8 @@ pub enum TriggerKind {
     TrayButton,
 }
 
+/// Strategy the ASR pipeline applies when picking the recognition
+/// language for a session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LanguageStrategy {
@@ -47,6 +61,8 @@ pub enum LanguageStrategy {
     Bilingual,
 }
 
+/// Language preferences attached to a [`CaptureSession`]; the daemon
+/// resolves them against provider capabilities before each transcription.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LanguageProfile {
     pub strategy: LanguageStrategy,
@@ -70,6 +86,9 @@ impl Default for LanguageProfile {
     }
 }
 
+/// Snapshot of a single capture lifecycle (one user-initiated dictation
+/// or composition). Flows from the daemon to clients over `/v1` and via
+/// SSE events; identified by `session_id` for the life of the process.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureSession {
     pub session_id: Uuid,
@@ -93,6 +112,8 @@ impl CaptureSession {
     }
 }
 
+/// One emitted ASR segment streamed back to clients during a session.
+/// `is_final` distinguishes partial hypotheses from the locked-in text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscriptChunk {
     pub session_id: Uuid,
@@ -102,6 +123,8 @@ pub struct TranscriptChunk {
     pub confidence_basis_points: Option<u16>,
 }
 
+/// Preset composition genre selectable in `compose` requests. Drives the
+/// system prompt template the LLM worker reaches for; `Custom` opts out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompositionArchetype {
@@ -115,6 +138,8 @@ pub enum CompositionArchetype {
     Custom,
 }
 
+/// Body of `POST /v1/dictation/start`. Begins a long-running capture and
+/// returns a [`CaptureSession`] the client uses to drive `stop` later.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartDictationRequest {
     pub trigger: TriggerKind,
@@ -137,6 +162,9 @@ pub struct StartDictationRequest {
     pub provider_id: Option<String>,
 }
 
+/// Audio capture backend preference. `Auto` lets the daemon pick the
+/// first reachable subsystem; the explicit variants override that
+/// probing for deterministic CI and operator overrides.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecorderBackend {
@@ -185,6 +213,9 @@ fn default_silence_gap_probes() -> u32 {
     1
 }
 
+/// Body of `POST /v1/dictation/capture`: a single fixed-duration record-
+/// and-transcribe roundtrip that replies with the final transcript in
+/// one response instead of leaving a session running.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DictationCaptureRequest {
     pub trigger: TriggerKind,
@@ -204,6 +235,9 @@ pub struct DictationCaptureRequest {
     pub provider_id: Option<String>,
 }
 
+/// Classification a [`DictationCaptureResult`] carries when a capture
+/// completes in a degraded state; clients use it to pick the right
+/// retry path (recorder vs ASR vs injection).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DictationFailureKind {
@@ -216,6 +250,9 @@ pub enum DictationFailureKind {
     InjectionFailed,
 }
 
+/// Reply for one-shot capture and the final body emitted when a long
+/// session stops. Carries the session snapshot, the transcript, the
+/// retained audio path (if any), and an optional failure classification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DictationCaptureResult {
     pub session: CaptureSession,
@@ -225,11 +262,16 @@ pub struct DictationCaptureResult {
     pub failure_kind: Option<DictationFailureKind>,
 }
 
+/// Body of `POST /v1/dictation/stop`. Targets a single in-flight
+/// session by id so the orchestrator can finalize and respond.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StopDictationRequest {
     pub session_id: Uuid,
 }
 
+/// Body of `POST /v1/compose`: ask the LLM worker to draft long-form
+/// text from a spoken prompt, optionally constrained to an archetype
+/// and an output language.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ComposeRequest {
     pub spoken_prompt: String,
@@ -239,6 +281,7 @@ pub struct ComposeRequest {
     pub output_language: Option<String>,
 }
 
+/// Direction the rewrite worker should push the source text in.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RewriteStyle {
@@ -249,6 +292,8 @@ pub enum RewriteStyle {
     Translate,
 }
 
+/// Body of `POST /v1/rewrite`: transform existing prose under a
+/// chosen [`RewriteStyle`] without re-running ASR.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RewriteRequest {
     pub source_text: String,
@@ -257,12 +302,16 @@ pub struct RewriteRequest {
     pub output_language: Option<String>,
 }
 
+/// Body of `POST /v1/translate`: convert `source_text` into
+/// `target_language` via the configured LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranslateRequest {
     pub source_text: String,
     pub target_language: String,
 }
 
+/// Body of `POST /v1/transcribe`: stateless ASR over an existing audio
+/// file on disk. Used by `vl transcribe-file` and one-shot capture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscribeRequest {
     pub audio_file: String,
@@ -274,6 +323,9 @@ pub struct TranscribeRequest {
     pub provider_id: Option<String>,
 }
 
+/// Worker-side reply for any transcription request. `notes` carries
+/// provider diagnostics (fallbacks, truncations) for the operator;
+/// callers should surface them rather than swallow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscriptionResult {
     pub text: String,
@@ -281,6 +333,8 @@ pub struct TranscriptionResult {
     pub notes: Vec<String>,
 }
 
+/// Whether a [`PreviewArtifact`] is ready for the user, blocked on
+/// missing provider configuration, or rejected by the worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewStatus {
@@ -289,6 +343,9 @@ pub enum PreviewStatus {
     Rejected,
 }
 
+/// Preview surface for composed, rewritten, or translated text. Flows
+/// from the daemon into the CLI/GUI/desktop layers so the user can
+/// review before any injection happens.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreviewArtifact {
     pub artifact_id: Uuid,
@@ -320,6 +377,8 @@ impl PreviewArtifact {
     }
 }
 
+/// Daemon reply that pairs a generated [`PreviewArtifact`] with the
+/// `job_id` clients use to correlate retries and emit follow-up events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompositionReceipt {
     pub job_id: Uuid,
@@ -335,6 +394,9 @@ impl CompositionReceipt {
     }
 }
 
+/// Surface the daemon should push text into. Selects the host adapter
+/// stack (AT-SPI vs clipboard vs terminal escape sequences) the client
+/// will hand the resulting [`InjectionPlan`] to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectTarget {
@@ -344,6 +406,9 @@ pub enum InjectTarget {
     TerminalKittyRemote,
 }
 
+/// Body of `POST /v1/inject/plan`: ask the daemon to translate text plus
+/// a target surface into a concrete [`InjectionPlan`] for the host
+/// adapter, including any escape-sequence wrapping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InjectRequest {
     pub target: InjectTarget,
@@ -352,6 +417,9 @@ pub struct InjectRequest {
     pub auto_submit: bool,
 }
 
+/// Host-ready injection payload returned to clients. `payload` already
+/// embeds any terminal hints (bracketed paste, trailing newline) so the
+/// caller can hand it to the adapter verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InjectionPlan {
     pub target: InjectTarget,
@@ -413,6 +481,9 @@ pub struct StitchWavSegmentsResult {
     pub duration_secs: f32,
 }
 
+/// Reply for `GET /v1/healthz`. Pairs the daemon's own status with a
+/// summary of the Python worker so operators can probe both layers in
+/// one round trip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse {
     pub status: String,
@@ -421,6 +492,9 @@ pub struct HealthResponse {
     pub worker: WorkerHealthSummary,
 }
 
+/// Worker-side readiness report embedded in [`HealthResponse`]. Captures
+/// every configurable provider (whisper, MiMo, Qwen3, LLM) plus host
+/// affordances such as the global shortcuts portal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerHealthSummary {
     pub status: String,
@@ -484,6 +558,9 @@ pub struct WorkerHealthSummary {
     pub message: Option<String>,
 }
 
+/// One SSE payload published on the daemon's event stream. Carries a
+/// loosely-typed `event_type` plus enough context (`session_id`,
+/// `message`, timestamp) for clients to reconstruct lifecycle order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventEnvelope {
     pub event_type: String,
@@ -507,12 +584,18 @@ impl EventEnvelope {
     }
 }
 
+/// Error variants the daemon and host adapters can surface to clients
+/// over the wire. Kept small and stable so OpenAPI error codes do not
+/// churn between releases.
 #[derive(Debug, Error)]
 pub enum VoiceLayerError {
     #[error("injection target is not supported")]
     UnsupportedInjectionTarget,
 }
 
+/// Unix epoch milliseconds, used as the cross-node sort key on
+/// `created_at_millis` fields. Falls back to `0` on the unreachable
+/// pre-epoch branch so callers never have to panic-handle a clock skew.
 pub fn now_epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1965,13 +2048,21 @@ mod tests {
     }
 
     /// Walk `.github/workflows/ci.yml` and pull the `run:` line of
-    /// every step in the `verify` job that invokes `cargo` or
-    /// `uv run`. The match is intentionally narrow — it ignores
-    /// `name:`, `uses:`, the `apt-get` install step, and any other
-    /// scaffolding — so the resulting list is exactly the
-    /// verification chain CI gates merges on. The order is preserved
-    /// from file order, mirroring the verification chain's order in
+    /// every step that participates in the verification chain
+    /// (`cargo fmt`, `cargo clippy`, `cargo test`, and `uv run ...`).
+    /// The match is intentionally narrow — it ignores `name:`,
+    /// `uses:`, the `apt-get` install step, the `uv sync` setup
+    /// step, and supplementary security / lint jobs (`cargo install
+    /// cargo-audit`, `cargo audit`, `shellcheck`, `npx redocly` and
+    /// friends) — so the resulting list is exactly the chain CI
+    /// gates merges on, in the same form as `CLAUDE.md`. The order
+    /// is preserved from file order, mirroring the chain's order in
     /// `CLAUDE.md`.
+    ///
+    /// CI may host the chain in a single job or split it across
+    /// jobs (e.g. one for `cargo *`, one for `uv run *`); both
+    /// shapes are accepted because the comparison is order-preserving
+    /// across the whole file, not per-job.
     fn extract_ci_verify_run_commands(contents: &str) -> Vec<String> {
         let mut commands = Vec::new();
         for line in contents.lines() {
@@ -1980,7 +2071,12 @@ mod tests {
                 continue;
             };
             let cmd = rest.trim();
-            if cmd.starts_with("cargo ") || cmd.starts_with("uv run ") {
+            if cmd.starts_with("cargo fmt ")
+                || cmd.starts_with("cargo clippy ")
+                || cmd.starts_with("cargo test ")
+                || cmd == "cargo test"
+                || cmd.starts_with("uv run ")
+            {
                 commands.push(cmd.to_owned());
             }
         }
@@ -4643,24 +4739,48 @@ More prose.
     fn extract_ci_verify_run_commands_filters_to_cargo_and_uv_invocations() {
         let yaml = "\
 jobs:
-  verify:
+  rust:
     steps:
       - name: Install deps
         run: apt-get install -y foo
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
       - name: cargo test
         run: cargo test --all
+  python:
+    steps:
+      - name: Sync env
+        run: uv sync --group dev
       - name: ruff
         run: uv run ruff check python
+  audit:
+    steps:
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit -D warnings
+  shell-lint:
+    steps:
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+  openapi-lint:
+    steps:
+      - name: redocly
+        run: npx -y @redocly/cli@1.34.2 lint openapi/voicelayerd.v1.yaml
 ";
         let commands = extract_ci_verify_run_commands(yaml);
         assert_eq!(
             commands,
             vec![
+                "cargo fmt --all -- --check".to_owned(),
                 "cargo test --all".to_owned(),
                 "uv run ruff check python".to_owned(),
             ],
+            "supplementary CI jobs (cargo install / cargo audit / shellcheck / \
+             redocly) and the `uv sync` setup step must not surface as part of \
+             the verification chain; only fmt/clippy/test and `uv run *` count",
         );
     }
 
@@ -4732,16 +4852,26 @@ jobs:
     /// `CLAUDE.md` documents the verification chain that contributors
     /// (and Claude) must run before closing a task; `.github/workflows/ci.yml`
     /// must run the same chain so CI mirrors local-pass discipline. A
-    /// step added to one without the other is the failure mode: a
-    /// contributor follows `CLAUDE.md`, sees green locally, but CI
-    /// either skips a check (and lets the regression in) or runs an
-    /// extra check that the doc never mentions (and blocks an honest
-    /// PR with a surprise red).
+    /// chain step added to one without the other is the failure mode:
+    /// a contributor follows `CLAUDE.md`, sees green locally, but CI
+    /// skips a check (and lets the regression in), or CI gates on a
+    /// check the doc never mentions (and blocks an honest PR with a
+    /// surprise red).
     ///
-    /// The single allowance: `cargo fmt --all` in `CLAUDE.md`
-    /// (write-mode) maps to `cargo fmt --all -- --check` in CI
-    /// (read-only). Both run the same formatter; only CI needs to
-    /// fail rather than rewrite. `normalise_fmt_command` collapses
+    /// Scope of the comparison is the verification chain only —
+    /// `cargo fmt`, `cargo clippy`, `cargo test`, and `uv run …`.
+    /// `extract_ci_verify_run_commands` deliberately ignores
+    /// supplementary CI jobs that have no `CLAUDE.md` counterpart
+    /// (cargo-audit, shellcheck, OpenAPI lint, CodeQL): those are
+    /// release-gates layered on top of the local-pass chain, not
+    /// part of it, and forcing them into `CLAUDE.md` would mislead
+    /// contributors into running tools they do not need on every
+    /// task. The `uv sync` setup step is likewise excluded.
+    ///
+    /// The single allowance inside the chain: `cargo fmt --all` in
+    /// `CLAUDE.md` (write-mode) maps to `cargo fmt --all -- --check`
+    /// in CI (read-only). Both run the same formatter; only CI needs
+    /// to fail rather than rewrite. `normalise_fmt_command` collapses
     /// the two onto a single canonical form before comparison.
     #[test]
     fn ci_verify_chain_matches_claude_md_verification_chain() {
@@ -5570,5 +5700,73 @@ pub struct GenericThing<T> { _phantom: std::marker::PhantomData<T> }
              Either rename the doc reference to match the current code, \
              promote the type to `pub`, or drop the mention.",
         );
+    }
+
+    /// A freshly-built session must start in `Listening`, carry a
+    /// non-nil UUIDv4, and round-trip through serde without losing
+    /// state. Pins the constructor's invariants so callers can rely
+    /// on the wire shape that `/v1/dictation/start` returns.
+    #[test]
+    fn capture_session_new_starts_in_listening_state_with_nonzero_clock() {
+        let session = CaptureSession::new(
+            SessionMode::Dictation,
+            TriggerKind::Cli,
+            LanguageProfile::default(),
+        );
+
+        assert_eq!(session.state, SessionState::Listening);
+        assert_eq!(session.mode, SessionMode::Dictation);
+        assert_eq!(session.trigger, TriggerKind::Cli);
+        assert!(
+            session.created_at_millis > 0,
+            "created_at_millis must come from now_epoch_millis(); got 0",
+        );
+        assert_ne!(
+            session.session_id,
+            Uuid::nil(),
+            "constructor must produce a fresh UUIDv4, not the nil UUID",
+        );
+        assert_eq!(
+            session.session_id.get_version_num(),
+            4,
+            "constructor must mint UUIDv4 so ids are unguessable across sessions",
+        );
+
+        let encoded = serde_json::to_string(&session).expect("serialise CaptureSession");
+        let decoded: CaptureSession =
+            serde_json::from_str(&encoded).expect("deserialise CaptureSession");
+        assert_eq!(decoded, session);
+    }
+
+    /// Two consecutive `now_epoch_millis()` calls must be monotonic
+    /// non-decreasing — anything else would break `created_at_millis`
+    /// ordering across sessions on a single host.
+    #[test]
+    fn now_epoch_millis_is_monotonic_non_decreasing_between_calls() {
+        let first = super::now_epoch_millis();
+        let second = super::now_epoch_millis();
+        assert!(
+            second >= first,
+            "now_epoch_millis() went backwards: {first} then {second}",
+        );
+        assert!(first > 0, "epoch ms must be a real wall-clock value");
+    }
+
+    /// Every `DictationFailureKind` variant must serialise to
+    /// snake_case on the wire so the openapi enum strings and the
+    /// client SDKs stay aligned with the Rust source of truth.
+    #[test]
+    fn dictation_failure_kind_every_variant_serializes_to_snake_case() {
+        for (variant, expected) in [
+            (DictationFailureKind::RecordingFailed, "recording_failed"),
+            (DictationFailureKind::AsrFailed, "asr_failed"),
+            (DictationFailureKind::InjectionFailed, "injection_failed"),
+        ] {
+            let encoded = serde_json::to_string(&variant).expect("serialise variant");
+            assert_eq!(encoded, format!("\"{expected}\""));
+            let decoded: DictationFailureKind =
+                serde_json::from_str(&encoded).expect("round-trip variant");
+            assert_eq!(decoded, variant);
+        }
     }
 }

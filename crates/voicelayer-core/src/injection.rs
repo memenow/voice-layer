@@ -108,4 +108,21 @@ mod tests {
         assert_eq!(clipboard_plan.payload, text);
         assert_eq!(accessible_plan.payload, clipboard_plan.payload);
     }
+
+    /// Empty input under `TerminalBracketedPaste` must still emit the
+    /// open/close bracketed-paste pair so terminals stay in their
+    /// expected paste-mode state even when the user dictation produced
+    /// no text. A future regression that special-cased empty text into
+    /// a bare `""` payload would leave the receiving shell mid-paste.
+    #[test]
+    fn terminal_bracketed_paste_wraps_empty_text_with_both_control_sequences() {
+        let plan = InjectionPlan::from_request(&InjectRequest {
+            target: InjectTarget::TerminalBracketedPaste,
+            text: String::new(),
+            auto_submit: false,
+        });
+
+        assert_eq!(plan.payload, "\u{1b}[200~\u{1b}[201~".to_owned());
+        assert!(!plan.auto_submit);
+    }
 }

@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a capability or improvement for VoiceLayer.
+title: "feat: <short description>"
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        VoiceLayer is a local-first voice composition layer for Ubuntu desktops.
+        Use this form to propose new behavior, new providers, or workflow
+        improvements. Focus on the user-visible outcome and the host context.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - daemon
+        - cli
+        - desktop
+        - worker
+        - docs
+        - build
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What user workflow does this enable or improve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: |
+        Sketch the intended behavior, API surface, or UX. Mention any host
+        constraints (Wayland, AT-SPI, PipeWire, XDG portals) and how the
+        change preserves local-first execution.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Bullet list of observable outcomes that would close this issue.
+      placeholder: |
+        - Daemon exposes ...
+        - CLI accepts ...
+        - Documentation updated under docs/...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Other approaches and why they were rejected.

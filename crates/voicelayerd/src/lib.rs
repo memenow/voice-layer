@@ -1,3 +1,9 @@
+//! Long-running VoiceLayer daemon. Binds an axum router to a local Unix
+//! domain socket, exposes the `/v1` control plane, supervises a single
+//! persistent Python worker for ASR and LLM calls, streams lifecycle
+//! events over SSE, and can be triggered from the desktop via the XDG
+//! Global Shortcuts portal.
+
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -50,6 +56,9 @@ pub use recording::{
 };
 pub use worker::{WorkerCallError, WorkerCommand, WorkerHealthResult, WorkerPreviewPayload};
 
+/// Runtime configuration handed to [`run_daemon`]: where the daemon
+/// binds its UDS, which directory anchors the Python worker, and which
+/// release version operators see in `GET /v1/healthz`.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
@@ -79,6 +88,9 @@ impl DaemonConfig {
     }
 }
 
+/// Resolve the directory the Python worker should run inside. Honours
+/// `VOICELAYER_PROJECT_ROOT`, falls back to the current working
+/// directory, and finally to `.` so the daemon never panics on launch.
 pub fn default_project_root() -> PathBuf {
     env::var_os("VOICELAYER_PROJECT_ROOT")
         .map(PathBuf::from)
@@ -86,6 +98,9 @@ pub fn default_project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Resolve the UDS path the daemon should bind. Prefers
+/// `$XDG_RUNTIME_DIR/voicelayer/daemon.sock`; falls back to the system
+/// temp directory so headless tests and minimal containers still work.
 pub fn default_socket_path() -> PathBuf {
     let base = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)

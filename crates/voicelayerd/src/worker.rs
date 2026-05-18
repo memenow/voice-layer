@@ -1372,6 +1372,29 @@ the bullet list above and must not be captured.
         );
     }
 
+    /// Worker replies with a well-formed JSON-RPC envelope that
+    /// carries `error` instead of `result`. The helper must surface
+    /// the payload as `WorkerCallError::Rpc(JsonRpcError)` so the
+    /// daemon can preserve the worker's diagnostic code and message
+    /// when bubbling failures up to operators.
+    #[tokio::test]
+    async fn worker_call_returns_rpc_error_when_response_carries_jsonrpc_error_payload() {
+        let worker = shell_worker(
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x","error":{"code":-32004,"message":"provider unavailable: stub"}}'"#,
+        );
+        match worker.list_providers().await {
+            Err(WorkerCallError::Rpc(rpc)) => {
+                assert_eq!(rpc.code, -32004);
+                assert!(
+                    rpc.message.contains("provider unavailable"),
+                    "Rpc variant must preserve the worker's message verbatim; got {}",
+                    rpc.message,
+                );
+            }
+            other => panic!("expected Rpc error from worker JSON-RPC error payload; got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn worker_call_returns_timed_out_when_subprocess_never_responds() {
         // Closes the gap left by #29: subprocess consumes stdin then

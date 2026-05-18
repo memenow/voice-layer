@@ -1,34 +1,19 @@
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
-  <title>Host Injection Strategy</title>
-  <style>
-    code{white-space: pre-wrap;}
-    span.smallcaps{font-variant: small-caps;}
-    div.columns{display: flex; gap: min(4vw, 1.5em);}
-    div.column{flex: auto; overflow-x: auto;}
-    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
-    /* The extra [class] is a hack that increases specificity enough to
-       override a similar rule in reveal.js */
-    ul.task-list[class]{list-style: none;}
-    ul.task-list li input[type="checkbox"] {
-      font-size: inherit;
-      width: 0.8em;
-      margin: 0 0.8em 0.2em -1.6em;
-      vertical-align: middle;
-    }
-    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
-  </style>
-  <link rel="stylesheet" href="../assets/style.css" />
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Host Injection Strategy — VoiceLayer Documentation</title>
+<meta name="description" content="GUI and terminal insertion priority for VoiceLayer on Ubuntu GNOME Wayland: AT-SPI first, clipboard second, keyboard simulation last." />
+<link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body>
+<a class="vl-skip-link" href="#main">Skip to main content</a>
 <header class="vl-header">
   <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
   <nav>
     <a href="../index.html">Home</a>
-    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../architecture/overview.html" aria-current="page">Architecture</a>
     <a href="../guides/development.html">Development</a>
     <a href="../guides/systemd.html">Systemd</a>
     <a href="../guides/local-asr-provider.html">ASR providers</a>
@@ -36,37 +21,28 @@
     <a href="../guides/desktop.html">Desktop</a>
   </nav>
 </header>
-<header id="title-block-header">
-<h1 class="title">Host Injection Strategy — VoiceLayer</h1>
-</header>
+
+<main id="main">
+
+<h1 id="host-injection-strategy">Host Injection Strategy</h1>
+
 <nav id="TOC" role="doc-toc">
 <ul>
-<li><a href="#host-injection-strategy"
-id="toc-host-injection-strategy">Host Injection Strategy</a>
+<li><a href="#principles">Principles</a></li>
+<li><a href="#gui-targets">GUI Targets</a>
 <ul>
-<li><a href="#principles" id="toc-principles">Principles</a></li>
-<li><a href="#gui-targets" id="toc-gui-targets">GUI Targets</a>
+<li><a href="#why-at-spi-first">Why AT-SPI First</a></li>
+<li><a href="#why-clipboard-second">Why Clipboard Second</a></li>
+<li><a href="#why-keyboard-simulation-last">Why Keyboard Simulation Last</a></li>
+</ul></li>
+<li><a href="#terminal-and-tui-targets">Terminal and TUI Targets</a>
 <ul>
-<li><a href="#why-at-spi-first" id="toc-why-at-spi-first">Why AT-SPI
-First</a></li>
-<li><a href="#why-clipboard-second" id="toc-why-clipboard-second">Why
-Clipboard Second</a></li>
-<li><a href="#why-keyboard-simulation-last"
-id="toc-why-keyboard-simulation-last">Why Keyboard Simulation
-Last</a></li>
+<li><a href="#default-safety-rule">Default Safety Rule</a></li>
 </ul></li>
-<li><a href="#terminal-and-tui-targets"
-id="toc-terminal-and-tui-targets">Terminal and TUI Targets</a>
-<ul>
-<li><a href="#default-safety-rule" id="toc-default-safety-rule">Default
-Safety Rule</a></li>
-</ul></li>
-<li><a href="#future-adapters" id="toc-future-adapters">Future
-Adapters</a></li>
-</ul></li>
+<li><a href="#future-adapters">Future Adapters</a></li>
 </ul>
 </nav>
-<h1 id="host-injection-strategy">Host Injection Strategy</h1>
+
 <h2 id="principles">Principles</h2>
 <ul>
 <li>Use the least invasive insertion mechanism that preserves
@@ -116,6 +92,9 @@ per-target profile setting.</p>
 <p>Those adapters should compose with the same
 <code>InjectionPlan</code> abstraction instead of creating parallel
 domain models.</p>
+
+</main>
+
 <footer class="vl-footer">
   <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
   <span>Documentation source: HTML files under <code>docs/</code>.</span>

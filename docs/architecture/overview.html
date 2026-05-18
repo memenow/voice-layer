@@ -1,34 +1,19 @@
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
-  <title>Architecture Overview</title>
-  <style>
-    code{white-space: pre-wrap;}
-    span.smallcaps{font-variant: small-caps;}
-    div.columns{display: flex; gap: min(4vw, 1.5em);}
-    div.column{flex: auto; overflow-x: auto;}
-    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
-    /* The extra [class] is a hack that increases specificity enough to
-       override a similar rule in reveal.js */
-    ul.task-list[class]{list-style: none;}
-    ul.task-list li input[type="checkbox"] {
-      font-size: inherit;
-      width: 0.8em;
-      margin: 0 0.8em 0.2em -1.6em;
-      vertical-align: middle;
-    }
-    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
-  </style>
-  <link rel="stylesheet" href="../assets/style.css" />
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Architecture Overview — VoiceLayer Documentation</title>
+<meta name="description" content="Runtime topology, component responsibilities, domain vocabulary, configuration precedence, recorder backends, and dictation segmentation modes." />
+<link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body>
+<a class="vl-skip-link" href="#main">Skip to main content</a>
 <header class="vl-header">
   <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
   <nav>
     <a href="../index.html">Home</a>
-    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../architecture/overview.html" aria-current="page">Architecture</a>
     <a href="../guides/development.html">Development</a>
     <a href="../guides/systemd.html">Systemd</a>
     <a href="../guides/local-asr-provider.html">ASR providers</a>
@@ -36,44 +21,30 @@
     <a href="../guides/desktop.html">Desktop</a>
   </nav>
 </header>
-<header id="title-block-header">
-<h1 class="title">Architecture Overview — VoiceLayer</h1>
-</header>
+
+<main id="main">
+
+<h1 id="architecture-overview">Architecture Overview</h1>
+
 <nav id="TOC" role="doc-toc">
 <ul>
-<li><a href="#architecture-overview"
-id="toc-architecture-overview">Architecture Overview</a>
+<li><a href="#goals">Goals</a></li>
+<li><a href="#runtime-topology">Runtime Topology</a></li>
+<li><a href="#component-responsibilities">Component Responsibilities</a>
 <ul>
-<li><a href="#goals" id="toc-goals">Goals</a></li>
-<li><a href="#runtime-topology" id="toc-runtime-topology">Runtime
-Topology</a></li>
-<li><a href="#component-responsibilities"
-id="toc-component-responsibilities">Component Responsibilities</a>
-<ul>
-<li><a href="#rust" id="toc-rust">Rust</a></li>
-<li><a href="#python" id="toc-python">Python</a></li>
+<li><a href="#rust">Rust</a></li>
+<li><a href="#python">Python</a></li>
 </ul></li>
-<li><a href="#domain-objects" id="toc-domain-objects">Domain
-Objects</a></li>
-<li><a href="#initial-transport-decisions"
-id="toc-initial-transport-decisions">Initial Transport
-Decisions</a></li>
-<li><a href="#configuration-precedence"
-id="toc-configuration-precedence">Configuration Precedence</a></li>
-<li><a href="#recorder-backends" id="toc-recorder-backends">Recorder
-Backends</a></li>
-<li><a href="#dictation-segmentation-phase-3b-3d"
-id="toc-dictation-segmentation-phase-3b-3d">Dictation Segmentation
-(Phase 3B, 3D)</a></li>
-<li><a href="#optional-silero-vad-pre-pass-phase-3d"
-id="toc-optional-silero-vad-pre-pass-phase-3d">Optional silero-vad
-Pre-pass (Phase 3D)</a></li>
-<li><a href="#deferred-work" id="toc-deferred-work">Deferred
-Work</a></li>
-</ul></li>
+<li><a href="#domain-objects">Domain Objects</a></li>
+<li><a href="#initial-transport-decisions">Initial Transport Decisions</a></li>
+<li><a href="#configuration-precedence">Configuration Precedence</a></li>
+<li><a href="#recorder-backends">Recorder Backends</a></li>
+<li><a href="#dictation-segmentation-phase-3b-3d">Dictation Segmentation (Phase 3B, 3D)</a></li>
+<li><a href="#optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</a></li>
+<li><a href="#deferred-work">Deferred Work</a></li>
 </ul>
 </nav>
-<h1 id="architecture-overview">Architecture Overview</h1>
+
 <h2 id="goals">Goals</h2>
 <p>VoiceLayer must support two primary workflows:</p>
 <ul>
@@ -85,7 +56,7 @@ artifact before insertion</li>
 <p>The system must work across GUI applications and terminal/TUI
 surfaces without splitting the domain model.</p>
 <h2 id="runtime-topology">Runtime Topology</h2>
-<pre class="text"><code>+--------+   +--------------+      JSON over UDS      +------------------+
+<pre><code>+--------+   +--------------+      JSON over UDS      +------------------+
 |  vl    |   |  vl-desktop  | &lt;---------------------&gt; | voicelayerd      |
 | (CLI)  |   | (iced GUI)   |                         +------------------+
 +--------+   +--------------+                                  |
@@ -199,8 +170,7 @@ long-running child process and send SIGINT on stop; the audio is then
 handed to the Python worker for transcription via
 <code>whisper-cli</code>. The daemon does not process PCM in process;
 all capture flows through the recorder subprocess to a WAV file.</p>
-<h2 id="dictation-segmentation-phase-3b-3d">Dictation Segmentation
-(Phase 3B, 3D)</h2>
+<h2 id="dictation-segmentation-phase-3b-3d">Dictation Segmentation (Phase 3B, 3D)</h2>
 <p><code>StartDictationRequest</code> carries a
 <code>segmentation</code> field that controls how audio is captured for
 transcription:</p>
@@ -270,8 +240,7 @@ and <code>AsrFailed</code> are populated by the daemon;
 (one-shot bounded duration) or <code>POST /v1/transcriptions</code>
 (file transcription); those continue to use <code>whisper-cli</code>
 directly against a single WAV.</p>
-<h2 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad
-Pre-pass (Phase 3D)</h2>
+<h2 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</h2>
 <p>A silero-vad pre-pass can run inside the Python worker before any
 <code>transcribe</code> call, regardless of which ASR backend the
 request targets. When enabled it detects speech regions in the captured
@@ -318,6 +287,9 @@ user units (one for the daemon, one optional unit for
 <p>The repository already defines the seams for the remaining additions
 so the first implementation does not need to redesign the public
 interfaces.</p>
+
+</main>
+
 <footer class="vl-footer">
   <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu.</span>
   <span>Documentation source: HTML files under <code>docs/</code>.</span>

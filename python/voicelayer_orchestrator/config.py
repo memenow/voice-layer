@@ -180,7 +180,14 @@ class Qwen3AsrConfig:
 def load_llm_provider_config(
     environ: Mapping[str, str] | None = None,
 ) -> OpenAICompatibleConfig | None:
-    """Load an OpenAI-compatible provider configuration from the environment."""
+    """Load an OpenAI-compatible provider configuration from the environment.
+
+    Reads ``VOICELAYER_LLM_ENDPOINT`` and ``VOICELAYER_LLM_MODEL``;
+    optional ``VOICELAYER_LLM_API_KEY`` and
+    ``VOICELAYER_LLM_TIMEOUT_SECONDS`` (default ``60``). Returns ``None``
+    when either of the two required keys is missing so callers treat the
+    LLM workflows as "not configured" without surfacing an error.
+    """
 
     source = environ or os.environ
     endpoint = source.get("VOICELAYER_LLM_ENDPOINT")
@@ -201,7 +208,17 @@ def load_llm_provider_config(
 def load_llama_server_launch_config(
     environ: Mapping[str, str] | None = None,
 ) -> LlamaServerLaunchConfig | None:
-    """Load optional auto-start configuration for `llama-server`."""
+    """Load auto-start configuration for a local ``llama-server``.
+
+    Gated by ``VOICELAYER_LLM_AUTO_START`` (truthy values:
+    ``1``/``true``/``yes``/``on``); returns ``None`` when unset so
+    :func:`ensure_llm_endpoint` skips the launch path. When enabled,
+    reads ``VOICELAYER_LLAMA_SERVER_BIN`` (default ``llama-server``),
+    ``VOICELAYER_LLAMA_MODEL_PATH`` or ``VOICELAYER_LLAMA_HF_REPO``,
+    ``VOICELAYER_LLAMA_SERVER_ARGS``, ``VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS``
+    (default ``45``), and ``VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS``
+    (default ``0.5``).
+    """
 
     source = environ or os.environ
     enabled = source.get("VOICELAYER_LLM_AUTO_START", "").strip().lower()
@@ -221,7 +238,15 @@ def load_llama_server_launch_config(
 def load_whisper_provider_config(
     environ: Mapping[str, str] | None = None,
 ) -> WhisperCppConfig | None:
-    """Load `whisper-cli` configuration from the environment."""
+    """Load ``whisper-cli`` configuration from the environment.
+
+    Requires ``VOICELAYER_WHISPER_MODEL_PATH``; returns ``None`` when
+    unset so callers treat the CLI provider as "not configured". Also
+    reads ``VOICELAYER_WHISPER_BIN`` (default ``whisper-cli``),
+    ``VOICELAYER_WHISPER_TIMEOUT_SECONDS`` (default ``300``),
+    ``VOICELAYER_WHISPER_NO_GPU`` (toggle, default off), and
+    ``VOICELAYER_WHISPER_ARGS`` for extra argv passthrough.
+    """
 
     source = environ or os.environ
     model_path = source.get("VOICELAYER_WHISPER_MODEL_PATH")
@@ -243,9 +268,11 @@ def load_whisper_vad_config(
 ) -> WhisperVadConfig | None:
     """Load silero-vad pre-pass configuration from the environment.
 
-    Returns ``None`` when VAD is not explicitly enabled or the model path is
-    missing. Callers treat a ``None`` config as "no VAD" and fall back to the
-    raw WAV transcribe path.
+    Gated by ``VOICELAYER_WHISPER_VAD_ENABLED`` plus a non-empty
+    ``VOICELAYER_WHISPER_VAD_MODEL_PATH``; returns ``None`` otherwise so
+    callers treat it as "no VAD" and fall back to the raw WAV transcribe
+    path. Optional tuning knobs:
+    ``VOICELAYER_WHISPER_VAD_{THRESHOLD,MIN_SPEECH_MS,MIN_SILENCE_MS,SPEECH_PAD_MS,MAX_SEGMENT_SECS,SAMPLE_RATE}``.
     """
 
     source = environ or os.environ
@@ -271,11 +298,17 @@ def load_whisper_vad_config(
 def load_whisper_server_config(
     environ: Mapping[str, str] | None = None,
 ) -> WhisperServerConfig | None:
-    """Load persistent `whisper-server` configuration from the environment.
+    """Load persistent ``whisper-server`` configuration from the environment.
 
-    Returns None when neither a host/port pair nor an autostart binary is
-    configured, so callers can fall back to the one-shot ``whisper-cli``
-    provider without handling an error.
+    Activates when any of ``VOICELAYER_WHISPER_SERVER_HOST``,
+    ``VOICELAYER_WHISPER_SERVER_PORT``, ``VOICELAYER_WHISPER_SERVER_BIN``,
+    or ``VOICELAYER_WHISPER_SERVER_AUTO_START`` is set; returns ``None``
+    when none are, so callers fall back to the one-shot ``whisper-cli``
+    provider without handling an error. Host defaults to ``127.0.0.1``
+    and port to ``8188`` when only autostart is configured. Reads
+    ``VOICELAYER_WHISPER_MODEL_PATH`` for autostart and the
+    ``VOICELAYER_WHISPER_SERVER_{TIMEOUT_SECONDS,ARGS,LAUNCH_TIMEOUT_SECONDS,POLL_INTERVAL_SECONDS}``
+    tuning knobs.
     """
 
     source = environ or os.environ
@@ -317,9 +350,16 @@ def load_mimo_asr_config(
 ) -> MimoAsrConfig | None:
     """Load Xiaomi MiMo-V2.5-ASR provider configuration from the environment.
 
-    Returns ``None`` when either of the two required model paths is
-    missing so callers can treat the provider as "not configured" the
-    same way they treat whisper without surfacing an error.
+    Requires both ``VOICELAYER_MIMO_MODEL_PATH`` and
+    ``VOICELAYER_MIMO_TOKENIZER_PATH``; returns ``None`` when either is
+    missing so callers treat the provider as "not configured" without
+    surfacing an error. Optional knobs:
+    ``VOICELAYER_MIMO_REPO_PATH`` (parent of upstream ``src/``),
+    ``VOICELAYER_MIMO_DEVICE`` (default ``cuda:0``),
+    ``VOICELAYER_MIMO_AUDIO_TAG``,
+    ``VOICELAYER_MIMO_TIMEOUT_SECONDS`` (default ``600``),
+    ``VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS`` (default ``180``), and
+    ``VOICELAYER_MIMO_ARGS``.
     """
 
     source = environ or os.environ
@@ -353,17 +393,18 @@ def load_qwen3_asr_config(
 ) -> Qwen3AsrConfig | None:
     """Load Qwen3-ASR-1.7B provider configuration from the environment.
 
-    Returns ``None`` when ``VOICELAYER_QWEN3_ASR_MODEL_PATH`` is unset
-    so callers treat the provider as "not configured" the same way they
-    treat MiMo, without surfacing an error. Operators must pre-stage
-    the weights themselves; the loader does not trigger HuggingFace
-    downloads to keep cold-start cost predictable on the local-first
-    runtime path.
-
-    The default ``long_audio_split_seconds=0`` disables client-side
-    splitting because the upstream ``qwen-asr`` wrapper handles long
-    audio internally; operators can opt back into worker-side chunking
-    by setting a positive value.
+    Requires ``VOICELAYER_QWEN3_ASR_MODEL_PATH``; returns ``None`` when
+    unset so callers treat the provider as "not configured" the same way
+    they treat MiMo, without surfacing an error. Operators must
+    pre-stage the weights themselves; the loader does not trigger
+    HuggingFace downloads to keep cold-start cost predictable on the
+    local-first runtime path. Optional knobs:
+    ``VOICELAYER_QWEN3_ASR_DEVICE`` (default ``cuda:0``),
+    ``VOICELAYER_QWEN3_ASR_DTYPE`` (default ``bfloat16``),
+    ``VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS`` (default ``600``),
+    ``VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS`` (default ``0`` —
+    upstream wrapper handles long-audio chunking; set positive to force
+    worker-side splitting), and ``VOICELAYER_QWEN3_ASR_ARGS``.
     """
 
     source = environ or os.environ

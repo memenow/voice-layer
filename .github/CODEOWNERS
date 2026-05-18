@@ -1,0 +1,11 @@
+# CODEOWNERS for memenow/voice-layer.
+#
+# GitHub reads this file to decide who is automatically requested for review
+# on pull requests that touch the matching paths. The last matching pattern
+# in this file wins, so order matters.
+#
+# VoiceLayer currently has a single maintainer, so we keep ownership at the
+# user level rather than splitting by directory. Add directory-scoped rules
+# below the global rule when additional maintainers join.
+
+* @BillDuke13

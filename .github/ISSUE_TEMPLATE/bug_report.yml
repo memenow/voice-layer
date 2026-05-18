@@ -1,0 +1,90 @@
+name: Bug report
+description: Report a defect in VoiceLayer.
+title: "bug: <short description>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. VoiceLayer is local-first, so
+        reproduction context matters. Please include host, toolchain, and the
+        smallest steps that exhibit the issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Which subsystem is involved?
+      options:
+        - daemon
+        - cli
+        - desktop
+        - worker
+        - docs
+        - build
+        - other
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Ubuntu version and display server
+      description: e.g. "Ubuntu 24.04, GNOME Wayland" or "Ubuntu 22.04, GNOME X11".
+      placeholder: "Ubuntu 24.04, GNOME Wayland"
+    validations:
+      required: true
+  - type: input
+    id: rust
+    attributes:
+      label: Rust toolchain
+      description: Output of `rustc --version` and active toolchain channel.
+      placeholder: "rustc 1.88.0 (stable)"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python toolchain (uv)
+      description: Output of `uv run python --version` and `uv --version`.
+      placeholder: "Python 3.12.x, uv 0.x"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic steps. Include exact commands.
+      placeholder: |
+        1. Start the daemon with `cargo run -p vl -- daemon run`.
+        2. Trigger a capture via `vl capture ...`.
+        3. Observe the failure.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: |
+        Relevant excerpts from the daemon log, `vl doctor`, or terminal output.
+        Redact any secrets before pasting.
+      render: shell
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I redacted secrets, tokens, and personal data from logs.
+          required: true
