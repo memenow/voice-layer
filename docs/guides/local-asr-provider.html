@@ -159,8 +159,9 @@ cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto</code>
 <li>fallback backend: <code>arecord -d</code></li>
 </ul>
 <p>This recording path writes a temporary WAV file and then forwards
-that file to the worker's <code>transcribe</code> RPC (whisper-server
-when configured, otherwise <code>whisper-cli</code>). The same path is
+that file to the worker's <code>transcribe</code> RPC
+(<code>whisper-server</code> when configured, otherwise
+<code>whisper-cli</code>). The same path is
 now exposed through the daemon-side <code>dictation capture</code> flow,
 so future global hotkey and tray integrations can reuse it without
 re-implementing recording logic.</p>

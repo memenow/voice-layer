@@ -169,7 +169,9 @@ falls back to <code>arecord</code>.</li>
 long-running child process and send SIGINT on stop; the audio is then
 handed to the Python worker's <code>transcribe</code> RPC, which
 dispatches to <code>whisper-server</code> when configured and falls back
-to one-shot <code>whisper-cli</code> otherwise. The daemon does not
+to one-shot <code>whisper-cli</code> otherwise, or to the session's
+<code>provider_id</code> backend (<code>mimo_v2_5_asr</code> or
+<code>qwen3_asr_1_7b</code>) when one is selected. The daemon does not
 process PCM in process; all capture flows through the recorder
 subprocess to a WAV file.</p>
 <h2 id="dictation-segmentation-phase-3b-3d">Dictation Segmentation (Phase 3B, 3D)</h2>
@@ -241,8 +243,9 @@ and <code>AsrFailed</code> are populated by the daemon;
 <p>Segmentation never applies to <code>POST /v1/dictation/capture</code>
 (one-shot bounded duration) or <code>POST /v1/transcriptions</code>
 (file transcription); those transcribe a single WAV in one
-<code>transcribe</code> call (whisper-server when configured, otherwise
-whisper-cli) with no recorder rolling.</p>
+<code>transcribe</code> call with no recorder rolling, using the same
+<code>whisper-server</code> / <code>whisper-cli</code> /
+<code>provider_id</code> dispatch as live sessions.</p>
 <h2 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</h2>
 <p>A silero-vad pre-pass can run inside the Python worker before any
 <code>transcribe</code> call, regardless of which ASR backend the
