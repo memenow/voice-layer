@@ -159,10 +159,12 @@ cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto</code>
 <li>fallback backend: <code>arecord -d</code></li>
 </ul>
 <p>This recording path writes a temporary WAV file and then forwards
-that file to <code>whisper-cli</code>. The same path is now exposed
-through the daemon-side <code>dictation capture</code> flow, so future
-global hotkey and tray integrations can reuse it without re-implementing
-recording logic.</p>
+that file to the worker's <code>transcribe</code> RPC
+(<code>whisper-server</code> when configured, otherwise
+<code>whisper-cli</code>). The same path is
+now exposed through the daemon-side <code>dictation capture</code> flow,
+so future global hotkey and tray integrations can reuse it without
+re-implementing recording logic.</p>
 <h3 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</h3>
 <p>The Python worker can run a silero-vad pre-pass before handing audio
 to the configured ASR backend. When enabled it detects speech regions in
