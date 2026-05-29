@@ -167,9 +167,11 @@ falls back to <code>arecord</code>.</li>
 <p>Live sessions (<code>POST /v1/sessions/dictation</code> and
 <code>POST /v1/sessions/dictation/stop</code>) start the recorder as a
 long-running child process and send SIGINT on stop; the audio is then
-handed to the Python worker for transcription via
-<code>whisper-cli</code>. The daemon does not process PCM in process;
-all capture flows through the recorder subprocess to a WAV file.</p>
+handed to the Python worker's <code>transcribe</code> RPC, which
+dispatches to <code>whisper-server</code> when configured and falls back
+to one-shot <code>whisper-cli</code> otherwise. The daemon does not
+process PCM in process; all capture flows through the recorder
+subprocess to a WAV file.</p>
 <h2 id="dictation-segmentation-phase-3b-3d">Dictation Segmentation (Phase 3B, 3D)</h2>
 <p><code>StartDictationRequest</code> carries a
 <code>segmentation</code> field that controls how audio is captured for
@@ -238,8 +240,9 @@ and <code>AsrFailed</code> are populated by the daemon;
 </ul>
 <p>Segmentation never applies to <code>POST /v1/dictation/capture</code>
 (one-shot bounded duration) or <code>POST /v1/transcriptions</code>
-(file transcription); those continue to use <code>whisper-cli</code>
-directly against a single WAV.</p>
+(file transcription); those transcribe a single WAV in one
+<code>transcribe</code> call (whisper-server when configured, otherwise
+whisper-cli) with no recorder rolling.</p>
 <h2 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</h2>
 <p>A silero-vad pre-pass can run inside the Python worker before any
 <code>transcribe</code> call, regardless of which ASR backend the
