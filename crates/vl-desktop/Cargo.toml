@@ -8,22 +8,44 @@ license.workspace = true
 ashpd = { version = "0.13", default-features = false, features = [
     "tokio",
     "global_shortcuts",
+    # Read the XDG Settings portal (`org.freedesktop.appearance` contrast /
+    # reduced-motion) for the accessibility wiring; no extra D-Bus crate needed.
+    "settings",
 ] }
+bytemuck.workspace = true
 bytes.workspace = true
+directories.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "wgpu", "advanced"] }
+# Desktop-only and optional, so it is pinned here rather than centralised in
+# `[workspace.dependencies]` (the same crate-local treatment as `iced`/`ashpd`).
+ksni = { version = "0.3.5", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 voicelayer-core = { path = "../voicelayer-core" }
+voicelayer-ui.workspace = true
 voicelayerd = { path = "../voicelayerd" }
 
+[features]
+# Optional StatusNotifierItem system tray (pure-Rust `ksni`, no GTK). Off by
+# default; GNOME needs the AppIndicator extension for it to render at all, and
+# the shell degrades gracefully when no tray host is present.
+tray = ["dep:ksni"]
+
 [dev-dependencies]
+# Font selection (Inter static weights resolving under one "Inter" family) is
+# verified offline with the same font db iced uses at runtime.
+fontdb = "0.23"
+# WGSL is validated by naga at runtime; this lets the test suite parse and
+# validate the glass shader offline (the GUI can't be driven headlessly).
+naga = { version = "27", features = ["wgsl-in"] }
 tempfile.workspace = true

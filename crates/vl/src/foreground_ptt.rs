@@ -38,6 +38,7 @@
 //! appends `-1`, `-2`, … until an unused name is found. The first free candidate wins; we do
 //! not overwrite existing transcripts.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,8 +48,7 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags, read,
     },
-    execute,
-    style::Print,
+    execute, queue,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode, size,
@@ -64,6 +64,7 @@ use crate::terminal_targets::{
     ForegroundInjectionTarget, paste_into_kitty_target, paste_into_tmux_pane,
     paste_into_wezterm_pane, resolve_foreground_injection_target, resolve_tmux_target_pane,
 };
+use crate::tui_glass::{self, GlassTheme};
 use crate::uds::{cli_socket_path, uds_post_json};
 
 #[allow(clippy::too_many_arguments)]
@@ -573,14 +574,31 @@ fn truncate_for_panel(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Render the whole foreground PTT panel as one rounded Liquid Glass card.
+///
+/// The terminal cannot blur or refract, so the glass look is approximated with
+/// color and layout only (see [`crate::tui_glass`]): a translucent film
+/// flattened to one panel color, a lensed top edge, accent titles, and a
+/// status badge. None of this changes the key handling, capture, or injection
+/// behavior — only how the existing state is drawn.
 fn render_foreground_ptt_ui(ui: &ForegroundPttUiState) -> Result<(), Box<dyn std::error::Error>> {
-    let (width, height) = size().unwrap_or((100, 30));
-    let transcript_width = width.saturating_sub(4).max(20) as usize;
-    let transcript_lines = wrap_for_panel(
-        ui.last_transcript_full.as_deref().unwrap_or("-"),
-        transcript_width,
-    );
-    let transcript_height = height.saturating_sub(18).max(6) as usize;
+    let theme = GlassTheme::dark();
+    let (term_width, term_height) = size().unwrap_or((100, 30));
+
+    // The card floats at a capped width so it does not smear across an
+    // ultra-wide terminal; every inner measurement derives from this width.
+    let total = (term_width as usize).clamp(28, 120);
+    let inner = total.saturating_sub(2); // columns between the side bars
+    let text_area = inner.saturating_sub(2); // inside the inner padding spaces
+
+    let transcript_lines =
+        wrap_for_panel(ui.last_transcript_full.as_deref().unwrap_or("-"), text_area);
+
+    // Fixed chrome: top + badge + 6 fields + 3 section dividers + 3 control
+    // rows + bottom, plus one row per recent event (or a single placeholder).
+    let event_rows = ui.recent_events.len().max(1);
+    let chrome = 15 + event_rows;
+    let transcript_height = (term_height as usize).saturating_sub(chrome).max(3);
     let max_scroll = transcript_lines.len().saturating_sub(transcript_height);
     let scroll = ui.transcript_scroll.min(max_scroll);
     let visible_lines = transcript_lines
@@ -590,64 +608,125 @@ fn render_foreground_ptt_ui(ui: &ForegroundPttUiState) -> Result<(), Box<dyn std
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        MoveTo(0, 0),
-        Clear(ClearType::All),
-        Print("VoiceLayer Foreground PTT\n"),
-        Print("==========================\n"),
-        Print(format!("Status: {}\n", ui.status_label)),
-        Print(format!("Key: {}\n", ui.key_label)),
-        Print(format!("Target: {}\n", ui.target_label)),
-        Print(format!(
-            "Active session: {}\n",
-            ui.active_session_id.as_deref().unwrap_or("-")
-        )),
-        Print(format!(
-            "Last session: {}\n",
-            ui.last_session_id.as_deref().unwrap_or("-")
-        )),
-        Print(format!(
-            "Last injection: {}\n",
-            ui.last_injection_status.as_deref().unwrap_or("-")
-        )),
-        Print(format!(
-            "Last error: {}\n",
-            ui.last_error.as_deref().unwrap_or("-")
-        )),
-        Print(format!(
-            "\nTranscript view (line {} of {}):\n",
-            scroll + 1,
-            transcript_lines.len().max(1)
-        )),
+    let mut out = std::io::stdout();
+    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+
+    // Header: product title in the lensed top edge.
+    tui_glass::border(
+        &mut out,
+        &theme,
+        tui_glass::rule(inner, '╭', "VoiceLayer · Foreground PTT", '╮'),
+        theme.edge_top,
     )?;
 
-    for line in visible_lines {
-        execute!(stdout, Print(format!("  {line}\n")))?;
-    }
-
-    execute!(stdout, Print("\nRecent events:\n"),)?;
-
-    for event in &ui.recent_events {
-        execute!(stdout, Print(format!("  - {event}\n")))?;
-    }
-
-    execute!(
-        stdout,
-        Print("\nControls:\n"),
-        Print("  press selected key to start\n"),
-        Print("  release key to stop when supported\n"),
-        Print("  otherwise press selected key again to stop\n"),
-        Print("  j/k or Up/Down scroll transcript, PageUp/PageDown jump\n"),
-        Print("  c copies the last transcript to the clipboard\n"),
-        Print("  r restores the saved clipboard text backup\n"),
-        Print("  i re-applies the last injection\n"),
-        Print("  s saves the last transcript to a file\n"),
-        Print("  d discards the last transcript from the panel\n"),
-        Print("  Esc exits\n"),
+    // Status badge.
+    let tone = tui_glass::classify_status(&ui.status_label);
+    let status_text = format!(" {}", ui.status_label);
+    tui_glass::row(
+        &mut out,
+        &theme,
+        inner,
+        &[(theme.tone(tone), "●"), (theme.text, status_text.as_str())],
     )?;
+
+    // Session and result fields: muted label, primary value (error in danger).
+    let key = ui.key_label.as_str();
+    let active = ui.active_session_id.as_deref().unwrap_or("—");
+    let last = ui.last_session_id.as_deref().unwrap_or("—");
+    let injection = ui.last_injection_status.as_deref().unwrap_or("—");
+    let (error_text, error_color) = match ui.last_error.as_deref() {
+        Some(error) => (error, theme.danger),
+        None => ("—", theme.muted),
+    };
+    let fields = [
+        ("Key", key, theme.text),
+        ("Target", ui.target_label.as_str(), theme.text),
+        ("Active", active, theme.text),
+        ("Last", last, theme.text),
+        ("Injection", injection, theme.text),
+        ("Error", error_text, error_color),
+    ];
+    for (name, value, value_color) in fields {
+        let label = field_label(name);
+        tui_glass::row(
+            &mut out,
+            &theme,
+            inner,
+            &[(theme.muted, label.as_str()), (value_color, value)],
+        )?;
+    }
+
+    // Transcript.
+    let transcript_title = format!(
+        "Transcript · line {} / {}",
+        scroll + 1,
+        transcript_lines.len().max(1)
+    );
+    tui_glass::border(
+        &mut out,
+        &theme,
+        tui_glass::rule(inner, '├', &transcript_title, '┤'),
+        theme.edge_bottom,
+    )?;
+    for line in &visible_lines {
+        tui_glass::row(&mut out, &theme, inner, &[(theme.text, line.as_str())])?;
+    }
+
+    // Recent events.
+    tui_glass::border(
+        &mut out,
+        &theme,
+        tui_glass::rule(inner, '├', "Recent events", '┤'),
+        theme.edge_bottom,
+    )?;
+    if ui.recent_events.is_empty() {
+        tui_glass::row(
+            &mut out,
+            &theme,
+            inner,
+            &[(theme.muted, "(waiting for activity)")],
+        )?;
+    } else {
+        for event in &ui.recent_events {
+            tui_glass::row(&mut out, &theme, inner, &[(theme.muted, event.as_str())])?;
+        }
+    }
+
+    // Controls. Keys are surfaced via the accent marker; the bindings below are
+    // unchanged from the event loop above.
+    tui_glass::border(
+        &mut out,
+        &theme,
+        tui_glass::rule(inner, '├', "Controls", '┤'),
+        theme.edge_bottom,
+    )?;
+    let controls = [
+        format!("{key}: start · release or {key} again: stop · Esc: exit"),
+        "j/k or Up/Down: scroll · PgUp/PgDn: jump".to_owned(),
+        "c: copy · r: restore · i: inject · s: save · d: discard".to_owned(),
+    ];
+    for line in &controls {
+        tui_glass::row(
+            &mut out,
+            &theme,
+            inner,
+            &[(theme.accent, "▸ "), (theme.muted, line.as_str())],
+        )?;
+    }
+
+    tui_glass::border(
+        &mut out,
+        &theme,
+        tui_glass::rule(inner, '╰', "", '╯'),
+        theme.edge_bottom,
+    )?;
+    out.flush()?;
     Ok(())
+}
+
+/// Pad a field name to the shared label column so values align down the card.
+fn field_label(name: &str) -> String {
+    format!("{name:<11}")
 }
 
 fn wrap_for_panel(text: &str, width: usize) -> Vec<String> {

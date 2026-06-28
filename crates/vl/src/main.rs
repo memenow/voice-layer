@@ -7,6 +7,7 @@ mod config;
 mod foreground_ptt;
 mod preview;
 mod terminal_targets;
+mod tui_glass;
 mod uds;
 
 #[tokio::main]

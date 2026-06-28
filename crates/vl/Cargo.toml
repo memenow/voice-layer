@@ -19,6 +19,7 @@ toml.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 voicelayer-core = { path = "../voicelayer-core" }
+voicelayer-ui.workspace = true
 voicelayerd = { path = "../voicelayerd" }
 
 [dev-dependencies]
