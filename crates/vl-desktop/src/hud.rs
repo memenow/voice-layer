@@ -375,24 +375,26 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let wave = sin(uv.x * 18.0 - t * 3.0) * 0.6
              + sin(uv.x * 7.0 + t * 1.7) * 0.3
              + sin(uv.x * 33.0 - t * 5.0) * 0.1;
-    let env = smoothstep(0.0, 0.18, uv.x) * smoothstep(1.0, 0.82, uv.x);
+    // Taper both ends; the trailing edge uses `1.0 - smoothstep(low, high, x)`
+    // rather than a descending edge pair, which WGSL leaves undefined.
+    let env = smoothstep(0.0, 0.18, uv.x) * (1.0 - smoothstep(0.82, 1.0, uv.x));
     let h = amp * wave * env;
 
     let dist = abs((uv.y - mid) - h);
-    let line = smoothstep(0.035, 0.0, dist);
-    let glow = smoothstep(0.18, 0.0, dist) * 0.35;
+    let line = 1.0 - smoothstep(0.0, 0.035, dist);
+    let glow = (1.0 - smoothstep(0.0, 0.18, dist)) * 0.35;
     col = col + u.accent.rgb * (line * 0.9 + glow) * (0.4 + 0.6 * u.energy);
 
     // A faint mirrored ghost for a fuller "audio" feel.
     let dist2 = abs((uv.y - mid) + h);
-    col = col + u.accent.rgb * smoothstep(0.05, 0.0, dist2) * 0.15;
+    col = col + u.accent.rgb * (1.0 - smoothstep(0.0, 0.05, dist2)) * 0.15;
 
     // Micro-grain so the body is not a flat fill.
     let n = hash(floor(pix * 0.5));
     col = col + (n - 0.5) * 0.015;
 
     // Specular rim just inside the rounded edge.
-    let rim = smoothstep(2.5, 0.0, abs(d)) * 0.10;
+    let rim = (1.0 - smoothstep(0.0, 2.5, abs(d))) * 0.10;
     col = col + vec3<f32>(1.0, 1.0, 1.0) * rim;
 
     return vec4<f32>(col, mask);

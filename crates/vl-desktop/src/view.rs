@@ -198,17 +198,26 @@ fn dictation_panel(app: &App) -> Element<'_, Message> {
         .into()
     };
 
-    let primary: Element<'_, Message> = match app.session.stage {
-        SessionStage::Idle | SessionStage::Completed | SessionStage::Failed => {
-            components::capsule("Start dictation  ·  F9", Capsule::Primary)
-                .on_press(Message::StartPressed)
-                .into()
-        }
-        SessionStage::Listening => components::capsule("Stop dictation  ·  F9", Capsule::Primary)
-            .on_press(Message::StopPressed)
-            .into(),
-        SessionStage::Starting | SessionStage::Stopping => {
-            components::capsule(render_session_stage(app.session.stage), Capsule::Ghost).into()
+    let primary: Element<'_, Message> = if app.capture_in_flight {
+        // A one-shot capture holds the microphone; streaming start is blocked
+        // until it finishes (see `App::start_session`), so present the control as
+        // inactive rather than offering a press that would be refused.
+        components::capsule("Start dictation  ·  F9", Capsule::Ghost).into()
+    } else {
+        match app.session.stage {
+            SessionStage::Idle | SessionStage::Completed | SessionStage::Failed => {
+                components::capsule("Start dictation  ·  F9", Capsule::Primary)
+                    .on_press(Message::StartPressed)
+                    .into()
+            }
+            SessionStage::Listening => {
+                components::capsule("Stop dictation  ·  F9", Capsule::Primary)
+                    .on_press(Message::StopPressed)
+                    .into()
+            }
+            SessionStage::Starting | SessionStage::Stopping => {
+                components::capsule(render_session_stage(app.session.stage), Capsule::Ghost).into()
+            }
         }
     };
 

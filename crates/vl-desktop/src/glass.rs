@@ -367,8 +367,11 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Two drifting soft light pools — accent-tinted, low intensity.
     let c1 = vec2<f32>(0.30 + 0.10 * sin(t * 0.13), 0.28 + 0.08 * cos(t * 0.11)) * vec2<f32>(u.aspect, 1.0);
     let c2 = vec2<f32>(0.72 + 0.08 * cos(t * 0.09), 0.66 + 0.10 * sin(t * 0.07)) * vec2<f32>(u.aspect, 1.0);
-    let b1 = smoothstep(0.55, 0.0, distance(p, c1));
-    let b2 = smoothstep(0.50, 0.0, distance(p, c2));
+    // WGSL `smoothstep` is only well-defined for an increasing edge pair, so
+    // express each inward falloff as `1.0 - smoothstep(low, high, x)` rather than
+    // descending edges (mathematically identical, but driver-portable).
+    let b1 = 1.0 - smoothstep(0.0, 0.55, distance(p, c1));
+    let b2 = 1.0 - smoothstep(0.0, 0.50, distance(p, c2));
     col = col + u.accent.rgb * b1 * 0.18 * decor;
     col = col + u.elevated.rgb * b2 * 0.14 * decor;
 
@@ -379,13 +382,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Traveling specular sweep along the diagonal, periodic.
     let sweep_phase = fract(t * 0.06);
     let band = uv.x * 0.6 + uv.y * 0.4;
-    let sweep = smoothstep(0.06, 0.0, abs(band - sweep_phase)) * 0.06;
+    let sweep = (1.0 - smoothstep(0.0, 0.06, abs(band - sweep_phase))) * 0.06;
     col = col + vec3<f32>(1.0, 1.0, 1.0) * sweep * decor;
 
     // Pointer-reactive radial highlight (converged, subtle); off when pointer < 0.
     if (u.pointer.x >= 0.0) {
         let pp = u.pointer * vec2<f32>(u.aspect, 1.0);
-        col = col + u.accent.rgb * smoothstep(0.22, 0.0, distance(p, pp)) * 0.10 * decor;
+        col = col + u.accent.rgb * (1.0 - smoothstep(0.0, 0.22, distance(p, pp))) * 0.10 * decor;
     }
 
     // Vignette: lift the center, darken the edges.

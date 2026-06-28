@@ -29,6 +29,11 @@ pub(crate) struct JobStage {
     pub(crate) auto_submit: bool,
     pub(crate) injecting: bool,
     pub(crate) plan: Option<InjectionPlan>,
+    /// Generation counter for the injection currently in flight. Bumped on every
+    /// new submission and every new inject so a late `POST /v1/inject` reply from
+    /// a superseded preview is dropped instead of landing its plan on the job's
+    /// newer (or still-running) request.
+    pub(crate) inject_epoch: u64,
 }
 
 impl JobStage {
@@ -41,15 +46,21 @@ impl JobStage {
             auto_submit: false,
             injecting: false,
             plan: None,
+            inject_epoch: 0,
         }
     }
 
-    /// Clear the previous run's preview and plan as a new submission starts.
-    pub(crate) fn begin_submit(&mut self) {
+    /// Begin a new submission: clear the previous run's preview and plan, adopt
+    /// the current default inject target, and invalidate any injection still in
+    /// flight so its late reply cannot attach to this fresh job.
+    pub(crate) fn begin_submit(&mut self, default_target: InjectTarget) {
         self.submitting = true;
         self.error = None;
         self.preview = None;
         self.plan = None;
+        self.inject_target = default_target;
+        self.injecting = false;
+        self.inject_epoch = self.inject_epoch.wrapping_add(1);
     }
 }
 
@@ -134,5 +145,55 @@ impl TranslateForm {
             target: prefs.default_output_language.clone(),
             job: JobStage::seeded(prefs.default_inject_target.clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobStage;
+    use voicelayer_core::InjectTarget;
+
+    /// A new submission adopts the current default inject target (so a changed
+    /// Settings default takes effect) and cancels any injection still in flight,
+    /// advancing the epoch so its late reply is dropped rather than attached.
+    #[test]
+    fn begin_submit_adopts_default_target_and_invalidates_in_flight_inject() {
+        let mut job = JobStage::seeded(InjectTarget::GuiAccessible);
+        // An injection from a prior preview is mid-flight when the user resubmits.
+        job.injecting = true;
+        let before = job.inject_epoch;
+
+        job.begin_submit(InjectTarget::GuiClipboard);
+
+        assert!(job.submitting, "a fresh submission is in flight");
+        assert_eq!(
+            job.inject_target,
+            InjectTarget::GuiClipboard,
+            "the new submission adopts the current default inject target",
+        );
+        assert!(!job.injecting, "any in-flight injection is cancelled");
+        assert!(job.plan.is_none());
+        assert!(job.preview.is_none());
+        assert_eq!(
+            job.inject_epoch,
+            before + 1,
+            "the inject generation advances so a superseded reply is dropped",
+        );
+    }
+
+    /// Every submission advances the inject epoch, so each supersedes the
+    /// previous generation's in-flight reply.
+    #[test]
+    fn begin_submit_advances_inject_epoch_each_call() {
+        let mut job = JobStage::seeded(InjectTarget::GuiAccessible);
+        let e0 = job.inject_epoch;
+        job.begin_submit(InjectTarget::GuiAccessible);
+        let e1 = job.inject_epoch;
+        job.begin_submit(InjectTarget::GuiAccessible);
+        let e2 = job.inject_epoch;
+        assert!(
+            e1 > e0 && e2 > e1,
+            "each submission supersedes the previous inject generation",
+        );
     }
 }

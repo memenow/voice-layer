@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Desktop Shell Guide — VoiceLayer Documentation</title>
-<meta name="description" content="How vl-desktop shares the daemon socket, its two client-side environment variables, the GlobalShortcuts portal hotkey, and the systemd relationship." />
+<meta name="description" content="The vl-desktop GUI shell: navigation panels, workflows, Settings, capture HUD, optional system tray, Liquid Glass visual language, environment variables, and the GlobalShortcuts portal hotkey." />
 <link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body>
@@ -29,6 +29,16 @@
 <nav id="TOC" role="doc-toc">
 <ul>
 <li><a href="#launch">Launch</a></li>
+<li><a href="#gui-panels">GUI panels</a>
+<ul>
+<li><a href="#dictation">Dictation</a></li>
+<li><a href="#generative-workflows">Compose, Rewrite, Translate</a></li>
+<li><a href="#providers-doctor-history">Providers, Doctor, History</a></li>
+<li><a href="#settings">Settings</a></li>
+</ul></li>
+<li><a href="#capture-hud">Capture HUD overlay</a></li>
+<li><a href="#system-tray">System tray</a></li>
+<li><a href="#liquid-glass">Liquid Glass visual language</a></li>
 <li><a href="#environment-variables">Environment variables</a></li>
 <li><a href="#relationship-to-the-daemon">Relationship to the daemon</a></li>
 <li><a href="#system-wide-hotkey">System-wide hotkey</a></li>
@@ -40,6 +50,146 @@
 Unix socket. Unlike <code>voicelayerd</code>, it runs as an interactive
 user process (not a systemd user service), so its operator knobs live
 outside <code>~/.config/voicelayer/voicelayerd.env</code>.</p>
+<h2 id="gui-panels">GUI panels</h2>
+<p><code>vl-desktop</code> is an <code>iced::daemon</code> multi-window
+shell with a left navigation sidebar. The sidebar renders eight tabs in
+order: Dictation, Compose, Rewrite, Translate, Providers, Doctor,
+History, Settings.</p>
+
+<h3 id="dictation">Dictation</h3>
+<p>Start and stop streaming dictation with the "Start dictation · F9"
+button (or the global shortcut registered via the XDG portal when
+available). While a session is live the panel shows the session stage
+badge ("listening — speak now") and, on completion, the full transcript
+and detected language.</p>
+<p>A second card ("Capture options") exposes per-session controls:
+ASR provider picker (populated from the daemon's registered providers),
+free-text input-language box (blank means auto-detect), segmentation
+picker (One-shot / Fixed window / VAD-gated), and a translate-to-English
+toggle. Below those controls a one-shot fixed-window capture button
+triggers <code>POST /v1/dictation/capture</code> for a bounded
+single-recording capture; it is disabled while a streaming session is
+in flight.</p>
+
+<h3 id="generative-workflows">Compose, Rewrite, Translate</h3>
+<p>Each is a form that submits a request to the corresponding
+<code>POST /v1</code> generative endpoint and yields a
+<code>PreviewArtifact</code>. After the preview appears an inject card
+lets you pick a target (<code>InjectTarget</code>), toggle auto-submit,
+and press "Plan injection" — which calls <code>POST /v1/inject</code>
+and returns an <code>InjectionPlan</code> (the daemon prepares the paste;
+it does not type into the focused application automatically). The
+resulting plan is shown inline.</p>
+<ul>
+<li><strong>Compose</strong> — spoken-style prompt, optional archetype
+(e.g. email, issue description), optional output language.</li>
+<li><strong>Rewrite</strong> — source text, restyle picker (e.g. more
+formal), optional output language.</li>
+<li><strong>Translate</strong> — source text, required target
+language.</li>
+</ul>
+
+<h3 id="providers-doctor-history">Providers, Doctor, History</h3>
+<ul>
+<li><strong>Providers</strong> — lists all daemon-registered
+<code>ProviderDescriptor</code> entries (id, kind, transport,
+local/remote badge). Refreshes on tab entry or via the Refresh
+button.</li>
+<li><strong>Doctor</strong> — daemon and worker health diagnostics:
+status, version, socket path, ASR configured/model, LLM
+configured/endpoint/reachable, global-shortcuts portal availability.
+Refreshes on tab entry or via the Re-probe button.</li>
+<li><strong>History</strong> — recent <code>CaptureSession</code> records
+from the daemon, showing session id prefix, mode, state, and trigger.
+Refreshes on demand.</li>
+</ul>
+
+<h3 id="settings">Settings</h3>
+<p>Local, GUI-only preferences — there is no <code>/v1</code>
+configuration route. These are session defaults seeded into each
+workflow; daemon-side configuration remains the CLI's domain.</p>
+<ul>
+<li>Default output language (blank keeps the source language)</li>
+<li>Default inject target</li>
+<li>Recorder backend (Auto / PipeWire / ALSA)</li>
+<li>One-shot capture window (5 / 8 / 12 / 20 / 30 seconds)</li>
+</ul>
+<p>A separate "Appearance &amp; accessibility" card exposes:</p>
+<ul>
+<li>Glass opacity slider (0 % – 100 %). Persisted to
+<code>desktop.toml</code> and applied immediately.</li>
+<li>Reduce Transparency toggle. Persisted to <code>desktop.toml</code>.
+GNOME exposes no system-level reduce-transparency signal (unlike macOS),
+so this stays a manual toggle rather than following the OS.</li>
+<li>Read-only display of the live OS accessibility state — Increase
+Contrast and Reduce Motion — read from the XDG Settings portal and
+updated automatically. These are not editable here; they follow the
+system settings.</li>
+</ul>
+
+<h2 id="capture-hud">Capture HUD overlay</h2>
+<p>While the microphone is held (streaming dictation or a one-shot
+capture in flight), <code>vl-desktop</code> opens a second borderless
+transparent window: a small glass pill showing the capture state
+("Listening — speak now", "Capturing · N s", etc.) with a synthetic
+animated waveform and, during streaming dictation, a "Stop · F9"
+button.</p>
+<p>The HUD is best-effort always-on-top. On GNOME Wayland the compositor
+owns window placement — <code>window::move_to</code> is not supported and
+the always-on-top level hint is silently ignored, so the compositor
+decides where the pill lands. <code>Position::Centered</code> is the
+requested hint; wlroots and KWin compositors honor it. The layer-shell
+path that would force placement is not implemented.</p>
+<p>The waveform animation is synthetic: the desktop client receives no
+microphone amplitude from the <code>/v1</code> event stream, so the
+animation is time-driven rather than driven by real audio levels.</p>
+
+<h2 id="system-tray">System tray</h2>
+<p>An optional StatusNotifierItem tray icon is compiled in when the
+<code>tray</code> cargo feature is enabled. It uses
+<code>ksni</code> (pure-Rust, no GTK / libappindicator dependency) and
+registers a menu with three items: Toggle dictation, Show VoiceLayer, and
+Quit VoiceLayer.</p>
+<p>The tray is strictly best-effort. GNOME Shell has no built-in
+StatusNotifierHost; the tray icon is visible only when the user has
+installed the "AppIndicator and KStatusNotifierItem Support" GNOME Shell
+extension. When no host is reachable the shell logs once and runs on
+without a tray — all tray actions are also reachable from the main window
+and the CLI.</p>
+<p>The tray holds no live session state; its menu items are stateless
+actions forwarded to the iced runtime as messages.</p>
+
+<h2 id="liquid-glass">Liquid Glass visual language</h2>
+<p><code>vl-desktop</code> uses a two-layer Liquid Glass rendering
+model:</p>
+<ol type="1">
+<li>An opaque gradient backdrop (the graceful fallback tier — always
+visible).</li>
+<li>An animated wgpu/WGSL fragment shader painted over the backdrop:
+a drifting multi-stop gradient, frosted-glass grain, slow light blobs, a
+traveling specular sweep, a pointer-reactive highlight, and a vignette.
+This is the "glass" background the sidebar and content cards float
+above.</li>
+</ol>
+<p>Platform honesty: a fragment shader cannot sample the framebuffer
+behind the window on GNOME Wayland, so there is no real desktop blur.
+The shader paints a self-contained rich background; glass cards lens
+this material, not the true desktop content underneath.</p>
+<p>Graceful degradation is structural: if the GPU backend is unavailable
+iced falls back to the tiny-skia software renderer, where the custom
+shader primitive is a silent no-op. The opaque backdrop beneath it
+remains visible, giving the P1 appearance. No runtime detection is
+needed; the view always paints the backdrop first.</p>
+<p>Accessibility knobs (see <a href="#settings">Settings</a> above):</p>
+<ul>
+<li>Glass opacity and Reduce Transparency are user-controlled and
+persisted to <code>desktop.toml</code>.</li>
+<li>Increase Contrast and Reduce Motion are read live from the XDG
+Settings portal. When Reduce Motion is active the shell stops subscribing
+to per-frame ticks so the shader animation freezes (the material is still
+drawn; it just does not animate).</li>
+</ul>
+
 <h2 id="launch">Launch</h2>
 <pre><code>vl-desktop</code></pre>
 <p>Starting the daemon on demand: if <code>vl-desktop</code> cannot

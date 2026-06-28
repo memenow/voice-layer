@@ -583,22 +583,15 @@ fn truncate_for_panel(text: &str, max_chars: usize) -> String {
 /// behavior — only how the existing state is drawn.
 fn render_foreground_ptt_ui(ui: &ForegroundPttUiState) -> Result<(), Box<dyn std::error::Error>> {
     let theme = GlassTheme::dark();
-    let (term_width, term_height) = size().unwrap_or((100, 30));
-
-    // The card floats at a capped width so it does not smear across an
-    // ultra-wide terminal; every inner measurement derives from this width.
-    let total = (term_width as usize).clamp(28, 120);
-    let inner = total.saturating_sub(2); // columns between the side bars
-    let text_area = inner.saturating_sub(2); // inside the inner padding spaces
+    // Card geometry derived from the live terminal size. `scroll_transcript`
+    // derives the same values from `transcript_geometry`, so the scroll clamp
+    // always matches what is rendered and long transcripts stay fully reachable.
+    let event_rows = ui.recent_events.len().max(1);
+    let (inner, text_area, transcript_height) = transcript_geometry(event_rows);
 
     let transcript_lines =
         wrap_for_panel(ui.last_transcript_full.as_deref().unwrap_or("-"), text_area);
 
-    // Fixed chrome: top + badge + 6 fields + 3 section dividers + 3 control
-    // rows + bottom, plus one row per recent event (or a single placeholder).
-    let event_rows = ui.recent_events.len().max(1);
-    let chrome = 15 + event_rows;
-    let transcript_height = (term_height as usize).saturating_sub(chrome).max(3);
     let max_scroll = transcript_lines.len().saturating_sub(transcript_height);
     let scroll = ui.transcript_scroll.min(max_scroll);
     let visible_lines = transcript_lines
@@ -729,6 +722,25 @@ fn field_label(name: &str) -> String {
     format!("{name:<11}")
 }
 
+/// Transcript card geometry for the current terminal size: the inner content
+/// width, the wrap width (`text_area`), and the number of visible transcript
+/// rows. Shared by [`render_foreground_ptt_ui`] and [`scroll_transcript`] so the
+/// scroll clamp is computed from the same width and height the renderer draws,
+/// keeping the end of a long transcript reachable on any terminal size.
+/// `event_rows` is the recent-event row count, which the fixed chrome budget
+/// accounts for. Defaults to an 80×24-ish layout if the terminal size is unknown.
+fn transcript_geometry(event_rows: usize) -> (usize, usize, usize) {
+    let (term_width, term_height) = size().unwrap_or((100, 30));
+    let total = (term_width as usize).clamp(28, 120);
+    let inner = total.saturating_sub(2); // columns between the side bars
+    let text_area = inner.saturating_sub(2); // inside the inner padding spaces
+    // Fixed chrome: top + badge + 6 fields + 3 section dividers + 3 control rows
+    // + bottom, plus one row per recent event (or a single placeholder).
+    let chrome = 15 + event_rows;
+    let transcript_height = (term_height as usize).saturating_sub(chrome).max(3);
+    (inner, text_area, transcript_height)
+}
+
 fn wrap_for_panel(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -750,8 +762,11 @@ fn wrap_for_panel(text: &str, width: usize) -> Vec<String> {
 
 fn scroll_transcript(ui: &mut ForegroundPttUiState, delta: isize) -> bool {
     let text = ui.last_transcript_full.as_deref().unwrap_or("-");
-    let lines = wrap_for_panel(text, 80);
-    let max_scroll = lines.len().saturating_sub(6) as isize;
+    // Clamp against the same wrap width and visible-row count the renderer uses,
+    // not a fixed 80-column / six-row guess, so the offset can reach the real end.
+    let (_inner, text_area, transcript_height) = transcript_geometry(ui.recent_events.len().max(1));
+    let lines = wrap_for_panel(text, text_area);
+    let max_scroll = lines.len().saturating_sub(transcript_height) as isize;
     let current = ui.transcript_scroll as isize;
     let next = (current + delta).clamp(0, max_scroll);
     let changed = next != current;

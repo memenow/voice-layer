@@ -185,7 +185,9 @@ pub enum Message {
     InjectTargetSelected(WorkflowTab, InjectTarget),
     InjectAutoSubmitToggled(WorkflowTab),
     InjectPressed(WorkflowTab),
-    Injected(WorkflowTab, Result<Box<InjectionPlan>, SharedError>),
+    // The `u64` is the inject generation this reply belongs to; a stale reply
+    // (superseded by a newer submission or inject) is dropped on arrival.
+    Injected(WorkflowTab, u64, Result<Box<InjectionPlan>, SharedError>),
 
     // Settings (local preferences).
     PrefOutputLanguageEdited(String),
@@ -308,6 +310,9 @@ impl App {
             Message::ProbeDaemonPressed => {
                 self.daemon = DaemonStatus::Probing;
                 self.error = None;
+                // Drop the prior probe's diagnostics so the Doctor panel cannot
+                // present stale socket/worker details as current while re-probing.
+                self.health = None;
                 probe_health(self.client.clone())
             }
             Message::DaemonProbed(Ok(health)) => {
@@ -319,6 +324,9 @@ impl App {
             Message::DaemonProbed(Err(error)) => {
                 self.daemon = DaemonStatus::Unreachable;
                 self.error = Some((*error).clone());
+                // The daemon is down or unreachable; clear the last good probe so
+                // the Doctor panel does not keep rendering its details as current.
+                self.health = None;
                 Task::none()
             }
             Message::StartDaemonPressed => {
@@ -340,6 +348,10 @@ impl App {
             }
             Message::ProvidersListed(Err(error)) => {
                 self.error = Some((*error).clone());
+                // Drop the cached list so the Providers panel and the dictation
+                // ASR picker stop offering ids from a daemon/socket we can no
+                // longer confirm; a successful refresh repopulates it.
+                self.providers = None;
                 Task::none()
             }
             Message::PortalProbed(PortalProbe::Available) => {
@@ -502,8 +514,13 @@ impl App {
                 Task::none()
             }
             Message::InjectPressed(tab) => self.submit_inject(tab),
-            Message::Injected(tab, result) => {
+            Message::Injected(tab, epoch, result) => {
                 if let Some(job) = self.job_mut(tab) {
+                    // Drop a reply from an injection a newer submission or inject
+                    // superseded: it belongs to a preview no longer on screen.
+                    if epoch != job.inject_epoch {
+                        return Task::none();
+                    }
                     job.injecting = false;
                     match result {
                         Ok(plan) => {
@@ -603,6 +620,13 @@ impl App {
     }
 
     fn start_session(&mut self) -> Task<Message> {
+        // A one-shot capture already holds the microphone; starting streaming
+        // dictation now would run a second recorder against it and race the HUD
+        // and transcript state. Serialize: refuse until the capture finishes.
+        if self.capture_in_flight {
+            self.error = Some("A one-shot capture is in progress; wait for it to finish.".into());
+            return Task::none();
+        }
         if self.daemon != DaemonStatus::Healthy {
             self.error = Some("Daemon is not healthy; start it first.".into());
             return Task::none();
@@ -676,9 +700,12 @@ impl App {
         let request = ComposeRequest {
             spoken_prompt: prompt.to_owned(),
             archetype: self.compose.archetype.clone(),
-            output_language: optional_text(&self.compose.language),
+            output_language: optional_text(&self.compose.language)
+                .or_else(|| optional_text(&self.preferences.default_output_language)),
         };
-        self.compose.job.begin_submit();
+        self.compose
+            .job
+            .begin_submit(self.preferences.default_inject_target.clone());
         let client = self.client.clone();
         Task::perform(
             async move { client.compose(request).await.map(Box::new) },
@@ -700,9 +727,12 @@ impl App {
         let request = RewriteRequest {
             source_text: source.to_owned(),
             style: self.rewrite.style.clone(),
-            output_language: optional_text(&self.rewrite.language),
+            output_language: optional_text(&self.rewrite.language)
+                .or_else(|| optional_text(&self.preferences.default_output_language)),
         };
-        self.rewrite.job.begin_submit();
+        self.rewrite
+            .job
+            .begin_submit(self.preferences.default_inject_target.clone());
         let client = self.client.clone();
         Task::perform(
             async move { client.rewrite(request).await.map(Box::new) },
@@ -717,20 +747,26 @@ impl App {
         }
         let source = self.translate.source.text();
         let source = source.trim();
-        let target = self.translate.target.trim().to_owned();
         if source.is_empty() {
             self.translate.job.error = Some("Enter text to translate.".into());
             return Task::none();
         }
-        if target.is_empty() {
+        // Fall back to the Settings default output language when the target field
+        // is blank, so a configured default makes Translate usable without
+        // retyping the language on every request.
+        let Some(target) = optional_text(&self.translate.target)
+            .or_else(|| optional_text(&self.preferences.default_output_language))
+        else {
             self.translate.job.error = Some("Enter a target language.".into());
             return Task::none();
-        }
+        };
         let request = TranslateRequest {
             source_text: source.to_owned(),
             target_language: target,
         };
-        self.translate.job.begin_submit();
+        self.translate
+            .job
+            .begin_submit(self.preferences.default_inject_target.clone());
         let client = self.client.clone();
         Task::perform(
             async move { client.translate(request).await.map(Box::new) },
@@ -767,10 +803,14 @@ impl App {
         job.injecting = true;
         job.error = None;
         job.plan = None;
+        // Tag this request's reply so a newer submission or inject can supersede
+        // it; a late reply with a stale epoch is dropped in `Message::Injected`.
+        job.inject_epoch = job.inject_epoch.wrapping_add(1);
+        let epoch = job.inject_epoch;
         let client = self.client.clone();
         Task::perform(
             async move { client.inject(request).await.map(Box::new) },
-            move |result| Message::Injected(tab, result),
+            move |result| Message::Injected(tab, epoch, result),
         )
     }
 
