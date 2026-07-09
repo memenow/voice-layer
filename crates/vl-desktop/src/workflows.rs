@@ -46,7 +46,7 @@ pub(crate) fn compose_panel(app: &App) -> Element<'_, Message> {
                 components::picker(
                     "Automatic",
                     archetype_choices(),
-                    form.archetype.clone().map(ArchetypeChoice),
+                    Some(ArchetypeChoice(form.archetype.clone())),
                     |choice| Message::ComposeArchetypeSelected(choice.0),
                 ),
             ),

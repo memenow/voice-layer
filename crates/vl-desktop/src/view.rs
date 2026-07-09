@@ -327,6 +327,23 @@ fn providers_panel(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorEmptyState {
+    Probing,
+    Failed(String),
+}
+
+fn doctor_empty_state(daemon: DaemonStatus, error: Option<&str>) -> DoctorEmptyState {
+    if daemon != DaemonStatus::Unreachable {
+        return DoctorEmptyState::Probing;
+    }
+    let message = error
+        .filter(|message| !message.trim().is_empty())
+        .map(|message| format!("Daemon unreachable — {message}"))
+        .unwrap_or_else(|| "Daemon unreachable.".to_owned());
+    DoctorEmptyState::Failed(message)
+}
+
 fn doctor_panel(app: &App) -> Element<'_, Message> {
     let p = theme::palette();
     let header = row![
@@ -363,10 +380,16 @@ fn doctor_panel(app: &App) -> Element<'_, Message> {
             .spacing(tokens::space::SM)
             .into()
         }
-        None => text("Probing daemon…")
-            .size(tokens::text::BODY)
-            .color(theme::color(p.text_secondary))
-            .into(),
+        None => match doctor_empty_state(app.daemon, app.error.as_deref()) {
+            DoctorEmptyState::Probing => text("Probing daemon…")
+                .size(tokens::text::BODY)
+                .color(theme::color(p.text_secondary))
+                .into(),
+            DoctorEmptyState::Failed(message) => text(message)
+                .size(tokens::text::BODY)
+                .color(theme::color(p.danger))
+                .into(),
+        },
     };
 
     column![
@@ -527,4 +550,26 @@ fn yes_no(value: bool) -> String {
 
 fn optional(value: Option<&str>) -> String {
     value.unwrap_or("—").to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DoctorEmptyState, doctor_empty_state};
+    use crate::state::DaemonStatus;
+
+    #[test]
+    fn doctor_empty_state_distinguishes_probing_from_failure() {
+        assert_eq!(
+            doctor_empty_state(DaemonStatus::Probing, None),
+            DoctorEmptyState::Probing,
+        );
+        assert_eq!(
+            doctor_empty_state(DaemonStatus::Unreachable, Some("socket missing")),
+            DoctorEmptyState::Failed("Daemon unreachable — socket missing".to_owned()),
+        );
+        assert_eq!(
+            doctor_empty_state(DaemonStatus::Unreachable, None),
+            DoctorEmptyState::Failed("Daemon unreachable.".to_owned()),
+        );
+    }
 }

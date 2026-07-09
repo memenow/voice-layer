@@ -57,8 +57,24 @@ impl JobStage {
         self.submitting = true;
         self.error = None;
         self.preview = None;
-        self.plan = None;
         self.inject_target = default_target;
+        self.invalidate_inject();
+    }
+
+    pub(crate) fn set_inject_target(&mut self, target: InjectTarget) {
+        if self.inject_target != target {
+            self.inject_target = target;
+            self.invalidate_inject();
+        }
+    }
+
+    pub(crate) fn toggle_auto_submit(&mut self) {
+        self.auto_submit = !self.auto_submit;
+        self.invalidate_inject();
+    }
+
+    fn invalidate_inject(&mut self) {
+        self.plan = None;
         self.injecting = false;
         self.inject_epoch = self.inject_epoch.wrapping_add(1);
     }
@@ -97,6 +113,7 @@ pub(crate) struct ComposeForm {
     pub(crate) prompt: text_editor::Content,
     pub(crate) archetype: Option<CompositionArchetype>,
     pub(crate) language: String,
+    language_edited: bool,
     pub(crate) job: JobStage,
 }
 
@@ -106,8 +123,24 @@ impl ComposeForm {
             prompt: text_editor::Content::new(),
             archetype: None,
             language: prefs.default_output_language.clone(),
+            language_edited: false,
             job: JobStage::seeded(prefs.default_inject_target.clone()),
         }
+    }
+
+    pub(crate) fn edit_language(&mut self, value: String) {
+        self.language = value;
+        self.language_edited = true;
+    }
+
+    pub(crate) fn sync_default_language(&mut self, value: &str) {
+        if !self.language_edited {
+            self.language = value.to_owned();
+        }
+    }
+
+    pub(crate) fn output_language(&self) -> Option<String> {
+        optional_text(&self.language)
     }
 }
 
@@ -117,6 +150,7 @@ pub(crate) struct RewriteForm {
     pub(crate) source: text_editor::Content,
     pub(crate) style: RewriteStyle,
     pub(crate) language: String,
+    language_edited: bool,
     pub(crate) job: JobStage,
 }
 
@@ -126,8 +160,24 @@ impl RewriteForm {
             source: text_editor::Content::new(),
             style: RewriteStyle::MoreFormal,
             language: prefs.default_output_language.clone(),
+            language_edited: false,
             job: JobStage::seeded(prefs.default_inject_target.clone()),
         }
+    }
+
+    pub(crate) fn edit_language(&mut self, value: String) {
+        self.language = value;
+        self.language_edited = true;
+    }
+
+    pub(crate) fn sync_default_language(&mut self, value: &str) {
+        if !self.language_edited {
+            self.language = value.to_owned();
+        }
+    }
+
+    pub(crate) fn output_language(&self) -> Option<String> {
+        optional_text(&self.language)
     }
 }
 
@@ -135,6 +185,7 @@ impl RewriteForm {
 pub(crate) struct TranslateForm {
     pub(crate) source: text_editor::Content,
     pub(crate) target: String,
+    target_edited: bool,
     pub(crate) job: JobStage,
 }
 
@@ -143,15 +194,50 @@ impl TranslateForm {
         Self {
             source: text_editor::Content::new(),
             target: prefs.default_output_language.clone(),
+            target_edited: false,
             job: JobStage::seeded(prefs.default_inject_target.clone()),
         }
+    }
+
+    pub(crate) fn edit_target(&mut self, value: String) {
+        self.target = value;
+        self.target_edited = true;
+    }
+
+    pub(crate) fn sync_default_target(&mut self, value: &str) {
+        if !self.target_edited {
+            self.target = value.to_owned();
+        }
+    }
+
+    pub(crate) fn target_language(&self) -> Option<String> {
+        optional_text(&self.target)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::JobStage;
-    use voicelayer_core::InjectTarget;
+    use super::{ComposeForm, JobStage, RewriteForm, TranslateForm};
+    use crate::state::Preferences;
+    use voicelayer_core::{InjectTarget, InjectionPlan};
+
+    fn preferences_with_language(language: &str) -> Preferences {
+        Preferences {
+            default_output_language: language.to_owned(),
+            ..Preferences::default()
+        }
+    }
+
+    fn prepared_job() -> JobStage {
+        let mut job = JobStage::seeded(InjectTarget::GuiAccessible);
+        job.injecting = true;
+        job.plan = Some(InjectionPlan {
+            target: InjectTarget::GuiAccessible,
+            payload: "prepared".to_owned(),
+            auto_submit: false,
+        });
+        job
+    }
 
     /// A new submission adopts the current default inject target (so a changed
     /// Settings default takes effect) and cancels any injection still in flight,
@@ -195,5 +281,66 @@ mod tests {
             e1 > e0 && e2 > e1,
             "each submission supersedes the previous inject generation",
         );
+    }
+
+    #[test]
+    fn changing_inject_target_invalidates_the_prepared_plan_and_reply_epoch() {
+        let mut job = prepared_job();
+        let before = job.inject_epoch;
+
+        job.set_inject_target(InjectTarget::GuiClipboard);
+
+        assert_eq!(job.inject_target, InjectTarget::GuiClipboard);
+        assert!(!job.injecting);
+        assert!(job.plan.is_none());
+        assert_eq!(job.inject_epoch, before + 1);
+    }
+
+    #[test]
+    fn toggling_auto_submit_invalidates_the_prepared_plan_and_reply_epoch() {
+        let mut job = prepared_job();
+        let before = job.inject_epoch;
+
+        job.toggle_auto_submit();
+
+        assert!(job.auto_submit);
+        assert!(!job.injecting);
+        assert!(job.plan.is_none());
+        assert_eq!(job.inject_epoch, before + 1);
+    }
+
+    #[test]
+    fn untouched_language_fields_follow_settings_default_changes() {
+        let prefs = preferences_with_language("English");
+        let mut compose = ComposeForm::new(&prefs);
+        let mut rewrite = RewriteForm::new(&prefs);
+        let mut translate = TranslateForm::new(&prefs);
+
+        compose.sync_default_language("French");
+        rewrite.sync_default_language("French");
+        translate.sync_default_target("French");
+
+        assert_eq!(compose.output_language().as_deref(), Some("French"));
+        assert_eq!(rewrite.output_language().as_deref(), Some("French"));
+        assert_eq!(translate.target_language().as_deref(), Some("French"));
+    }
+
+    #[test]
+    fn explicitly_cleared_language_fields_do_not_reinherit_the_default() {
+        let prefs = preferences_with_language("English");
+        let mut compose = ComposeForm::new(&prefs);
+        let mut rewrite = RewriteForm::new(&prefs);
+        let mut translate = TranslateForm::new(&prefs);
+
+        compose.edit_language(String::new());
+        rewrite.edit_language(String::new());
+        translate.edit_target(String::new());
+        compose.sync_default_language("French");
+        rewrite.sync_default_language("French");
+        translate.sync_default_target("French");
+
+        assert_eq!(compose.output_language(), None);
+        assert_eq!(rewrite.output_language(), None);
+        assert_eq!(translate.target_language(), None);
     }
 }

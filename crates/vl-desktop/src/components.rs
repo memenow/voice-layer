@@ -284,36 +284,41 @@ fn picker_style(t: &iced::Theme, status: pick_list::Status) -> pick_list::Style 
 /// a [`picker`] (which requires `ToString`). Each `*_choices()` helper returns
 /// the options in display order; unwrap `.0` to recover the wire value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchetypeChoice(pub CompositionArchetype);
+pub struct ArchetypeChoice(pub Option<CompositionArchetype>);
 
 impl std::fmt::Display for ArchetypeChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self.0 {
-            CompositionArchetype::Email => "Email",
-            CompositionArchetype::CoverLetter => "Cover letter",
-            CompositionArchetype::DailyReport => "Daily report",
-            CompositionArchetype::Issue => "Issue",
-            CompositionArchetype::PullRequestDescription => "Pull request description",
-            CompositionArchetype::Prompt => "Prompt",
-            CompositionArchetype::TechnicalSummary => "Technical summary",
-            CompositionArchetype::Custom => "Custom",
+        f.write_str(match self.0.as_ref() {
+            None => "Automatic",
+            Some(CompositionArchetype::Email) => "Email",
+            Some(CompositionArchetype::CoverLetter) => "Cover letter",
+            Some(CompositionArchetype::DailyReport) => "Daily report",
+            Some(CompositionArchetype::Issue) => "Issue",
+            Some(CompositionArchetype::PullRequestDescription) => "Pull request description",
+            Some(CompositionArchetype::Prompt) => "Prompt",
+            Some(CompositionArchetype::TechnicalSummary) => "Technical summary",
+            Some(CompositionArchetype::Custom) => "Custom",
         })
     }
 }
 
 pub fn archetype_choices() -> Vec<ArchetypeChoice> {
-    [
-        CompositionArchetype::Email,
-        CompositionArchetype::CoverLetter,
-        CompositionArchetype::DailyReport,
-        CompositionArchetype::Issue,
-        CompositionArchetype::PullRequestDescription,
-        CompositionArchetype::Prompt,
-        CompositionArchetype::TechnicalSummary,
-        CompositionArchetype::Custom,
-    ]
-    .map(ArchetypeChoice)
-    .to_vec()
+    let mut choices = vec![ArchetypeChoice(None)];
+    choices.extend(
+        [
+            CompositionArchetype::Email,
+            CompositionArchetype::CoverLetter,
+            CompositionArchetype::DailyReport,
+            CompositionArchetype::Issue,
+            CompositionArchetype::PullRequestDescription,
+            CompositionArchetype::Prompt,
+            CompositionArchetype::TechnicalSummary,
+            CompositionArchetype::Custom,
+        ]
+        .map(Some)
+        .map(ArchetypeChoice),
+    );
+    choices
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,5 +469,16 @@ mod tests {
     #[test]
     fn raise_alpha_saturates_at_one() {
         assert_eq!(raise_alpha(Rgba::new(1.0, 1.0, 1.0, 0.95), 0.2).a, 1.0);
+    }
+
+    #[test]
+    fn archetype_choices_include_a_selectable_automatic_option() {
+        let choices = archetype_choices();
+        assert_eq!(choices.first(), Some(&ArchetypeChoice(None)));
+        assert_eq!(
+            choices.first().map(ToString::to_string).as_deref(),
+            Some("Automatic")
+        );
+        assert!(choices.contains(&ArchetypeChoice(Some(CompositionArchetype::Email))));
     }
 }

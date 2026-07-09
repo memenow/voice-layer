@@ -22,17 +22,15 @@ use iced::{Element, Subscription, Task, keyboard, stream, window};
 use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionArchetype, CompositionReceipt,
     DictationCaptureRequest, DictationCaptureResult, EventEnvelope, HealthResponse, InjectRequest,
-    InjectTarget, InjectionPlan, ProviderDescriptor, RecorderBackend, RewriteRequest, RewriteStyle,
-    StartDictationRequest, TranslateRequest, TriggerKind,
+    InjectTarget, InjectionPlan, ProviderDescriptor, ProviderKind, RecorderBackend, RewriteRequest,
+    RewriteStyle, StartDictationRequest, TranslateRequest, TriggerKind,
 };
 use voicelayer_ui::a11y::Accessibility;
 
 use crate::a11y;
 use crate::api::{self, Client};
 use crate::config;
-use crate::forms::{
-    ComposeForm, JobStage, RewriteForm, TranslateForm, apply_job_result, optional_text,
-};
+use crate::forms::{ComposeForm, JobStage, RewriteForm, TranslateForm, apply_job_result};
 use crate::launcher::spawn_daemon;
 use crate::portal::{self, PortalProbe, SHORTCUT_TOGGLE};
 use crate::state::{
@@ -163,7 +161,7 @@ pub enum Message {
 
     // Compose workflow.
     ComposePromptEdited(text_editor::Action),
-    ComposeArchetypeSelected(CompositionArchetype),
+    ComposeArchetypeSelected(Option<CompositionArchetype>),
     ComposeLanguageEdited(String),
     ComposeSubmitPressed,
     Composed(Result<Box<CompositionReceipt>, SharedError>),
@@ -343,6 +341,7 @@ impl App {
             }
             Message::RefreshProvidersPressed => list_providers(self.client.clone()),
             Message::ProvidersListed(Ok(list)) => {
+                reconcile_selected_asr_provider(&mut self.dictation_provider, Some(&list));
                 self.providers = Some(list);
                 Task::none()
             }
@@ -352,6 +351,7 @@ impl App {
                 // ASR picker stop offering ids from a daemon/socket we can no
                 // longer confirm; a successful refresh repopulates it.
                 self.providers = None;
+                reconcile_selected_asr_provider(&mut self.dictation_provider, None);
                 Task::none()
             }
             Message::PortalProbed(PortalProbe::Available) => {
@@ -453,11 +453,11 @@ impl App {
                 Task::none()
             }
             Message::ComposeArchetypeSelected(archetype) => {
-                self.compose.archetype = Some(archetype);
+                self.compose.archetype = archetype;
                 Task::none()
             }
             Message::ComposeLanguageEdited(value) => {
-                self.compose.language = value;
+                self.compose.edit_language(value);
                 Task::none()
             }
             Message::ComposeSubmitPressed => self.submit_compose(),
@@ -476,7 +476,7 @@ impl App {
                 Task::none()
             }
             Message::RewriteLanguageEdited(value) => {
-                self.rewrite.language = value;
+                self.rewrite.edit_language(value);
                 Task::none()
             }
             Message::RewriteSubmitPressed => self.submit_rewrite(),
@@ -491,7 +491,7 @@ impl App {
                 Task::none()
             }
             Message::TranslateTargetEdited(value) => {
-                self.translate.target = value;
+                self.translate.edit_target(value);
                 Task::none()
             }
             Message::TranslateSubmitPressed => self.submit_translate(),
@@ -503,13 +503,13 @@ impl App {
             // --- Preview → inject (shared by the three generative workflows) ---
             Message::InjectTargetSelected(tab, target) => {
                 if let Some(job) = self.job_mut(tab) {
-                    job.inject_target = target;
+                    job.set_inject_target(target);
                 }
                 Task::none()
             }
             Message::InjectAutoSubmitToggled(tab) => {
                 if let Some(job) = self.job_mut(tab) {
-                    job.auto_submit = !job.auto_submit;
+                    job.toggle_auto_submit();
                 }
                 Task::none()
             }
@@ -535,6 +535,9 @@ impl App {
 
             // --- Settings (local preferences) ---
             Message::PrefOutputLanguageEdited(value) => {
+                self.compose.sync_default_language(&value);
+                self.rewrite.sync_default_language(&value);
+                self.translate.sync_default_target(&value);
                 self.preferences.default_output_language = value;
                 Task::none()
             }
@@ -592,11 +595,7 @@ impl App {
     /// streaming stage that holds the microphone, or a one-shot capture in
     /// flight. The terminal stages (idle / completed / failed) are not active.
     fn capture_active(&self) -> bool {
-        self.capture_in_flight
-            || matches!(
-                self.session.stage,
-                SessionStage::Starting | SessionStage::Listening | SessionStage::Stopping
-            )
+        capture_is_active(self.capture_in_flight, self.session.stage)
     }
 
     /// Reconcile the capture HUD window with [`Self::capture_active`]: open it
@@ -654,6 +653,10 @@ impl App {
     /// for the configured window and returns a single result. The in-flight flag
     /// drives the capture button while the streaming stage machine is untouched.
     fn capture_session(&mut self) -> Task<Message> {
+        if self.capture_active() {
+            self.error = Some("A capture or dictation session is already in progress.".into());
+            return Task::none();
+        }
         if self.daemon != DaemonStatus::Healthy {
             self.error = Some("Daemon is not healthy; start it first.".into());
             return Task::none();
@@ -700,8 +703,7 @@ impl App {
         let request = ComposeRequest {
             spoken_prompt: prompt.to_owned(),
             archetype: self.compose.archetype.clone(),
-            output_language: optional_text(&self.compose.language)
-                .or_else(|| optional_text(&self.preferences.default_output_language)),
+            output_language: self.compose.output_language(),
         };
         self.compose
             .job
@@ -727,8 +729,7 @@ impl App {
         let request = RewriteRequest {
             source_text: source.to_owned(),
             style: self.rewrite.style.clone(),
-            output_language: optional_text(&self.rewrite.language)
-                .or_else(|| optional_text(&self.preferences.default_output_language)),
+            output_language: self.rewrite.output_language(),
         };
         self.rewrite
             .job
@@ -751,12 +752,7 @@ impl App {
             self.translate.job.error = Some("Enter text to translate.".into());
             return Task::none();
         }
-        // Fall back to the Settings default output language when the target field
-        // is blank, so a configured default makes Translate usable without
-        // retyping the language on every request.
-        let Some(target) = optional_text(&self.translate.target)
-            .or_else(|| optional_text(&self.preferences.default_output_language))
-        else {
+        let Some(target) = self.translate.target_language() else {
             self.translate.job.error = Some("Enter a target language.".into());
             return Task::none();
         };
@@ -902,6 +898,31 @@ fn fetch_sessions(client: Client) -> Task<Message> {
     )
 }
 
+fn reconcile_selected_asr_provider(
+    selected: &mut Option<String>,
+    providers: Option<&[ProviderDescriptor]>,
+) {
+    let should_clear = match selected.as_deref() {
+        None => false,
+        Some(selected_id) => !providers.is_some_and(|providers| {
+            providers
+                .iter()
+                .any(|provider| provider.kind == ProviderKind::Asr && provider.id == selected_id)
+        }),
+    };
+    if should_clear {
+        *selected = None;
+    }
+}
+
+fn capture_is_active(capture_in_flight: bool, stage: SessionStage) -> bool {
+    capture_in_flight
+        || matches!(
+            stage,
+            SessionStage::Starting | SessionStage::Listening | SessionStage::Stopping
+        )
+}
+
 /// Best-effort stream for portal-activated hotkeys; mirrors the listener task
 /// into the iced runtime. Silent when the portal is unavailable.
 fn portal_stream() -> impl iced::futures::Stream<Item = Message> {
@@ -994,17 +1015,105 @@ fn sse_stream(socket_path: PathBuf) -> impl iced::futures::Stream<Item = Message
                         tracing::debug!(error = %error, "event stream ended");
                     }
                 });
+                let reader_guard = AbortOnDrop(reader);
                 while let Some(event) = rx.recv().await {
                     if output.send(Message::EventReceived(event)).await.is_err() {
-                        reader.abort();
                         return;
                     }
                 }
-                reader.abort();
+                drop(reader_guard);
                 // The daemon closed the stream or the socket was unreachable; pause
                 // before reconnecting so a down daemon does not spin.
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             }
         },
     )
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voicelayer_core::ProviderKind;
+
+    fn provider(id: &str, kind: ProviderKind) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: id.to_owned(),
+            kind,
+            transport: "test".to_owned(),
+            local: true,
+            default_enabled: true,
+            experimental: false,
+            license: "Apache-2.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn provider_refresh_keeps_only_a_selected_asr_that_is_still_available() {
+        let providers = vec![
+            provider("whisper", ProviderKind::Asr),
+            provider("writer", ProviderKind::Llm),
+        ];
+
+        let mut selected = Some("whisper".to_owned());
+        reconcile_selected_asr_provider(&mut selected, Some(&providers));
+        assert_eq!(selected.as_deref(), Some("whisper"));
+
+        let mut missing = Some("missing".to_owned());
+        reconcile_selected_asr_provider(&mut missing, Some(&providers));
+        assert_eq!(missing, None);
+
+        let mut wrong_kind = Some("writer".to_owned());
+        reconcile_selected_asr_provider(&mut wrong_kind, Some(&providers));
+        assert_eq!(wrong_kind, None);
+    }
+
+    #[test]
+    fn provider_refresh_error_clears_the_unverifiable_selection() {
+        let mut selected = Some("whisper".to_owned());
+        reconcile_selected_asr_provider(&mut selected, None);
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn capture_is_active_for_one_shot_and_streaming_microphone_states() {
+        assert!(capture_is_active(true, SessionStage::Idle));
+        for stage in [
+            SessionStage::Starting,
+            SessionStage::Listening,
+            SessionStage::Stopping,
+        ] {
+            assert!(capture_is_active(false, stage), "stage {stage:?}");
+        }
+        for stage in [
+            SessionStage::Idle,
+            SessionStage::Completed,
+            SessionStage::Failed,
+        ] {
+            assert!(!capture_is_active(false, stage), "stage {stage:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_a_pending_reader_task() {
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = reader.abort_handle();
+        let guard = AbortOnDrop(reader);
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the subscription guard should abort its reader task");
+    }
 }
