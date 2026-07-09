@@ -15,7 +15,7 @@ use iced::{Element, Length, window};
 use voicelayer_core::{ProviderDescriptor, ProviderKind};
 use voicelayer_ui::tokens::{self, Weight};
 
-use crate::app::{App, Message};
+use crate::app::{App, Message, dictation_translate_supported, is_dispatchable_asr_provider};
 use crate::components::{self, Capsule, ProviderChoice, Tone};
 use crate::glass;
 use crate::hud;
@@ -119,11 +119,13 @@ fn nav_button(app: &App, tab: WorkflowTab) -> Element<'_, Message> {
 fn connection_controls(app: &App) -> Element<'_, Message> {
     let field = components::field("Socket path", &app.socket_input, Message::SocketPathEdited);
     let control: Element<'_, Message> = match app.daemon {
-        DaemonStatus::Unknown | DaemonStatus::Probing => {
-            components::capsule("Probing…", Capsule::Ghost)
-                .width(Length::Fill)
-                .into()
-        }
+        DaemonStatus::Unknown => components::capsule("Probe daemon", Capsule::Ghost)
+            .width(Length::Fill)
+            .on_press(Message::ProbeDaemonPressed)
+            .into(),
+        DaemonStatus::Probing => components::capsule("Probing…", Capsule::Ghost)
+            .width(Length::Fill)
+            .into(),
         DaemonStatus::Healthy => components::capsule("Re-probe", Capsule::Ghost)
             .width(Length::Fill)
             .on_press(Message::ProbeDaemonPressed)
@@ -439,14 +441,7 @@ fn provider_kind_label(kind: &ProviderKind) -> &'static str {
 /// capture. A sibling card to the streaming-status card above it — never nested.
 fn capture_options(app: &App) -> Element<'_, Message> {
     let p = theme::palette();
-    let asr_ids: Vec<String> = app
-        .providers
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter(|descriptor| matches!(descriptor.kind, ProviderKind::Asr))
-        .map(|descriptor| descriptor.id.clone())
-        .collect();
+    let asr_ids = dispatchable_asr_ids(app.providers.as_deref().unwrap_or(&[]));
 
     let provider_picker = components::picker(
         "Automatic (daemon default)",
@@ -465,19 +460,25 @@ fn capture_options(app: &App) -> Element<'_, Message> {
         Some(app.dictation_segmentation),
         Message::DictationSegmentationSelected,
     );
-    let translate = components::capsule(
-        if app.dictation_translate {
-            "Translate to English: on"
+    let translate: Element<'_, Message> =
+        if dictation_translate_supported(app.dictation_provider.as_deref()) {
+            components::capsule(
+                if app.dictation_translate {
+                    "Translate to English: on"
+                } else {
+                    "Translate to English: off"
+                },
+                if app.dictation_translate {
+                    Capsule::Secondary
+                } else {
+                    Capsule::Ghost
+                },
+            )
+            .on_press(Message::DictationTranslateToggled)
+            .into()
         } else {
-            "Translate to English: off"
-        },
-        if app.dictation_translate {
-            Capsule::Secondary
-        } else {
-            Capsule::Ghost
-        },
-    )
-    .on_press(Message::DictationTranslateToggled);
+            components::capsule("Translate to English: unavailable", Capsule::Ghost).into()
+        };
 
     // One-shot capture is offered only when no streaming session is mid-flight.
     let capturable = matches!(
@@ -514,6 +515,14 @@ fn capture_options(app: &App) -> Element<'_, Message> {
     )
     .width(Length::Fill)
     .into()
+}
+
+fn dispatchable_asr_ids(providers: &[ProviderDescriptor]) -> Vec<String> {
+    providers
+        .iter()
+        .filter(|provider| is_dispatchable_asr_provider(provider))
+        .map(|provider| provider.id.clone())
+        .collect()
 }
 
 /// A captioned control: the label sits above its input.
@@ -554,8 +563,21 @@ fn optional(value: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorEmptyState, doctor_empty_state};
+    use super::{DoctorEmptyState, dispatchable_asr_ids, doctor_empty_state};
     use crate::state::DaemonStatus;
+    use voicelayer_core::{ProviderDescriptor, ProviderKind};
+
+    fn provider(id: &str, kind: ProviderKind) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: id.to_owned(),
+            kind,
+            transport: "test".to_owned(),
+            local: true,
+            default_enabled: true,
+            experimental: false,
+            license: "Apache-2.0".to_owned(),
+        }
+    }
 
     #[test]
     fn doctor_empty_state_distinguishes_probing_from_failure() {
@@ -570,6 +592,26 @@ mod tests {
         assert_eq!(
             doctor_empty_state(DaemonStatus::Unreachable, None),
             DoctorEmptyState::Failed("Daemon unreachable.".to_owned()),
+        );
+    }
+
+    #[test]
+    fn dictation_picker_lists_only_dispatchable_asr_providers() {
+        let providers = vec![
+            provider("whisper_cpp", ProviderKind::Asr),
+            provider("mimo_v2_5_asr", ProviderKind::Asr),
+            provider("qwen3_asr_1_7b", ProviderKind::Asr),
+            provider("voxtral_realtime", ProviderKind::Asr),
+            provider("writer", ProviderKind::Llm),
+        ];
+
+        assert_eq!(
+            dispatchable_asr_ids(&providers),
+            vec![
+                "whisper_cpp".to_owned(),
+                "mimo_v2_5_asr".to_owned(),
+                "qwen3_asr_1_7b".to_owned(),
+            ],
         );
     }
 }

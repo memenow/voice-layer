@@ -24,6 +24,7 @@ use voicelayer_core::{
     DictationCaptureRequest, DictationCaptureResult, EventEnvelope, HealthResponse, InjectRequest,
     InjectTarget, InjectionPlan, ProviderDescriptor, ProviderKind, RecorderBackend, RewriteRequest,
     RewriteStyle, StartDictationRequest, TranslateRequest, TriggerKind,
+    is_supported_transcribe_provider_id,
 };
 use voicelayer_ui::a11y::Accessibility;
 
@@ -85,6 +86,9 @@ pub struct App {
     pub(crate) hud_window: Option<window::Id>,
     client: Client,
     pub(crate) socket_input: String,
+    /// Generation of the active daemon target. Async replies carry this value so
+    /// a late response from a previously selected socket cannot refill its cache.
+    daemon_epoch: u64,
     pub(crate) daemon: DaemonStatus,
     pub(crate) tab: WorkflowTab,
     pub(crate) session: Session,
@@ -135,18 +139,18 @@ pub enum Message {
     // The big payloads (`HealthResponse`, `DictationCaptureResult`) are boxed:
     // iced clones every `Message` on dispatch, so keeping the enum small keeps
     // those clones cheap and satisfies `clippy::large_enum_variant`.
-    DaemonProbed(Result<Box<HealthResponse>, SharedError>),
+    DaemonProbed(u64, Result<Box<HealthResponse>, SharedError>),
     StartDaemonPressed,
-    DaemonSpawnResult(Result<(), SharedError>),
+    DaemonSpawnResult(u64, Result<(), SharedError>),
     RefreshProvidersPressed,
-    ProvidersListed(Result<Vec<ProviderDescriptor>, SharedError>),
+    ProvidersListed(u64, Result<Vec<ProviderDescriptor>, SharedError>),
     PortalProbed(PortalProbe),
     HotkeyReceived,
     StartPressed,
     StopPressed,
     SessionStarted(Result<CaptureSession, SharedError>),
     SessionStopped(Result<Box<DictationCaptureResult>, SharedError>),
-    EventReceived(EventEnvelope),
+    EventReceived(u64, EventEnvelope),
     /// Frame tick from `window::frames`, carrying the frame instant; advances the
     /// glass shader's animation clock.
     Tick(Instant),
@@ -200,7 +204,7 @@ pub enum Message {
 
     // History.
     HistoryRefreshPressed,
-    SessionsListed(Result<Vec<CaptureSession>, SharedError>),
+    SessionsListed(u64, Result<Vec<CaptureSession>, SharedError>),
 }
 
 impl App {
@@ -218,6 +222,7 @@ impl App {
             hud_window: None,
             client: client.clone(),
             socket_input,
+            daemon_epoch: 0,
             daemon: DaemonStatus::Probing,
             tab: WorkflowTab::default(),
             session: Session::default(),
@@ -242,8 +247,8 @@ impl App {
         };
         let startup = Task::batch(vec![
             open_main.map(Message::MainWindowOpened),
-            probe_health(client.clone()),
-            list_providers(client),
+            probe_health(client.clone(), 0),
+            list_providers(client, 0),
             Task::perform(portal::probe(), Message::PortalProbed),
             // Read the initial OS accessibility state; the subscription keeps it live.
             Task::perform(a11y::probe(), Message::SystemA11yChanged),
@@ -291,18 +296,42 @@ impl App {
                 // Refresh the read-only panels on entry so they show live data;
                 // the dictation provider picker also needs the provider list.
                 match tab {
-                    WorkflowTab::Providers => list_providers(self.client.clone()),
-                    WorkflowTab::Doctor => probe_health(self.client.clone()),
-                    WorkflowTab::History => fetch_sessions(self.client.clone()),
+                    WorkflowTab::Providers => {
+                        list_providers(self.client.clone(), self.daemon_epoch)
+                    }
+                    WorkflowTab::Doctor => probe_health(self.client.clone(), self.daemon_epoch),
+                    WorkflowTab::History => fetch_sessions(self.client.clone(), self.daemon_epoch),
                     WorkflowTab::Dictation if self.providers.is_none() => {
-                        list_providers(self.client.clone())
+                        list_providers(self.client.clone(), self.daemon_epoch)
                     }
                     _ => Task::none(),
                 }
             }
             Message::SocketPathEdited(next) => {
-                self.client = Client::new(PathBuf::from(next.trim()));
+                let socket_path = PathBuf::from(next.trim());
+                if socket_path == self.client.socket_path() {
+                    self.socket_input = next;
+                    return Task::none();
+                }
+                if self.daemon_request_active() {
+                    self.error = Some(
+                        "Finish the active daemon request before changing the socket path."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+
+                self.client = Client::new(socket_path);
                 self.socket_input = next;
+                self.daemon_epoch = self.daemon_epoch.wrapping_add(1);
+                self.daemon = DaemonStatus::Unknown;
+                self.session = Session::default();
+                self.providers = None;
+                self.health = None;
+                self.last_event = None;
+                self.error = None;
+                self.dictation_provider = None;
+                self.sessions = None;
                 Task::none()
             }
             Message::ProbeDaemonPressed => {
@@ -311,15 +340,19 @@ impl App {
                 // Drop the prior probe's diagnostics so the Doctor panel cannot
                 // present stale socket/worker details as current while re-probing.
                 self.health = None;
-                probe_health(self.client.clone())
+                Task::batch([
+                    probe_health(self.client.clone(), self.daemon_epoch),
+                    list_providers(self.client.clone(), self.daemon_epoch),
+                ])
             }
-            Message::DaemonProbed(Ok(health)) => {
+            Message::DaemonProbed(epoch, _) if epoch != self.daemon_epoch => Task::none(),
+            Message::DaemonProbed(_, Ok(health)) => {
                 self.daemon = DaemonStatus::Healthy;
                 self.health = Some(*health);
                 self.error = None;
                 Task::none()
             }
-            Message::DaemonProbed(Err(error)) => {
+            Message::DaemonProbed(_, Err(error)) => {
                 self.daemon = DaemonStatus::Unreachable;
                 self.error = Some((*error).clone());
                 // The daemon is down or unreachable; clear the last good probe so
@@ -329,23 +362,36 @@ impl App {
             }
             Message::StartDaemonPressed => {
                 self.error = None;
-                Task::perform(spawn_daemon(), Message::DaemonSpawnResult)
+                let daemon_epoch = self.daemon_epoch;
+                Task::perform(spawn_daemon(), move |result| {
+                    Message::DaemonSpawnResult(daemon_epoch, result)
+                })
             }
-            Message::DaemonSpawnResult(Ok(())) => {
+            Message::DaemonSpawnResult(epoch, _) if epoch != self.daemon_epoch => Task::none(),
+            Message::DaemonSpawnResult(_, Ok(())) => {
                 self.daemon = DaemonStatus::Probing;
-                probe_health(self.client.clone())
+                Task::batch([
+                    probe_health(self.client.clone(), self.daemon_epoch),
+                    list_providers(self.client.clone(), self.daemon_epoch),
+                ])
             }
-            Message::DaemonSpawnResult(Err(error)) => {
+            Message::DaemonSpawnResult(_, Err(error)) => {
                 self.error = Some(format!("Failed to start daemon: {error}"));
                 Task::none()
             }
-            Message::RefreshProvidersPressed => list_providers(self.client.clone()),
-            Message::ProvidersListed(Ok(list)) => {
+            Message::RefreshProvidersPressed => {
+                list_providers(self.client.clone(), self.daemon_epoch)
+            }
+            Message::ProvidersListed(epoch, _) if epoch != self.daemon_epoch => Task::none(),
+            Message::ProvidersListed(_, Ok(list)) => {
                 reconcile_selected_asr_provider(&mut self.dictation_provider, Some(&list));
+                if !dictation_translate_supported(self.dictation_provider.as_deref()) {
+                    self.dictation_translate = false;
+                }
                 self.providers = Some(list);
                 Task::none()
             }
-            Message::ProvidersListed(Err(error)) => {
+            Message::ProvidersListed(_, Err(error)) => {
                 self.error = Some((*error).clone());
                 // Drop the cached list so the Providers panel and the dictation
                 // ASR picker stop offering ids from a daemon/socket we can no
@@ -402,7 +448,8 @@ impl App {
                 self.error = Some((*error).clone());
                 self.sync_hud()
             }
-            Message::EventReceived(event) => {
+            Message::EventReceived(epoch, _) if epoch != self.daemon_epoch => Task::none(),
+            Message::EventReceived(_, event) => {
                 self.last_event = Some(event);
                 Task::none()
             }
@@ -417,6 +464,9 @@ impl App {
             // --- Dictation panel controls ---
             Message::DictationProviderSelected(provider) => {
                 self.dictation_provider = provider;
+                if !dictation_translate_supported(self.dictation_provider.as_deref()) {
+                    self.dictation_translate = false;
+                }
                 Task::none()
             }
             Message::DictationLanguageEdited(value) => {
@@ -428,7 +478,11 @@ impl App {
                 Task::none()
             }
             Message::DictationTranslateToggled => {
-                self.dictation_translate = !self.dictation_translate;
+                if dictation_translate_supported(self.dictation_provider.as_deref()) {
+                    self.dictation_translate = !self.dictation_translate;
+                } else {
+                    self.dictation_translate = false;
+                }
                 Task::none()
             }
             Message::CapturePressed => {
@@ -569,12 +623,15 @@ impl App {
             }
 
             // --- History ---
-            Message::HistoryRefreshPressed => fetch_sessions(self.client.clone()),
-            Message::SessionsListed(Ok(list)) => {
+            Message::HistoryRefreshPressed => {
+                fetch_sessions(self.client.clone(), self.daemon_epoch)
+            }
+            Message::SessionsListed(epoch, _) if epoch != self.daemon_epoch => Task::none(),
+            Message::SessionsListed(_, Ok(list)) => {
                 self.sessions = Some(list);
                 Task::none()
             }
-            Message::SessionsListed(Err(error)) => {
+            Message::SessionsListed(_, Err(error)) => {
                 self.error = Some((*error).clone());
                 Task::none()
             }
@@ -596,6 +653,16 @@ impl App {
     /// flight. The terminal stages (idle / completed / failed) are not active.
     fn capture_active(&self) -> bool {
         capture_is_active(self.capture_in_flight, self.session.stage)
+    }
+
+    /// A socket retarget cannot safely cross a request whose reply mutates live
+    /// workflow state. Read-only daemon caches carry an epoch and can be dropped;
+    /// capture and generative jobs instead keep the current target until settled.
+    fn daemon_request_active(&self) -> bool {
+        self.capture_active()
+            || [&self.compose.job, &self.rewrite.job, &self.translate.job]
+                .iter()
+                .any(|job| job.submitting || job.injecting)
     }
 
     /// Reconcile the capture HUD window with [`Self::capture_active`]: open it
@@ -633,11 +700,15 @@ impl App {
         self.session.begin_starting();
         self.error = None;
         let client = self.client.clone();
+        let translate_to_english = validated_dictation_translate(
+            self.dictation_provider.as_deref(),
+            self.dictation_translate,
+        );
         let request = StartDictationRequest {
             trigger: TriggerKind::TrayButton,
             language_profile: language_profile_from_input(&self.dictation_language),
             recorder_backend: Some(self.preferences.recorder_backend),
-            translate_to_english: self.dictation_translate,
+            translate_to_english,
             keep_audio: false,
             segmentation: self.dictation_segmentation.to_mode(),
             provider_id: self.dictation_provider.clone(),
@@ -663,12 +734,16 @@ impl App {
         }
         self.capture_in_flight = true;
         self.error = None;
+        let translate_to_english = validated_dictation_translate(
+            self.dictation_provider.as_deref(),
+            self.dictation_translate,
+        );
         let request = DictationCaptureRequest {
             trigger: TriggerKind::TrayButton,
             language_profile: language_profile_from_input(&self.dictation_language),
             duration_seconds: self.preferences.capture_seconds,
             recorder_backend: Some(self.preferences.recorder_backend),
-            translate_to_english: self.dictation_translate,
+            translate_to_english,
             keep_audio: false,
             provider_id: self.dictation_provider.clone(),
         };
@@ -855,12 +930,12 @@ impl App {
             // Mirror the OS accessibility state (contrast / reduced motion) as it
             // changes, via the XDG settings portal.
             Subscription::run(a11y_stream),
-            // Keyed by the socket path so editing it retargets the live stream.
-            // A non-capturing closure bridges `&PathBuf` to the owned-path
-            // `sse_stream`; it coerces to `run_with`'s `fn(&PathBuf)` builder.
-            Subscription::run_with(self.client.socket_path().to_path_buf(), |path: &PathBuf| {
-                sse_stream(path.clone())
-            }),
+            // Keyed by both socket and generation so every accepted retarget
+            // replaces the live stream and late events identify their origin.
+            Subscription::run_with(
+                (self.client.socket_path().to_path_buf(), self.daemon_epoch),
+                |target: &(PathBuf, u64)| sse_stream(target.0.clone(), target.1),
+            ),
             window::close_events().map(Message::WindowClosed),
         ];
         // The glass shader's animation clock. Reduce Motion gates it off: when the
@@ -877,25 +952,42 @@ impl App {
     }
 }
 
-fn probe_health(client: Client) -> Task<Message> {
+fn probe_health(client: Client, daemon_epoch: u64) -> Task<Message> {
     Task::perform(
         async move { client.health().await.map(Box::new) },
-        Message::DaemonProbed,
+        move |result| Message::DaemonProbed(daemon_epoch, result),
     )
 }
 
-fn list_providers(client: Client) -> Task<Message> {
-    Task::perform(
-        async move { client.providers().await },
-        Message::ProvidersListed,
-    )
+fn list_providers(client: Client, daemon_epoch: u64) -> Task<Message> {
+    Task::perform(async move { client.providers().await }, move |result| {
+        Message::ProvidersListed(daemon_epoch, result)
+    })
 }
 
-fn fetch_sessions(client: Client) -> Task<Message> {
-    Task::perform(
-        async move { client.sessions().await },
-        Message::SessionsListed,
-    )
+fn fetch_sessions(client: Client, daemon_epoch: u64) -> Task<Message> {
+    Task::perform(async move { client.sessions().await }, move |result| {
+        Message::SessionsListed(daemon_epoch, result)
+    })
+}
+
+/// Whether an advertised provider is executable through the daemon's current
+/// transcription dispatch. The catalog also contains forward-looking entries,
+/// so `ProviderKind::Asr` alone is not sufficient for an actionable picker.
+pub(crate) fn is_dispatchable_asr_provider(provider: &ProviderDescriptor) -> bool {
+    provider.kind == ProviderKind::Asr
+        && is_supported_transcribe_provider_id(Some(provider.id.as_str()))
+}
+
+/// Translation is an explicit provider capability. Automatic dispatch and the
+/// whisper.cpp provider support it today; new ASR providers remain disabled
+/// until their worker path deliberately opts in.
+pub(crate) fn dictation_translate_supported(provider_id: Option<&str>) -> bool {
+    matches!(provider_id, None | Some("whisper_cpp"))
+}
+
+fn validated_dictation_translate(provider_id: Option<&str>, requested: bool) -> bool {
+    requested && dictation_translate_supported(provider_id)
 }
 
 fn reconcile_selected_asr_provider(
@@ -905,9 +997,9 @@ fn reconcile_selected_asr_provider(
     let should_clear = match selected.as_deref() {
         None => false,
         Some(selected_id) => !providers.is_some_and(|providers| {
-            providers
-                .iter()
-                .any(|provider| provider.kind == ProviderKind::Asr && provider.id == selected_id)
+            providers.iter().any(|provider| {
+                is_dispatchable_asr_provider(provider) && provider.id == selected_id
+            })
         }),
     };
     if should_clear {
@@ -1003,7 +1095,10 @@ fn tray_stream() -> impl iced::futures::Stream<Item = Message> {
 /// drop. Takes an owned `PathBuf` (not `&PathBuf`) so the returned stream
 /// captures no input lifetime and stays `'static` — the bridging closure in
 /// [`App::subscription`] hands it a clone per keyed socket path.
-fn sse_stream(socket_path: PathBuf) -> impl iced::futures::Stream<Item = Message> {
+fn sse_stream(
+    socket_path: PathBuf,
+    daemon_epoch: u64,
+) -> impl iced::futures::Stream<Item = Message> {
     stream::channel(
         64,
         async move |mut output: futures_mpsc::Sender<Message>| {
@@ -1017,7 +1112,11 @@ fn sse_stream(socket_path: PathBuf) -> impl iced::futures::Stream<Item = Message
                 });
                 let reader_guard = AbortOnDrop(reader);
                 while let Some(event) = rx.recv().await {
-                    if output.send(Message::EventReceived(event)).await.is_err() {
+                    if output
+                        .send(Message::EventReceived(daemon_epoch, event))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1041,7 +1140,40 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voicelayer_core::ProviderKind;
+    use std::sync::Arc;
+    use voicelayer_core::{LanguageProfile, ProviderKind, SessionMode};
+
+    fn test_app() -> App {
+        let preferences = Preferences::default();
+        App {
+            main_window: None,
+            hud_window: None,
+            client: Client::new(PathBuf::from("/tmp/old.sock")),
+            socket_input: "/tmp/old.sock".to_owned(),
+            daemon_epoch: 0,
+            daemon: DaemonStatus::Healthy,
+            tab: WorkflowTab::default(),
+            session: Session::default(),
+            providers: None,
+            health: None,
+            hotkey: HotkeyStatus::default(),
+            last_event: None,
+            error: None,
+            elapsed: 0.0,
+            last_frame: None,
+            dictation_provider: None,
+            dictation_language: String::new(),
+            dictation_segmentation: SegChoice::default(),
+            dictation_translate: false,
+            capture_in_flight: false,
+            compose: ComposeForm::new(&preferences),
+            rewrite: RewriteForm::new(&preferences),
+            translate: TranslateForm::new(&preferences),
+            sessions: None,
+            preferences,
+            system_a11y: SystemA11y::default(),
+        }
+    }
 
     fn provider(id: &str, kind: ProviderKind) -> ProviderDescriptor {
         ProviderDescriptor {
@@ -1058,13 +1190,18 @@ mod tests {
     #[test]
     fn provider_refresh_keeps_only_a_selected_asr_that_is_still_available() {
         let providers = vec![
-            provider("whisper", ProviderKind::Asr),
+            provider("whisper_cpp", ProviderKind::Asr),
+            provider("voxtral_realtime", ProviderKind::Asr),
             provider("writer", ProviderKind::Llm),
         ];
 
-        let mut selected = Some("whisper".to_owned());
+        let mut selected = Some("whisper_cpp".to_owned());
         reconcile_selected_asr_provider(&mut selected, Some(&providers));
-        assert_eq!(selected.as_deref(), Some("whisper"));
+        assert_eq!(selected.as_deref(), Some("whisper_cpp"));
+
+        let mut advertised_only = Some("voxtral_realtime".to_owned());
+        reconcile_selected_asr_provider(&mut advertised_only, Some(&providers));
+        assert_eq!(advertised_only, None);
 
         let mut missing = Some("missing".to_owned());
         reconcile_selected_asr_provider(&mut missing, Some(&providers));
@@ -1077,9 +1214,138 @@ mod tests {
 
     #[test]
     fn provider_refresh_error_clears_the_unverifiable_selection() {
-        let mut selected = Some("whisper".to_owned());
+        let mut selected = Some("whisper_cpp".to_owned());
         reconcile_selected_asr_provider(&mut selected, None);
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn translation_is_enabled_only_for_compatible_dictation_providers() {
+        assert!(dictation_translate_supported(None));
+        assert!(dictation_translate_supported(Some("whisper_cpp")));
+        assert!(!dictation_translate_supported(Some("mimo_v2_5_asr")));
+        assert!(!dictation_translate_supported(Some("qwen3_asr_1_7b")));
+        assert!(!dictation_translate_supported(Some("future_asr")));
+
+        assert!(validated_dictation_translate(None, true));
+        assert!(!validated_dictation_translate(Some("mimo_v2_5_asr"), true));
+        assert!(!validated_dictation_translate(Some("whisper_cpp"), false));
+    }
+
+    #[test]
+    fn selecting_an_incompatible_provider_disables_translation() {
+        let mut app = test_app();
+        app.dictation_translate = true;
+
+        drop(app.update(Message::DictationProviderSelected(Some(
+            "mimo_v2_5_asr".to_owned(),
+        ))));
+        assert!(!app.dictation_translate);
+
+        drop(app.update(Message::DictationTranslateToggled));
+        assert!(!app.dictation_translate);
+
+        drop(app.update(Message::DictationProviderSelected(Some(
+            "whisper_cpp".to_owned(),
+        ))));
+        drop(app.update(Message::DictationTranslateToggled));
+        assert!(app.dictation_translate);
+    }
+
+    #[test]
+    fn socket_retarget_clears_daemon_scoped_state_and_advances_epoch() {
+        let mut app = test_app();
+        app.providers = Some(vec![provider("whisper_cpp", ProviderKind::Asr)]);
+        app.dictation_provider = Some("whisper_cpp".to_owned());
+        app.sessions = Some(Vec::new());
+        app.last_event = Some(EventEnvelope::new("ready", None, "old daemon"));
+        app.session.stage = SessionStage::Completed;
+        app.session.transcript = Some("old transcript".to_owned());
+
+        drop(app.update(Message::SocketPathEdited("/tmp/new.sock".to_owned())));
+
+        assert_eq!(app.client.socket_path(), PathBuf::from("/tmp/new.sock"));
+        assert_eq!(app.socket_input, "/tmp/new.sock");
+        assert_eq!(app.daemon_epoch, 1);
+        assert_eq!(app.daemon, DaemonStatus::Unknown);
+        assert!(app.providers.is_none());
+        assert!(app.dictation_provider.is_none());
+        assert!(app.sessions.is_none());
+        assert!(app.last_event.is_none());
+        assert_eq!(app.session.stage, SessionStage::Idle);
+        assert!(app.session.transcript.is_none());
+    }
+
+    #[test]
+    fn same_effective_socket_path_preserves_daemon_state_and_epoch() {
+        let mut app = test_app();
+        app.providers = Some(vec![provider("whisper_cpp", ProviderKind::Asr)]);
+
+        drop(app.update(Message::SocketPathEdited("  /tmp/old.sock  ".to_owned())));
+
+        assert_eq!(app.daemon_epoch, 0);
+        assert_eq!(app.daemon, DaemonStatus::Healthy);
+        assert!(app.providers.is_some());
+        assert_eq!(app.socket_input, "  /tmp/old.sock  ");
+    }
+
+    #[test]
+    fn socket_retarget_is_rejected_while_capture_is_active() {
+        let mut app = test_app();
+        app.capture_in_flight = true;
+
+        drop(app.update(Message::SocketPathEdited("/tmp/new.sock".to_owned())));
+
+        assert_eq!(app.client.socket_path(), PathBuf::from("/tmp/old.sock"));
+        assert_eq!(app.socket_input, "/tmp/old.sock");
+        assert_eq!(app.daemon_epoch, 0);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("socket path"))
+        );
+    }
+
+    #[test]
+    fn stale_daemon_replies_are_ignored_after_socket_retarget() {
+        let mut app = test_app();
+        drop(app.update(Message::SocketPathEdited("/tmp/new.sock".to_owned())));
+        drop(app.update(Message::SocketPathEdited("/tmp/old.sock".to_owned())));
+        assert_eq!(
+            app.daemon_epoch, 2,
+            "A -> B -> A remains a new target generation"
+        );
+
+        drop(app.update(Message::DaemonProbed(
+            0,
+            Err(Arc::new("old daemon failed".to_owned())),
+        )));
+        drop(app.update(Message::DaemonSpawnResult(
+            0,
+            Err(Arc::new("old daemon spawn failed".to_owned())),
+        )));
+        drop(app.update(Message::ProvidersListed(
+            0,
+            Ok(vec![provider("whisper_cpp", ProviderKind::Asr)]),
+        )));
+        drop(app.update(Message::SessionsListed(
+            0,
+            Ok(vec![CaptureSession::new(
+                SessionMode::Dictation,
+                TriggerKind::TrayButton,
+                LanguageProfile::default(),
+            )]),
+        )));
+        drop(app.update(Message::EventReceived(
+            0,
+            EventEnvelope::new("stale", None, "old daemon"),
+        )));
+
+        assert_eq!(app.daemon, DaemonStatus::Unknown);
+        assert!(app.error.is_none());
+        assert!(app.providers.is_none());
+        assert!(app.sessions.is_none());
+        assert!(app.last_event.is_none());
     }
 
     #[test]
