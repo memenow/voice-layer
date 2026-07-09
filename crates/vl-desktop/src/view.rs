@@ -301,23 +301,25 @@ fn providers_panel(app: &App) -> Element<'_, Message> {
     ]
     .spacing(tokens::space::MD);
 
-    let listing: Element<'_, Message> = match &app.providers {
-        Some(list) if !list.is_empty() => {
-            let mut rows = Column::new().spacing(tokens::space::SM);
-            for descriptor in list {
-                rows = rows.push(provider_row(descriptor));
+    let listing: Element<'_, Message> =
+        match provider_empty_state(app.providers.as_deref(), app.providers_error.as_deref()) {
+            None => {
+                let mut rows = Column::new().spacing(tokens::space::SM);
+                for descriptor in app.providers.as_deref().unwrap_or_default() {
+                    rows = rows.push(provider_row(descriptor));
+                }
+                rows.into()
             }
-            rows.into()
-        }
-        Some(_) => text("No providers registered.")
-            .size(tokens::text::BODY)
-            .color(theme::color(p.text_secondary))
-            .into(),
-        None => text("Loading providers…")
-            .size(tokens::text::BODY)
-            .color(theme::color(p.text_secondary))
-            .into(),
-    };
+            Some(ProviderEmptyState::Empty) => text("No providers registered.")
+                .size(tokens::text::BODY)
+                .color(theme::color(p.text_secondary))
+                .into(),
+            Some(ProviderEmptyState::Loading) => text("Loading providers…")
+                .size(tokens::text::BODY)
+                .color(theme::color(p.text_secondary))
+                .into(),
+            Some(ProviderEmptyState::Failed(error)) => scoped_error_text(&error),
+        };
 
     column![
         components::card(
@@ -327,6 +329,27 @@ fn providers_panel(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
     ]
     .into()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProviderEmptyState {
+    Loading,
+    Empty,
+    Failed(String),
+}
+
+fn provider_empty_state(
+    providers: Option<&[ProviderDescriptor]>,
+    error: Option<&str>,
+) -> Option<ProviderEmptyState> {
+    if let Some(error) = error {
+        return Some(ProviderEmptyState::Failed(error.to_owned()));
+    }
+    match providers {
+        Some([]) => Some(ProviderEmptyState::Empty),
+        Some(_) => None,
+        None => Some(ProviderEmptyState::Loading),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -501,20 +524,29 @@ fn capture_options(app: &App) -> Element<'_, Message> {
         .size(tokens::text::TITLE)
         .color(theme::color(p.text_primary));
 
-    components::card(
-        column![
-            header,
-            field_group("ASR provider", provider_picker),
-            field_group("Input language", language),
-            field_group("Segmentation", segmentation),
-            translate,
-            capture,
-        ]
-        .spacing(tokens::space::MD),
-        app.accessibility(),
-    )
-    .width(Length::Fill)
-    .into()
+    let mut content = column![
+        header,
+        field_group("ASR provider", provider_picker),
+        field_group("Input language", language),
+        field_group("Segmentation", segmentation),
+        translate,
+        capture,
+    ]
+    .spacing(tokens::space::MD);
+    if let Some(error) = &app.providers_error {
+        content = content.push(scoped_error_text(error));
+    }
+
+    components::card(content, app.accessibility())
+        .width(Length::Fill)
+        .into()
+}
+
+fn scoped_error_text(message: &str) -> Element<'static, Message> {
+    text(format!("Error: {message}"))
+        .size(tokens::text::CAPTION)
+        .color(theme::color(theme::palette().danger))
+        .into()
 }
 
 fn dispatchable_asr_ids(providers: &[ProviderDescriptor]) -> Vec<String> {
@@ -563,7 +595,10 @@ fn optional(value: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorEmptyState, dispatchable_asr_ids, doctor_empty_state};
+    use super::{
+        DoctorEmptyState, ProviderEmptyState, dispatchable_asr_ids, doctor_empty_state,
+        provider_empty_state,
+    };
     use crate::state::DaemonStatus;
     use voicelayer_core::{ProviderDescriptor, ProviderKind};
 
@@ -612,6 +647,20 @@ mod tests {
                 "mimo_v2_5_asr".to_owned(),
                 "qwen3_asr_1_7b".to_owned(),
             ],
+        );
+    }
+
+    #[test]
+    fn provider_empty_state_shows_the_scoped_error_instead_of_loading() {
+        assert_eq!(
+            provider_empty_state(None, Some("provider refresh failed")),
+            Some(ProviderEmptyState::Failed(
+                "provider refresh failed".to_owned()
+            )),
+        );
+        assert_eq!(
+            provider_empty_state(None, None),
+            Some(ProviderEmptyState::Loading),
         );
     }
 }

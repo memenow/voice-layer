@@ -165,32 +165,54 @@ pub(crate) fn history_panel(app: &App) -> Element<'_, Message> {
     ]
     .spacing(tokens::space::MD);
 
-    let listing: Element<'_, Message> = match &app.sessions {
-        Some(list) if !list.is_empty() => {
-            let mut rows = Column::new().spacing(tokens::space::SM);
-            for session in list {
-                rows = rows.push(session_row(session));
+    let listing: Element<'_, Message> =
+        match history_empty_state(app.sessions.as_deref(), app.sessions_error.as_deref()) {
+            None => {
+                let mut rows = Column::new().spacing(tokens::space::SM);
+                for session in app.sessions.as_deref().unwrap_or_default() {
+                    rows = rows.push(session_row(session));
+                }
+                rows.into()
             }
-            rows.into()
-        }
-        Some(_) => text("No capture sessions yet.")
-            .size(tokens::text::BODY)
-            .color(secondary())
-            .into(),
-        None => text("Loading sessions…")
-            .size(tokens::text::BODY)
-            .color(secondary())
-            .into(),
-    };
+            Some(HistoryEmptyState::Empty) => text("No capture sessions yet.")
+                .size(tokens::text::BODY)
+                .color(secondary())
+                .into(),
+            Some(HistoryEmptyState::Loading) => text("Loading sessions…")
+                .size(tokens::text::BODY)
+                .color(secondary())
+                .into(),
+            Some(HistoryEmptyState::Failed(error)) => error_text(&error),
+        };
 
-    column![
-        components::card(
-            column![header, listing].spacing(tokens::space::LG),
-            app.accessibility()
-        )
-        .width(Length::Fill)
-    ]
-    .into()
+    let mut content = column![header, listing].spacing(tokens::space::LG);
+    if app.sessions.is_some()
+        && let Some(error) = &app.sessions_error
+    {
+        content = content.push(error_text(error));
+    }
+
+    column![components::card(content, app.accessibility()).width(Length::Fill)].into()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HistoryEmptyState {
+    Loading,
+    Empty,
+    Failed(String),
+}
+
+fn history_empty_state(
+    sessions: Option<&[CaptureSession]>,
+    error: Option<&str>,
+) -> Option<HistoryEmptyState> {
+    match sessions {
+        Some([]) => Some(HistoryEmptyState::Empty),
+        Some(_) => None,
+        None => error
+            .map(|error| HistoryEmptyState::Failed(error.to_owned()))
+            .or(Some(HistoryEmptyState::Loading)),
+    }
 }
 
 pub(crate) fn settings_panel(app: &App) -> Element<'_, Message> {
@@ -596,4 +618,21 @@ fn secondary() -> iced::Color {
 
 fn danger() -> iced::Color {
     theme::color(theme::palette().danger)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryEmptyState, history_empty_state};
+
+    #[test]
+    fn history_empty_state_shows_the_scoped_error_instead_of_loading() {
+        assert_eq!(
+            history_empty_state(None, Some("history unavailable")),
+            Some(HistoryEmptyState::Failed("history unavailable".to_owned())),
+        );
+        assert_eq!(
+            history_empty_state(None, None),
+            Some(HistoryEmptyState::Loading),
+        );
+    }
 }

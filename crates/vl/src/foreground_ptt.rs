@@ -54,6 +54,8 @@ use crossterm::{
         enable_raw_mode, size,
     },
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use voicelayer_core::{
     DictationCaptureResult, DictationFailureKind, LanguageProfile, LanguageStrategy,
     SegmentationMode, SessionState, StartDictationRequest, StopDictationRequest, TriggerKind,
@@ -745,13 +747,23 @@ fn wrap_for_panel(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     for raw_line in text.lines() {
-        let chars: Vec<char> = raw_line.chars().collect();
-        if chars.is_empty() {
+        if raw_line.is_empty() {
             lines.push(String::new());
             continue;
         }
-        for chunk in chars.chunks(width) {
-            lines.push(chunk.iter().collect());
+        let mut current = String::new();
+        for grapheme in raw_line.graphemes(true) {
+            let mut candidate = current.clone();
+            candidate.push_str(grapheme);
+            if !current.is_empty() && UnicodeWidthStr::width(candidate.as_str()) > width {
+                lines.push(std::mem::take(&mut current));
+                current.push_str(grapheme);
+            } else {
+                current = candidate;
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
         }
     }
     if lines.is_empty() {
@@ -868,16 +880,35 @@ fn copy_result_to_clipboard(ui: &mut ForegroundPttUiState, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_save_dir, unique_transcript_path};
+    use super::{default_save_dir, unique_transcript_path, wrap_for_panel};
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use unicode_width::UnicodeWidthStr;
 
     // The default_save_dir tests mutate XDG_STATE_HOME / HOME, so they
     // must serialize. Rust's test harness parallelizes by default, and a
     // sibling test clobbering the same variable would cause flakes.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn wrap_for_panel_respects_unicode_display_width() {
+        for (text, width, expected) in [
+            ("你好世界", 4, vec!["你好", "世界"]),
+            ("e\u{301}x", 1, vec!["e\u{301}", "x"]),
+            ("👩‍💻ok", 2, vec!["👩‍💻", "ok"]),
+        ] {
+            let lines = wrap_for_panel(text, width);
+            assert_eq!(lines, expected);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| UnicodeWidthStr::width(line.as_str()) <= width)
+            );
+            assert_eq!(lines.concat(), text);
+        }
+    }
 
     // RAII guard that snapshots an env var on construction and restores
     // it on Drop — including on panic — so a failing assertion does not

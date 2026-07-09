@@ -3990,6 +3990,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-segmentation",
+ "unicode-width",
  "uuid",
  "voicelayer-core",
  "voicelayer-doc-test-utils",

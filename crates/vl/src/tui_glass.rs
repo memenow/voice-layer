@@ -17,6 +17,8 @@ use std::io::Write;
 
 use crossterm::queue;
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use voicelayer_ui::terminal::flatten_over;
 use voicelayer_ui::tokens::{self, Appearance, Surface};
 use voicelayer_ui::{Palette, Rgba};
@@ -136,7 +138,7 @@ pub fn rule(inner: usize, left: char, label: &str, right: char) -> Rule {
         };
     }
     let label = truncate_cols(label, inner.saturating_sub(4));
-    let fill = inner.saturating_sub(label.chars().count() + 3);
+    let fill = inner.saturating_sub(UnicodeWidthStr::width(label.as_str()) + 3);
     Rule {
         lead: format!("{left}─ "),
         label,
@@ -144,13 +146,22 @@ pub fn rule(inner: usize, left: char, label: &str, right: char) -> Rule {
     }
 }
 
-/// Truncate `text` to at most `max` columns. The labels here are plain status
-/// and section strings, so a char count is a faithful column count.
+/// Truncate `text` to at most `max` terminal columns without splitting an
+/// extended grapheme cluster.
 pub fn truncate_cols(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if UnicodeWidthStr::width(text) <= max {
         return text.to_owned();
     }
-    text.chars().take(max).collect()
+    let mut end = 0;
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let candidate_end = index + grapheme.len();
+        // Script ligatures can make a later prefix narrower than an earlier
+        // one, so every grapheme boundary must remain eligible.
+        if UnicodeWidthStr::width(&text[..candidate_end]) <= max {
+            end = candidate_end;
+        }
+    }
+    text[..end].to_owned()
 }
 
 /// Draw a glass-card border row (top, divider, or bottom) in the `edge` color,
@@ -201,7 +212,7 @@ pub fn row(
             break;
         }
         let piece = truncate_cols(text, remaining);
-        used += piece.chars().count();
+        used += UnicodeWidthStr::width(piece.as_str());
         queue!(out, SetForegroundColor(*color), Print(piece))?;
     }
     if used < area {
@@ -220,9 +231,38 @@ pub fn row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     fn rule_width(r: &Rule) -> usize {
-        r.lead.chars().count() + r.label.chars().count() + r.trail.chars().count()
+        UnicodeWidthStr::width(r.lead.as_str())
+            + UnicodeWidthStr::width(r.label.as_str())
+            + UnicodeWidthStr::width(r.trail.as_str())
+    }
+
+    fn strip_ansi_sequences(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let mut output = String::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+                index += 2;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            let character = input[index..]
+                .chars()
+                .next()
+                .expect("index must remain on a character boundary");
+            output.push(character);
+            index += character.len_utf8();
+        }
+        output
     }
 
     #[test]
@@ -259,6 +299,23 @@ mod tests {
     }
 
     #[test]
+    fn truncate_cols_respects_unicode_display_width() {
+        assert_eq!(truncate_cols("你好世界", 4), "你好");
+        assert_eq!(truncate_cols("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(truncate_cols("👩‍💻!", 2), "👩‍💻");
+        assert_eq!(truncate_cols("✈️!", 1), "");
+        assert_eq!(truncate_cols("ⵏ\u{2D7F}ⴾ!", 1), "ⵏ\u{2D7F}ⴾ");
+    }
+
+    #[test]
+    fn wide_rule_label_respects_unicode_display_width() {
+        let r = rule(12, '├', "状态正常", '┤');
+        assert_eq!(rule_width(&r), 14);
+        assert!(r.trail.contains('─'));
+        assert!(r.trail.ends_with('┤'));
+    }
+
+    #[test]
     fn classify_status_maps_lifecycle_labels() {
         assert_eq!(classify_status("Listening"), StatusTone::Active);
         assert_eq!(classify_status("Transcribing"), StatusTone::Working);
@@ -277,5 +334,24 @@ mod tests {
         let rendered = String::from_utf8(buf).unwrap();
         assert_eq!(rendered.matches('│').count(), 2);
         assert!(rendered.contains("hello"));
+    }
+
+    #[test]
+    fn row_respects_unicode_display_width_across_segments() {
+        let theme = GlassTheme::dark();
+        let mut buf: Vec<u8> = Vec::new();
+        row(
+            &mut buf,
+            &theme,
+            8,
+            &[(theme.text, "你好"), (theme.muted, "abc")],
+        )
+        .unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        let visible = strip_ansi_sequences(&rendered);
+        let visible = visible.trim_end_matches('\n');
+
+        assert_eq!(visible, "│ 你好ab │");
+        assert_eq!(UnicodeWidthStr::width(visible), 10);
     }
 }

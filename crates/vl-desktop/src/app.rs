@@ -93,6 +93,7 @@ pub struct App {
     pub(crate) tab: WorkflowTab,
     pub(crate) session: Session,
     pub(crate) providers: Option<Vec<ProviderDescriptor>>,
+    pub(crate) providers_error: Option<String>,
     pub(crate) health: Option<HealthResponse>,
     pub(crate) hotkey: HotkeyStatus,
     pub(crate) last_event: Option<EventEnvelope>,
@@ -119,6 +120,7 @@ pub struct App {
     pub(crate) translate: TranslateForm,
     // History: capture sessions known to the daemon, lazily loaded.
     pub(crate) sessions: Option<Vec<CaptureSession>>,
+    pub(crate) sessions_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +229,7 @@ impl App {
             tab: WorkflowTab::default(),
             session: Session::default(),
             providers: None,
+            providers_error: None,
             health: None,
             hotkey: HotkeyStatus::default(),
             last_event: None,
@@ -242,6 +245,7 @@ impl App {
             rewrite: RewriteForm::new(&preferences),
             translate: TranslateForm::new(&preferences),
             sessions: None,
+            sessions_error: None,
             preferences,
             system_a11y: SystemA11y::default(),
         };
@@ -296,14 +300,10 @@ impl App {
                 // Refresh the read-only panels on entry so they show live data;
                 // the dictation provider picker also needs the provider list.
                 match tab {
-                    WorkflowTab::Providers => {
-                        list_providers(self.client.clone(), self.daemon_epoch)
-                    }
+                    WorkflowTab::Providers => self.refresh_providers(),
                     WorkflowTab::Doctor => probe_health(self.client.clone(), self.daemon_epoch),
-                    WorkflowTab::History => fetch_sessions(self.client.clone(), self.daemon_epoch),
-                    WorkflowTab::Dictation if self.providers.is_none() => {
-                        list_providers(self.client.clone(), self.daemon_epoch)
-                    }
+                    WorkflowTab::History => self.refresh_sessions(),
+                    WorkflowTab::Dictation if self.providers.is_none() => self.refresh_providers(),
                     _ => Task::none(),
                 }
             }
@@ -327,11 +327,13 @@ impl App {
                 self.daemon = DaemonStatus::Unknown;
                 self.session = Session::default();
                 self.providers = None;
+                self.providers_error = None;
                 self.health = None;
                 self.last_event = None;
                 self.error = None;
                 self.dictation_provider = None;
                 self.sessions = None;
+                self.sessions_error = None;
                 Task::none()
             }
             Message::ProbeDaemonPressed => {
@@ -340,9 +342,10 @@ impl App {
                 // Drop the prior probe's diagnostics so the Doctor panel cannot
                 // present stale socket/worker details as current while re-probing.
                 self.health = None;
+                let providers = self.refresh_providers();
                 Task::batch([
                     probe_health(self.client.clone(), self.daemon_epoch),
-                    list_providers(self.client.clone(), self.daemon_epoch),
+                    providers,
                 ])
             }
             Message::DaemonProbed(epoch, _) if epoch != self.daemon_epoch => Task::none(),
@@ -370,18 +373,17 @@ impl App {
             Message::DaemonSpawnResult(epoch, _) if epoch != self.daemon_epoch => Task::none(),
             Message::DaemonSpawnResult(_, Ok(())) => {
                 self.daemon = DaemonStatus::Probing;
+                let providers = self.refresh_providers();
                 Task::batch([
                     probe_health(self.client.clone(), self.daemon_epoch),
-                    list_providers(self.client.clone(), self.daemon_epoch),
+                    providers,
                 ])
             }
             Message::DaemonSpawnResult(_, Err(error)) => {
                 self.error = Some(format!("Failed to start daemon: {error}"));
                 Task::none()
             }
-            Message::RefreshProvidersPressed => {
-                list_providers(self.client.clone(), self.daemon_epoch)
-            }
+            Message::RefreshProvidersPressed => self.refresh_providers(),
             Message::ProvidersListed(epoch, _) if epoch != self.daemon_epoch => Task::none(),
             Message::ProvidersListed(_, Ok(list)) => {
                 reconcile_selected_asr_provider(&mut self.dictation_provider, Some(&list));
@@ -389,10 +391,11 @@ impl App {
                     self.dictation_translate = false;
                 }
                 self.providers = Some(list);
+                self.providers_error = None;
                 Task::none()
             }
             Message::ProvidersListed(_, Err(error)) => {
-                self.error = Some((*error).clone());
+                self.providers_error = Some((*error).clone());
                 // Drop the cached list so the Providers panel and the dictation
                 // ASR picker stop offering ids from a daemon/socket we can no
                 // longer confirm; a successful refresh repopulates it.
@@ -623,19 +626,28 @@ impl App {
             }
 
             // --- History ---
-            Message::HistoryRefreshPressed => {
-                fetch_sessions(self.client.clone(), self.daemon_epoch)
-            }
+            Message::HistoryRefreshPressed => self.refresh_sessions(),
             Message::SessionsListed(epoch, _) if epoch != self.daemon_epoch => Task::none(),
             Message::SessionsListed(_, Ok(list)) => {
                 self.sessions = Some(list);
+                self.sessions_error = None;
                 Task::none()
             }
             Message::SessionsListed(_, Err(error)) => {
-                self.error = Some((*error).clone());
+                self.sessions_error = Some((*error).clone());
                 Task::none()
             }
         }
+    }
+
+    fn refresh_providers(&mut self) -> Task<Message> {
+        self.providers_error = None;
+        list_providers(self.client.clone(), self.daemon_epoch)
+    }
+
+    fn refresh_sessions(&mut self) -> Task<Message> {
+        self.sessions_error = None;
+        fetch_sessions(self.client.clone(), self.daemon_epoch)
     }
 
     fn toggle_session(&mut self) -> Task<Message> {
@@ -1155,6 +1167,7 @@ mod tests {
             tab: WorkflowTab::default(),
             session: Session::default(),
             providers: None,
+            providers_error: None,
             health: None,
             hotkey: HotkeyStatus::default(),
             last_event: None,
@@ -1170,6 +1183,7 @@ mod tests {
             rewrite: RewriteForm::new(&preferences),
             translate: TranslateForm::new(&preferences),
             sessions: None,
+            sessions_error: None,
             preferences,
             system_a11y: SystemA11y::default(),
         }
@@ -1220,6 +1234,96 @@ mod tests {
     }
 
     #[test]
+    fn provider_failures_are_scoped_and_request_start_clears_them() {
+        let mut app = test_app();
+        app.providers = Some(vec![provider("whisper_cpp", ProviderKind::Asr)]);
+        app.dictation_provider = Some("whisper_cpp".to_owned());
+        app.error = Some("unrelated daemon error".to_owned());
+
+        drop(app.update(Message::ProvidersListed(
+            app.daemon_epoch,
+            Err(Arc::new("provider refresh failed".to_owned())),
+        )));
+
+        assert!(app.providers.is_none());
+        assert!(app.dictation_provider.is_none());
+        assert_eq!(
+            app.providers_error.as_deref(),
+            Some("provider refresh failed")
+        );
+        assert_eq!(app.error.as_deref(), Some("unrelated daemon error"));
+
+        drop(app.update(Message::RefreshProvidersPressed));
+        assert!(app.providers_error.is_none());
+        assert_eq!(app.error.as_deref(), Some("unrelated daemon error"));
+    }
+
+    #[test]
+    fn provider_success_clears_the_scoped_error() {
+        let mut app = test_app();
+        app.providers_error = Some("provider refresh failed".to_owned());
+
+        drop(app.update(Message::ProvidersListed(
+            app.daemon_epoch,
+            Ok(vec![provider("whisper_cpp", ProviderKind::Asr)]),
+        )));
+
+        assert!(app.providers_error.is_none());
+        assert_eq!(app.providers.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn history_failures_preserve_cached_sessions_and_are_scoped() {
+        let mut app = test_app();
+        app.sessions = Some(vec![CaptureSession::new(
+            SessionMode::Dictation,
+            TriggerKind::TrayButton,
+            LanguageProfile::default(),
+        )]);
+        app.error = Some("unrelated daemon error".to_owned());
+
+        drop(app.update(Message::SessionsListed(
+            app.daemon_epoch,
+            Err(Arc::new("history refresh failed".to_owned())),
+        )));
+
+        assert_eq!(app.sessions.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            app.sessions_error.as_deref(),
+            Some("history refresh failed")
+        );
+        assert_eq!(app.error.as_deref(), Some("unrelated daemon error"));
+
+        drop(app.update(Message::HistoryRefreshPressed));
+        assert_eq!(app.sessions.as_ref().map(Vec::len), Some(1));
+        assert!(app.sessions_error.is_none());
+    }
+
+    #[test]
+    fn history_failure_without_cache_has_an_error_instead_of_loading_forever() {
+        let mut app = test_app();
+
+        drop(app.update(Message::SessionsListed(
+            app.daemon_epoch,
+            Err(Arc::new("history unavailable".to_owned())),
+        )));
+
+        assert!(app.sessions.is_none());
+        assert_eq!(app.sessions_error.as_deref(), Some("history unavailable"));
+    }
+
+    #[test]
+    fn history_success_clears_the_scoped_error() {
+        let mut app = test_app();
+        app.sessions_error = Some("history refresh failed".to_owned());
+
+        drop(app.update(Message::SessionsListed(app.daemon_epoch, Ok(Vec::new()))));
+
+        assert!(app.sessions_error.is_none());
+        assert_eq!(app.sessions.as_ref().map(Vec::len), Some(0));
+    }
+
+    #[test]
     fn translation_is_enabled_only_for_compatible_dictation_providers() {
         assert!(dictation_translate_supported(None));
         assert!(dictation_translate_supported(Some("whisper_cpp")));
@@ -1256,8 +1360,10 @@ mod tests {
     fn socket_retarget_clears_daemon_scoped_state_and_advances_epoch() {
         let mut app = test_app();
         app.providers = Some(vec![provider("whisper_cpp", ProviderKind::Asr)]);
+        app.providers_error = Some("old provider error".to_owned());
         app.dictation_provider = Some("whisper_cpp".to_owned());
         app.sessions = Some(Vec::new());
+        app.sessions_error = Some("old history error".to_owned());
         app.last_event = Some(EventEnvelope::new("ready", None, "old daemon"));
         app.session.stage = SessionStage::Completed;
         app.session.transcript = Some("old transcript".to_owned());
@@ -1269,8 +1375,10 @@ mod tests {
         assert_eq!(app.daemon_epoch, 1);
         assert_eq!(app.daemon, DaemonStatus::Unknown);
         assert!(app.providers.is_none());
+        assert!(app.providers_error.is_none());
         assert!(app.dictation_provider.is_none());
         assert!(app.sessions.is_none());
+        assert!(app.sessions_error.is_none());
         assert!(app.last_event.is_none());
         assert_eq!(app.session.stage, SessionStage::Idle);
         assert!(app.session.transcript.is_none());
