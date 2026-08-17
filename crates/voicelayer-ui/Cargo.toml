@@ -1,0 +1,11 @@
+[package]
+name = "voicelayer-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Dependency-free by design: this crate is the single source of truth for the
+# Liquid Glass design tokens shared by the desktop GUI (`vl-desktop`, iced) and
+# the terminal UI (`vl`, crossterm). Rendering backends convert these tokens at
+# their own edge so no backend leaks into the shared layer.
+[dependencies]

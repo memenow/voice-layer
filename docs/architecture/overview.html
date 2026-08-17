@@ -278,17 +278,16 @@ catalog but the injection adapter is not yet wired up).</li>
 <li>Native kitty remote-control over its UNIX socket (the existing
 <code>kitten @ send-text</code> path shipped via
 <code>--kitty-match</code> is the only kitty integration today).</li>
-<li>Tray icon entry, in-window settings panel, and the embedded preview
-editor inside <code>vl-desktop</code> — the iced shell currently exposes
-only daemon health, start/stop, and a read-only transcript pane.</li>
 </ul>
-<p><code>vl-desktop</code>, GNOME portal hotkey binding
-(<code>vl-desktop</code> registers
+<p>The GNOME portal hotkey binding (<code>vl-desktop</code> registers
 <code>voicelayer.dictation_toggle</code> through
-<code>org.freedesktop.portal.GlobalShortcuts</code>), and the systemd
-user units (one for the daemon, one optional unit for
-<code>whisper-server</code>) are no longer deferred; see
-<code>docs/guides/desktop.html</code> and
+<code>org.freedesktop.portal.GlobalShortcuts</code>), the systemd user
+units (one for the daemon, one optional unit for
+<code>whisper-server</code>), and the full <code>vl-desktop</code> GUI
+surface (Compose / Rewrite / Translate workflows with preview and
+injection planning, Settings panel, History, system tray, capture HUD
+overlay, and the Liquid Glass visual language) are no longer deferred;
+see <code>docs/guides/desktop.html</code> and
 <code>docs/guides/systemd.html</code>.</p>
 <p>The repository already defines the seams for the remaining additions
 so the first implementation does not need to redesign the public
