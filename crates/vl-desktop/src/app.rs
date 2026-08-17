@@ -5,7 +5,9 @@
 //! their own content, title, and chrome — daemon `view`/`title`/`theme` receive
 //! the [`window::Id`] being drawn, which `application` does not expose. The
 //! daemon also outlives its windows, matching VoiceLayer's "background voice
-//! layer" model; closing the main window quits via [`iced::exit`].
+//! layer" model; closing the main window quits via [`iced::exit`], after
+//! [`App::request_quit`] has stopped any active dictation so the daemon-owned
+//! recorder is never orphaned.
 //!
 //! This module owns state, message handling, async tasks, and the event/portal
 //! subscriptions. Rendering lives in [`crate::view`]; the typed `/v1` client and
@@ -19,6 +21,7 @@ use iced::futures::channel::mpsc as futures_mpsc;
 use iced::widget::text_editor;
 use iced::{Element, Subscription, Task, keyboard, stream, window};
 
+use uuid::Uuid;
 use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionArchetype, CompositionReceipt,
     DictationCaptureRequest, DictationCaptureResult, EventEnvelope, HealthResponse, InjectRequest,
@@ -121,6 +124,9 @@ pub struct App {
     // History: capture sessions known to the daemon, lazily loaded.
     pub(crate) sessions: Option<Vec<CaptureSession>>,
     pub(crate) sessions_error: Option<String>,
+    /// Set once a quit has been requested while dictation cleanup is still in
+    /// flight; a second quit request forces the exit immediately.
+    quitting: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +213,9 @@ pub enum Message {
     // History.
     HistoryRefreshPressed,
     SessionsListed(u64, Result<Vec<CaptureSession>, SharedError>),
+    /// Internal: pre-quit dictation cleanup settled (successfully or not), so
+    /// the deferred exit requested by [`App::request_quit`] can proceed.
+    QuitNow,
 }
 
 impl App {
@@ -246,6 +255,7 @@ impl App {
             translate: TranslateForm::new(&preferences),
             sessions: None,
             sessions_error: None,
+            quitting: false,
             preferences,
             system_a11y: SystemA11y::default(),
         };
@@ -275,8 +285,9 @@ impl App {
             Message::WindowClosed(id) => {
                 if self.main_window == Some(id) {
                     // The daemon does not self-terminate on last-window-close; quit
-                    // deliberately when the main window goes away.
-                    iced::exit()
+                    // deliberately when the main window goes away — but stop an
+                    // active dictation first so the microphone is not orphaned.
+                    self.request_quit()
                 } else {
                     // The HUD closing — by us via `sync_hud` or by the compositor —
                     // only clears its slot; the daemon keeps running.
@@ -294,7 +305,7 @@ impl App {
                 None => Task::none(),
             },
             #[cfg(feature = "tray")]
-            Message::TrayQuitRequested => iced::exit(),
+            Message::TrayQuitRequested => self.request_quit(),
             Message::TabSelected(tab) => {
                 self.tab = tab;
                 // Refresh the read-only panels on entry so they show live data;
@@ -433,14 +444,36 @@ impl App {
                 Task::batch([task, self.sync_hud()])
             }
             Message::SessionStarted(Ok(session)) => {
+                // A quit requested while the start was in flight stops the
+                // fresh session immediately so the daemon never keeps
+                // recording without a UI able to stop it.
+                if self.quitting {
+                    let client = self.client.clone();
+                    let session_id = session.session_id;
+                    let stop = Task::perform(
+                        async move { client.stop_dictation(session_id).await },
+                        |_| Message::QuitNow,
+                    );
+                    return Task::batch([stop, quit_watchdog()]);
+                }
                 self.session.mark_listening(session.session_id);
                 self.error = None;
                 self.sync_hud()
             }
             Message::SessionStarted(Err(error)) => {
+                // The start failed, so no session exists to clean up; a pending
+                // quit can proceed right away.
+                if self.quitting {
+                    return iced::exit();
+                }
                 self.session.mark_failed();
                 self.error = Some((*error).clone());
                 self.sync_hud()
+            }
+            Message::SessionStopped(_) if self.quitting => {
+                // Pre-quit cleanup settled — transcript handling is moot once
+                // the operator chose to exit.
+                iced::exit()
             }
             Message::SessionStopped(Ok(result)) => {
                 self.error = self.session.apply_capture(*result);
@@ -451,6 +484,7 @@ impl App {
                 self.error = Some((*error).clone());
                 self.sync_hud()
             }
+            Message::QuitNow => iced::exit(),
             Message::EventReceived(epoch, _) if epoch != self.daemon_epoch => Task::none(),
             Message::EventReceived(_, event) => {
                 self.last_event = Some(event);
@@ -911,6 +945,34 @@ impl App {
         )
     }
 
+    /// Quit the shell without orphaning the microphone. A streaming dictation
+    /// session is owned by the daemon, not by this process, so a bare
+    /// `iced::exit()` would leave the recorder running with no UI left to stop
+    /// it. Defer the exit until the active — or still-starting — session has
+    /// been stopped; a second quit request forces the exit immediately, and
+    /// the cleanup reply (success or failure) ends the wait either way. A
+    /// one-shot capture in flight is fixed-duration and self-terminating, so
+    /// it does not hold the quit.
+    fn request_quit(&mut self) -> Task<Message> {
+        match quit_plan(self.quitting, self.session.stage, self.session.id) {
+            QuitPlan::Exit => iced::exit(),
+            QuitPlan::StopThenExit(session_id) => {
+                self.quitting = true;
+                self.session.begin_stopping();
+                let client = self.client.clone();
+                let stop = Task::perform(
+                    async move { client.stop_dictation(session_id).await },
+                    |_| Message::QuitNow,
+                );
+                Task::batch([stop, quit_watchdog()])
+            }
+            QuitPlan::AwaitPendingReply => {
+                self.quitting = true;
+                quit_watchdog()
+            }
+        }
+    }
+
     /// The live Liquid Glass accessibility contract: the persisted preferences
     /// (opacity, Reduce Transparency) combined with the live OS state (Increase
     /// Contrast, Reduce Motion). Views thread this into the glass styling.
@@ -1025,6 +1087,52 @@ fn capture_is_active(capture_in_flight: bool, stage: SessionStage) -> bool {
             stage,
             SessionStage::Starting | SessionStage::Listening | SessionStage::Stopping
         )
+}
+
+/// What a quit request must do about the microphone before exiting. Pure so
+/// the deferral policy is unit-testable without driving iced tasks.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitPlan {
+    /// Exit immediately: nothing holds the microphone, the stage has no
+    /// session id to stop, or this is a forced second request.
+    Exit,
+    /// Stop this session first; its reply (success or failure) then exits.
+    StopThenExit(Uuid),
+    /// A start or stop is already in flight; that reply finishes the quit.
+    AwaitPendingReply,
+}
+
+fn quit_plan(quitting: bool, stage: SessionStage, session_id: Option<Uuid>) -> QuitPlan {
+    if quitting {
+        return QuitPlan::Exit;
+    }
+    match stage {
+        SessionStage::Listening => match session_id {
+            Some(id) => QuitPlan::StopThenExit(id),
+            None => QuitPlan::Exit,
+        },
+        SessionStage::Starting | SessionStage::Stopping => QuitPlan::AwaitPendingReply,
+        // A one-shot capture never moves the stage off a terminal value; it is
+        // fixed-duration and self-terminating, so it does not hold the quit.
+        _ => QuitPlan::Exit,
+    }
+}
+
+/// Bound the pre-quit wait. The cleanup request has no daemon-side timeout, so
+/// a wedged daemon (accepted the socket, never replies) would otherwise leave
+/// the shell lingering as an invisible, windowless process — this is an
+/// `iced::daemon`, which deliberately does not exit on last-window-close, and
+/// the forced-second-request escape is unreachable once the main window is
+/// gone. After the watchdog fires, `Message::QuitNow` forces the exit; the
+/// session remains stoppable through the daemon's stop API (e.g. the `vl`
+/// CLI) instead of holding the shell process hostage indefinitely.
+fn quit_watchdog() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        },
+        |_| Message::QuitNow,
+    )
 }
 
 /// Best-effort stream for portal-activated hotkeys; mirrors the listener task
@@ -1184,6 +1292,7 @@ mod tests {
             translate: TranslateForm::new(&preferences),
             sessions: None,
             sessions_error: None,
+            quitting: false,
             preferences,
             system_a11y: SystemA11y::default(),
         }
@@ -1473,6 +1582,81 @@ mod tests {
         ] {
             assert!(!capture_is_active(false, stage), "stage {stage:?}");
         }
+    }
+
+    #[test]
+    fn quit_plan_stops_active_streaming_dictation_before_exiting() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            quit_plan(false, SessionStage::Listening, Some(id)),
+            QuitPlan::StopThenExit(id),
+        );
+        // A Listening stage without an id has nothing the daemon can stop.
+        assert_eq!(
+            quit_plan(false, SessionStage::Listening, None),
+            QuitPlan::Exit
+        );
+    }
+
+    #[test]
+    fn quit_plan_defers_to_the_pending_start_or_stop_reply() {
+        for stage in [SessionStage::Starting, SessionStage::Stopping] {
+            assert_eq!(
+                quit_plan(false, stage, None),
+                QuitPlan::AwaitPendingReply,
+                "stage {stage:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn quit_plan_exits_immediately_when_idle_or_forced() {
+        for stage in [
+            SessionStage::Idle,
+            SessionStage::Completed,
+            SessionStage::Failed,
+        ] {
+            assert_eq!(
+                quit_plan(false, stage, None),
+                QuitPlan::Exit,
+                "stage {stage:?}"
+            );
+        }
+        // A second quit request forces the exit even mid-cleanup.
+        assert_eq!(
+            quit_plan(true, SessionStage::Listening, Some(Uuid::new_v4())),
+            QuitPlan::Exit,
+        );
+        assert_eq!(
+            quit_plan(true, SessionStage::Starting, None),
+            QuitPlan::Exit,
+        );
+    }
+
+    #[test]
+    fn request_quit_marks_quitting_and_moves_listening_into_stopping() {
+        let mut app = test_app();
+        app.session.mark_listening(Uuid::new_v4());
+
+        drop(app.request_quit());
+
+        assert!(app.quitting, "the quit is now pending cleanup");
+        assert_eq!(app.session.stage, SessionStage::Stopping);
+    }
+
+    #[test]
+    fn request_quit_while_starting_only_marks_quitting() {
+        let mut app = test_app();
+        app.session.begin_starting();
+
+        drop(app.request_quit());
+
+        assert!(app.quitting);
+        assert_eq!(
+            app.session.stage,
+            SessionStage::Starting,
+            "the in-flight start reply finishes the quit",
+        );
     }
 
     #[tokio::test]

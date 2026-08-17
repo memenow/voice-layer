@@ -733,13 +733,26 @@ fn field_label(name: &str) -> String {
 /// accounts for. Defaults to an 80×24-ish layout if the terminal size is unknown.
 fn transcript_geometry(event_rows: usize) -> (usize, usize, usize) {
     let (term_width, term_height) = size().unwrap_or((100, 30));
-    let total = (term_width as usize).clamp(28, 120);
+    transcript_geometry_for(term_width as usize, term_height as usize, event_rows)
+}
+
+/// Pure core of [`transcript_geometry`] so the width invariant is testable
+/// without a live terminal.
+fn transcript_geometry_for(
+    term_width: usize,
+    term_height: usize,
+    event_rows: usize,
+) -> (usize, usize, usize) {
+    // Never emit rows wider than the live terminal: below the preferred
+    // 28-column minimum the card shrinks (labels truncate) instead of forcing
+    // line wraps that would desync the transcript viewport and scroll offsets.
+    let total = term_width.clamp(2, 120);
     let inner = total.saturating_sub(2); // columns between the side bars
     let text_area = inner.saturating_sub(2); // inside the inner padding spaces
     // Fixed chrome: top + badge + 6 fields + 3 section dividers + 3 control rows
     // + bottom, plus one row per recent event (or a single placeholder).
     let chrome = 15 + event_rows;
-    let transcript_height = (term_height as usize).saturating_sub(chrome).max(3);
+    let transcript_height = term_height.saturating_sub(chrome).max(3);
     (inner, text_area, transcript_height)
 }
 
@@ -880,7 +893,9 @@ fn copy_result_to_clipboard(ui: &mut ForegroundPttUiState, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_save_dir, unique_transcript_path, wrap_for_panel};
+    use super::{
+        default_save_dir, transcript_geometry_for, unique_transcript_path, wrap_for_panel,
+    };
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
@@ -907,6 +922,20 @@ mod tests {
                     .all(|line| UnicodeWidthStr::width(line.as_str()) <= width)
             );
             assert_eq!(lines.concat(), text);
+        }
+    }
+
+    #[test]
+    fn transcript_geometry_never_exceeds_the_live_terminal_width() {
+        for term_width in [2usize, 5, 20, 27, 28, 80, 120, 200] {
+            let (inner, text_area, _height) = transcript_geometry_for(term_width, 30, 1);
+            let total = inner + 2;
+            assert!(
+                total <= term_width.max(2),
+                "term_width {term_width}: card spans {total} columns",
+            );
+            assert!(total <= 120);
+            assert!(text_area <= inner);
         }
     }
 

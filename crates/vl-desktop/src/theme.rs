@@ -90,13 +90,16 @@ pub fn app_theme() -> Theme {
     )
 }
 
-/// Window-level base fill — shows at the window edges and is the fallback when
-/// transparency is unavailable. The rich layer the glass floats above is drawn
-/// by [`backdrop`].
+/// Window-level base fill. The style resolver is shared by every window the
+/// daemon opens and cannot inspect the window id, so the clear color must stay
+/// transparent: the borderless HUD window relies on it to keep the pixels
+/// outside its rounded pill see-through, while the main window paints its own
+/// opaque gradient [`backdrop`] over the whole surface (and non-transparent
+/// windows ignore the clear alpha anyway).
 pub fn app_style() -> iced::theme::Style {
     let p = palette();
     iced::theme::Style {
-        background_color: color(p.bg_base),
+        background_color: Color::TRANSPARENT,
         text_color: color(p.text_primary),
     }
 }
