@@ -1,0 +1,46 @@
+# `cargo audit` configuration. Anchors the supply-chain gate in CI
+# and gives operators running the audit locally the same result.
+#
+# Scope: this file only governs warnings that have no upstream fix
+# path from VoiceLayer's direct dependencies. Vulnerabilities are
+# NEVER ignored here. `cargo audit` exits non-zero on any
+# vulnerability by default; CI lifts soundness advisories to the same
+# bar with `cargo audit --deny unsound`. An unsoundness advisory may
+# be ignored only when BOTH of the following hold and are documented
+# in the entry: (1) no upstream release compatible with our dependency
+# chain carries the fix, and (2) the advisory's trigger condition is
+# provably unreachable in the code paths VoiceLayer compiles. The
+# `--deny` flag does not accept a `vulnerabilities` kind because
+# vulnerabilities are already fatal without it.
+
+[advisories]
+# Advisories listed here surface as warnings in the audit output but
+# do not fail CI. Every entry must justify why VoiceLayer cannot act
+# on the advisory directly. Re-evaluate each entry when bumping the
+# crate that pulls it in.
+ignore = [
+    # `paste 1.0.15` is unmaintained as of 2024-10-07. It reaches
+    # the dependency graph through metal -> wgpu-hal -> wgpu ->
+    # iced_wgpu -> iced (the GUI shell in vl-desktop). Neither
+    # metal nor wgpu has cut a release that drops the paste
+    # dependency yet; until they do, VoiceLayer has no upstream
+    # path to swap it out, and the unmaintained status carries no
+    # known soundness or vulnerability impact for our compile-time
+    # macro usage.
+    "RUSTSEC-2024-0436",
+    # `lru 0.16.4` `LruCache::pop()` is not panic-safe
+    # (RUSTSEC-2026-0253, use-after-free if a stored key/value `Drop`
+    # panics during eviction). It reaches the graph through cryoglyph
+    # -> iced_wgpu -> iced 0.14 (the vl-desktop GUI shell). Criterion
+    # (1): the fix only shipped in lru >= 0.18.2, cryoglyph 0.1.0 (its
+    # latest release) pins `lru = "0.16"`, and cryoglyph's main branch
+    # has moved to cosmic-text/wgpu versions incompatible with iced
+    # 0.14, so no compatible upstream release carries the fix.
+    # Criterion (2): cryoglyph's only cache is
+    # `LruCache<CacheKey, GlyphDetails>` in text_atlas.rs; both types
+    # are plain data with no `Drop` impl, so the panicking-`Drop`
+    # trigger is unreachable in the code VoiceLayer compiles.
+    # Re-evaluate when iced/cryoglyph releases a version that accepts
+    # lru >= 0.18.2.
+    "RUSTSEC-2026-0253",
+]

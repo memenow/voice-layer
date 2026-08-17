@@ -197,6 +197,6 @@ jobs:
       # upstream path to retire every unmaintained macro crate the
       # moment RustSec flags it. Such warnings are logged for the
       # maintainer to triage; the explicit allow-list with
-      # justification lives in `audit.toml`.
+      # justification lives in `.cargo/audit.toml`.
       - name: cargo audit --deny unsound
         run: cargo audit --deny unsound
