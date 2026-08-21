@@ -16,7 +16,7 @@ use tokio::{
     time::timeout,
 };
 use uuid::Uuid;
-use voicelayer_core::{ProviderDescriptor, TranscriptionResult};
+use voicelayer_core::{ProviderDescriptor, TranscriptionResult, WorkerInitPayload};
 
 const JSONRPC_VERSION: &str = "2.0";
 const WORKER_MODULE: &str = "voicelayer_orchestrator.worker";
@@ -135,6 +135,10 @@ pub struct WorkerCommand {
     /// across the boundary so a stable read of the most recent failure
     /// is always available.
     stderr_tail: Arc<StdMutex<VecDeque<String>>>,
+    /// Provider configuration delivered in the `initialize` handshake —
+    /// the first frame every freshly spawned worker answers before
+    /// serving any other method.
+    init_payload: Option<Arc<WorkerInitPayload>>,
 }
 
 impl WorkerCommand {
@@ -151,7 +155,16 @@ impl WorkerCommand {
             stderr_tail: Arc::new(StdMutex::new(VecDeque::with_capacity(
                 STDERR_TAIL_MAX_LINES,
             ))),
+            init_payload: None,
         }
+    }
+
+    /// Attach the initialize payload. Production construction uses this;
+    /// leaving it `None` preserves the legacy no-handshake behavior for
+    /// worker unit tests.
+    pub fn with_init_payload(mut self, payload: WorkerInitPayload) -> Self {
+        self.init_payload = Some(Arc::new(payload));
+        self
     }
 
     pub fn discover(project_root: PathBuf) -> Self {
@@ -192,6 +205,20 @@ impl WorkerCommand {
             .chain(self.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Whether a worker child is currently held. The health refresher
+    /// uses this so it never spawns the worker by itself.
+    pub async fn is_running(&self) -> bool {
+        self.process.lock().await.is_some()
+    }
+
+    /// Kill the worker child. Called on daemon shutdown.
+    pub async fn shutdown(&self) {
+        let mut guard = self.process.lock().await;
+        if let Some(mut process) = guard.take() {
+            let _ = process.child.kill().await;
+        }
     }
 
     pub async fn health(&self) -> Result<WorkerHealthResult, WorkerCallError> {
@@ -249,6 +276,44 @@ impl WorkerCommand {
         request: &voicelayer_core::StitchWavSegmentsRequest,
     ) -> Result<voicelayer_core::StitchWavSegmentsResult, WorkerCallError> {
         self.call("stitch_wav_segments", Some(request)).await
+    }
+
+    /// Run the `initialize` handshake on a freshly spawned process.
+    /// No-op when no init payload was attached (worker unit tests).
+    async fn initialize(&self, process: &mut WorkerProcess) -> Result<(), WorkerCallError> {
+        let Some(payload) = &self.init_payload else {
+            return Ok(());
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = JsonRpcRequest::initialize(id.clone(), payload.as_ref());
+        let mut line = serde_json::to_string(&request)?;
+        line.push('\n');
+        process.stdin.write_all(line.as_bytes()).await?;
+        process.stdin.flush().await?;
+
+        let budget = self
+            .timeout_override
+            .unwrap_or_else(|| worker_call_timeout("health"));
+        let line = timeout(budget, process.stdout.next_line())
+            .await
+            .map_err(|_| WorkerCallError::TimedOut)?
+            .map_err(WorkerCallError::Io)?
+            .ok_or(WorkerCallError::EmptyResponse)?;
+        let response: JsonRpcResponse<serde_json::Value> = serde_json::from_str(&line)?;
+        if response.jsonrpc != JSONRPC_VERSION {
+            return Err(WorkerCallError::InvalidProtocolVersion(response.jsonrpc));
+        }
+        if response.id.as_deref() != Some(id.as_str()) {
+            return Err(WorkerCallError::IdMismatch {
+                expected: id,
+                got: response.id,
+            });
+        }
+        match (response.result, response.error) {
+            (Some(_), None) => Ok(()),
+            (None, Some(error)) => Err(WorkerCallError::Rpc(error)),
+            _ => Err(WorkerCallError::MalformedResponse),
+        }
     }
 
     /// Spawn a fresh worker subprocess and wire its pipes into a
@@ -348,6 +413,13 @@ impl WorkerCommand {
                     Ok(process) => *guard = Some(process),
                     Err(err) => return Err(err),
                 }
+                if let Err(err) = self.initialize(guard.as_mut().expect("just spawned")).await {
+                    *guard = None;
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
 
             let process = guard.as_mut().expect("just spawned or pre-existing");
@@ -399,6 +471,15 @@ impl WorkerCommand {
             let response: JsonRpcResponse<R> = serde_json::from_str(&line)?;
             if response.jsonrpc != JSONRPC_VERSION {
                 return Err(WorkerCallError::InvalidProtocolVersion(response.jsonrpc));
+            }
+            if let Some(got) = &response.id
+                && got != &request.id
+            {
+                *guard = None;
+                return Err(WorkerCallError::IdMismatch {
+                    expected: request.id.clone(),
+                    got: Some(got.clone()),
+                });
             }
 
             // Detect the "respond-then-exit" pattern with a single
@@ -511,9 +592,25 @@ struct JsonRpcRequest<P> {
     params: Option<P>,
 }
 
+impl<'a> JsonRpcRequest<&'a voicelayer_core::WorkerInitPayload> {
+    /// The `initialize` handshake frame — the worker answers it before
+    /// serving any other method. Kept as a named constructor so the
+    /// method string is pinned in one place (the parity test scans
+    /// `.call("...")` sites plus this constructor).
+    fn initialize(id: String, params: &'a voicelayer_core::WorkerInitPayload) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            method: "initialize".to_owned(),
+            params: Some(params),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcResponse<R> {
     jsonrpc: String,
+    id: Option<String>,
     result: Option<R>,
     error: Option<JsonRpcError>,
 }
@@ -523,6 +620,12 @@ struct JsonRpcResponse<R> {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+}
+
+impl JsonRpcError {
+    pub fn is_provider_unavailable(&self) -> bool {
+        self.code == -32004
+    }
 }
 
 #[derive(Debug, Error)]
@@ -541,6 +644,11 @@ pub enum WorkerCallError {
     ProcessExited(Option<i32>, String),
     #[error("worker returned unsupported JSON-RPC version `{0}`")]
     InvalidProtocolVersion(String),
+    #[error("worker response id mismatch: expected {expected}, got {got:?}")]
+    IdMismatch {
+        expected: String,
+        got: Option<String>,
+    },
     #[error("worker returned a malformed JSON-RPC response")]
     MalformedResponse,
     #[error("worker RPC error {0}")]
@@ -760,6 +868,11 @@ mod tests {
             if !method.is_empty() && method.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
                 methods.insert(method.to_owned());
             }
+        }
+        // The `initialize` handshake is built by the named constructor
+        // `JsonRpcRequest::initialize` rather than a `.call(...)` site.
+        if source.contains("fn initialize(id: String") {
+            methods.insert("initialize".to_owned());
         }
         methods
     }
@@ -1239,8 +1352,9 @@ the bullet list above and must not be captured.
         // The response parses cleanly as JsonRpcResponse but the
         // `jsonrpc` field doesn't match the protocol constant — the
         // helper rejects it before reading the result.
-        let worker =
-            shell_worker(r#"printf '%s\n' '{"jsonrpc":"1.0","id":"x","result":{"providers":[]}}'"#);
+        let worker = shell_worker(
+            r#"printf '%s\n' '{"jsonrpc":"1.0","id":null,"result":{"providers":[]}}'"#,
+        );
         match worker.list_providers().await {
             Err(WorkerCallError::InvalidProtocolVersion(version)) => {
                 assert_eq!(version, "1.0");
@@ -1254,7 +1368,7 @@ the bullet list above and must not be captured.
         // Valid JSON-RPC envelope but neither `result` nor `error` is
         // populated. The helper defends against this since servers
         // sometimes ship a half-formed response on internal failures.
-        let worker = shell_worker(r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x"}'"#);
+        let worker = shell_worker(r#"printf '%s\n' '{"jsonrpc":"2.0","id":null}'"#);
         match worker.list_providers().await {
             Err(WorkerCallError::MalformedResponse) => {}
             other => panic!("expected MalformedResponse; got {other:?}"),
@@ -1268,7 +1382,7 @@ the bullet list above and must not be captured.
         // operator can tell the worker crashed mid-shutdown rather
         // than the response itself being broken.
         let worker = shell_worker(
-            r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x","result":{"providers":[]}}'; exit 7"#,
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":null,"result":{"providers":[]}}'; exit 7"#,
         );
         match worker.list_providers().await {
             Err(WorkerCallError::ProcessExited(code, _stderr)) => {
@@ -1300,7 +1414,7 @@ the bullet list above and must not be captured.
         // whitespace; the loop body emits a fixed valid JSON-RPC
         // response each time.
         let script = format!(
-            r#"echo x >> {counter_path}; while IFS= read -r _; do printf '%s\n' '{{"jsonrpc":"2.0","id":"x","result":{{"providers":[]}}}}'; done"#,
+            r#"echo x >> {counter_path}; while IFS= read -r _; do printf '%s\n' '{{"jsonrpc":"2.0","id":null,"result":{{"providers":[]}}}}'; done"#,
         );
         let worker = WorkerCommand::new(
             "sh".to_owned(),
@@ -1343,7 +1457,7 @@ the bullet list above and must not be captured.
         let counter_path = spawn_counter.display().to_string();
 
         let script = format!(
-            r#"echo x >> {counter_path}; head -n 1 > /dev/null; printf '%s\n' '{{"jsonrpc":"2.0","id":"x","result":{{"providers":[]}}}}'"#,
+            r#"echo x >> {counter_path}; head -n 1 > /dev/null; printf '%s\n' '{{"jsonrpc":"2.0","id":null,"result":{{"providers":[]}}}}'"#,
         );
         let worker = WorkerCommand::new(
             "sh".to_owned(),
@@ -1380,7 +1494,7 @@ the bullet list above and must not be captured.
     #[tokio::test]
     async fn worker_call_returns_rpc_error_when_response_carries_jsonrpc_error_payload() {
         let worker = shell_worker(
-            r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x","error":{"code":-32004,"message":"provider unavailable: stub"}}'"#,
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":null,"error":{"code":-32004,"message":"provider unavailable: stub"}}'"#,
         );
         match worker.list_providers().await {
             Err(WorkerCallError::Rpc(rpc)) => {

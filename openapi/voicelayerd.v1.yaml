@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: VoiceLayer Local Control API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Local control API exposed by the VoiceLayer daemon over a Unix domain socket.
   license:
@@ -18,6 +18,19 @@ paths:
       responses:
         "200":
           description: Daemon health report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /v1/health/refresh:
+    post:
+      operationId: refreshHealth
+      tags: [health]
+      summary: Force a fresh worker + platform probe and return the result.
+      description: Probes the worker and platform on demand and returns a fresh health report.
+      responses:
+        "200":
+          description: Freshly probed daemon health report.
           content:
             application/json:
               schema:
@@ -39,6 +52,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/ProviderDescriptor"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/events/stream:
     get:
       operationId: streamEvents
@@ -85,6 +100,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CaptureSession"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
   /v1/sessions/dictation/stop:
     post:
       operationId: stopLiveDictationSession
@@ -102,6 +121,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DictationCaptureResult"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
+        "504":
+          $ref: "#/components/responses/Problem"
   /v1/sessions/compose:
     post:
       operationId: createCompositionJob
@@ -119,6 +148,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompositionReceipt"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/rewrites:
     post:
       operationId: rewriteText
@@ -136,6 +171,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompositionReceipt"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/translations:
     post:
       operationId: translateText
@@ -153,6 +194,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompositionReceipt"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/transcriptions:
     post:
       operationId: transcribeAudioFile
@@ -170,6 +217,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TranscriptionResult"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/dictation/capture:
     post:
       operationId: captureDictation
@@ -187,10 +240,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DictationCaptureResult"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/inject:
     post:
       operationId: planInjection
-      summary: Build an injection plan for a target.
+      summary: Build an injection plan for a target. Pure function; always 200.
+      description: Computes the injection payload for the target (bracketed paste, etc.) locally.
       requestBody:
         required: true
         content:
@@ -205,7 +267,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/InjectionPlan"
 components:
+  responses:
+    Problem:
+      description: RFC 9457 problem details describing the failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
   schemas:
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          description: Problem type URN, e.g. `urn:voicelayer:problem:provider_unavailable`.
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+      description: |
+        Problem type registry:
+        - `urn:voicelayer:problem:bad_request` (400)
+        - `urn:voicelayer:problem:session_not_found` (404)
+        - `urn:voicelayer:problem:recording_failed` (500)
+        - `urn:voicelayer:problem:internal` (500)
+        - `urn:voicelayer:problem:provider_request_failed` (502)
+        - `urn:voicelayer:problem:provider_unavailable` (503)
+        - `urn:voicelayer:problem:worker_unavailable` (503)
+        - `urn:voicelayer:problem:worker_timeout` (504)
     HealthResponse:
       type: object
       required: [status, socket_path, version, worker]
@@ -229,7 +321,7 @@ components:
         - qwen3_asr_configured
         - llm_configured
         - llm_reachable
-        - global_shortcuts_portal_available
+        - global_hotkeys_available
       properties:
         status:
           type: string
@@ -332,27 +424,22 @@ components:
           type:
             - string
             - "null"
-        global_shortcuts_portal_available:
+        global_hotkeys_available:
           description: |
-            True when the current desktop session exposes the
-            `org.freedesktop.portal.GlobalShortcuts` interface. Drives whether
-            `vl hotkeys portal-status` treats portal-based push-to-talk as
-            viable on this session.
+            True when the current platform can deliver global hotkeys to
+            VoiceLayer (XDG GlobalShortcuts portal on Linux, Carbon
+            RegisterEventHotKey on macOS).
           type: boolean
-        global_shortcuts_portal_version:
+        global_hotkeys_backend:
           description: |
-            Interface version returned by the portal during the availability
-            probe. Absent when the portal is unreachable or did not report a
-            version.
+            Hotkey backend in use: `xdg_portal` on Linux, `global_hotkey`
+            on macOS. Absent when the probe did not run.
           type:
-            - integer
+            - string
             - "null"
-          format: int64
-          minimum: 0
-        global_shortcuts_portal_error:
+        global_hotkeys_detail:
           description: |
-            Reason the portal probe failed, when
-            `global_shortcuts_portal_available` is `false`. Absent on success.
+            Probe detail or failure reason. Absent when the probe did not run.
           type:
             - string
             - "null"
@@ -410,8 +497,6 @@ components:
           enum: [push_to_talk, toggle, cli, tui, tray_button]
         language_profile:
           $ref: "#/components/schemas/LanguageProfile"
-        recorder_backend:
-          $ref: "#/components/schemas/RecorderBackend"
         translate_to_english:
           type: boolean
         keep_audio:
@@ -470,13 +555,6 @@ components:
               type: integer
               minimum: 1
               description: Duration of each captured segment in whole seconds.
-            overlap_secs:
-              type: integer
-              minimum: 0
-              default: 0
-              description: |
-                Reserved for later stitching; the Phase 3B MVP accepts the
-                value but does not yet overlap consecutive segments.
         - type: object
           required: [mode, probe_secs, max_segment_secs]
           properties:
@@ -515,9 +593,6 @@ components:
         session_id:
           type: string
           format: uuid
-    RecorderBackend:
-      type: string
-      enum: [auto, pipewire, alsa]
     DictationCaptureRequest:
       type: object
       required: [trigger, duration_seconds]
@@ -530,8 +605,6 @@ components:
         duration_seconds:
           type: integer
           minimum: 1
-        recorder_backend:
-          $ref: "#/components/schemas/RecorderBackend"
         translate_to_english:
           type: boolean
         keep_audio:
@@ -740,22 +813,3 @@ components:
           type:
             - string
             - "null"
-        failure_kind:
-          description: |
-            When the dictation session did not complete successfully, identifies which
-            stage failed so clients can route the error to the right subsystem. Absent
-            (or null) on successful completions.
-            - `recording_failed`: the recorder subprocess could not capture or cleanly
-              stop audio.
-            - `asr_failed`: audio was captured but the worker failed to transcribe it.
-            - `injection_failed`: the transcript was produced but injecting it into the
-              foreground target failed. Only set by the client (CLI, desktop shell);
-              the daemon never emits this variant.
-          type:
-            - string
-            - "null"
-          enum:
-            - recording_failed
-            - asr_failed
-            - injection_failed
-            - null

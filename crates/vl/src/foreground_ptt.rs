@@ -57,11 +57,11 @@ use crossterm::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use voicelayer_core::{
-    DictationCaptureResult, DictationFailureKind, LanguageProfile, LanguageStrategy,
-    SegmentationMode, SessionState, StartDictationRequest, StopDictationRequest, TriggerKind,
+    DictationCaptureResult, LanguageProfile, LanguageStrategy, SegmentationMode, SessionState,
+    StartDictationRequest, StopDictationRequest, TriggerKind,
 };
 
-use crate::config::{CliPttKey, CliRecorderBackend, StopAction};
+use crate::config::{CliPttKey, StopAction};
 use crate::terminal_targets::{
     ForegroundInjectionTarget, paste_into_kitty_target, paste_into_tmux_pane,
     paste_into_wezterm_pane, resolve_foreground_injection_target, resolve_tmux_target_pane,
@@ -72,7 +72,6 @@ use crate::uds::{cli_socket_path, uds_post_json};
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_foreground_ptt(
     language: Option<String>,
-    backend: CliRecorderBackend,
     translate_to_english: bool,
     keep_audio: bool,
     key: CliPttKey,
@@ -254,7 +253,6 @@ pub(crate) async fn run_foreground_ptt(
                             input_languages: vec![language],
                             output_language: None,
                         }),
-                        recorder_backend: Some(backend.into()),
                         translate_to_english,
                         keep_audio,
                         segmentation: SegmentationMode::default(),
@@ -464,33 +462,8 @@ fn apply_dictation_result_to_ui(
             }
         }
     }
-    if let Some(kind) = result.failure_kind {
-        let tag = failure_kind_tag(kind);
-        let detail = result
-            .transcription
-            .notes
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "dictation failure reported without detail.".to_owned());
-        let prefixed = format!("{tag} {detail}");
-        if ui
-            .last_error
-            .as_deref()
-            .is_none_or(|existing| !existing.starts_with("[injection-failed]"))
-        {
-            ui.last_error = Some(prefixed.clone());
-        }
-        ui.push_event(prefixed);
-    } else if result.session.state == SessionState::Failed && ui.last_error.is_none() {
+    if result.session.state == SessionState::Failed && ui.last_error.is_none() {
         ui.last_error = result.transcription.notes.first().cloned();
-    }
-}
-
-fn failure_kind_tag(kind: DictationFailureKind) -> &'static str {
-    match kind {
-        DictationFailureKind::RecordingFailed => "[recording-failed]",
-        DictationFailureKind::AsrFailed => "[asr-failed]",
-        DictationFailureKind::InjectionFailed => "[injection-failed]",
     }
 }
 

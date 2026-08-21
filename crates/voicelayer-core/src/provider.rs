@@ -94,20 +94,15 @@ pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
 }
 
 pub fn default_host_adapter_catalog() -> Vec<ProviderDescriptor> {
-    vec![
+    let mut catalog = vec![
         ProviderDescriptor {
-            id: "atspi_accessible_text".to_owned(),
+            id: "global_shortcuts".to_owned(),
             kind: ProviderKind::HostAdapter,
-            transport: "desktop_bus".to_owned(),
-            local: true,
-            default_enabled: true,
-            experimental: false,
-            license: "system".to_owned(),
-        },
-        ProviderDescriptor {
-            id: "global_shortcuts_portal".to_owned(),
-            kind: ProviderKind::HostAdapter,
-            transport: "desktop_bus".to_owned(),
+            transport: if cfg!(target_os = "linux") {
+                "xdg_portal".to_owned()
+            } else {
+                "global_hotkey".to_owned()
+            },
             local: true,
             default_enabled: true,
             experimental: false,
@@ -122,7 +117,35 @@ pub fn default_host_adapter_catalog() -> Vec<ProviderDescriptor> {
             experimental: false,
             license: "n/a".to_owned(),
         },
-    ]
+    ];
+    if cfg!(target_os = "linux") {
+        catalog.insert(
+            0,
+            ProviderDescriptor {
+                id: "atspi_accessible_text".to_owned(),
+                kind: ProviderKind::HostAdapter,
+                transport: "desktop_bus".to_owned(),
+                local: true,
+                default_enabled: true,
+                experimental: false,
+                license: "system".to_owned(),
+            },
+        );
+    } else {
+        catalog.insert(
+            0,
+            ProviderDescriptor {
+                id: "macos_clipboard_paste".to_owned(),
+                kind: ProviderKind::HostAdapter,
+                transport: "core_graphics".to_owned(),
+                local: true,
+                default_enabled: true,
+                experimental: false,
+                license: "system".to_owned(),
+            },
+        );
+    }
+    catalog
 }
 
 #[cfg(test)]

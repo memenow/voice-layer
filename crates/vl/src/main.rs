@@ -5,12 +5,14 @@
 mod cli;
 mod config;
 mod foreground_ptt;
-mod preview;
 mod terminal_targets;
 mod tui_glass;
 mod uds;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    cli::run().await
+async fn main() {
+    if let Err(error) = cli::run().await {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
 }

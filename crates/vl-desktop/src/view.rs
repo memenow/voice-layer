@@ -233,12 +233,9 @@ fn dictation_panel(app: &App) -> Element<'_, Message> {
     }
     if let Some(event) = &app.last_event {
         card_body = card_body.push(
-            text(format!(
-                "Last event · {} — {}",
-                event.event_type, event.message
-            ))
-            .size(tokens::text::CAPTION)
-            .color(theme::color(p.text_secondary)),
+            text(format!("Last event · {}", event.event.name()))
+                .size(tokens::text::CAPTION)
+                .color(theme::color(p.text_secondary)),
         );
     }
     if let Some(error) = &app.error {
@@ -397,10 +394,7 @@ fn doctor_panel(app: &App) -> Element<'_, Message> {
                 info_row("LLM configured", yes_no(worker.llm_configured)),
                 info_row("LLM endpoint", optional(worker.llm_endpoint.as_deref())),
                 info_row("LLM reachable", yes_no(worker.llm_reachable)),
-                info_row(
-                    "Shortcuts portal",
-                    yes_no(worker.global_shortcuts_portal_available),
-                ),
+                info_row("Global hotkeys", yes_no(worker.global_hotkeys_available),),
             ]
             .spacing(tokens::space::SM)
             .into()

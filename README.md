@@ -1,6 +1,6 @@
 # VoiceLayer
 
-VoiceLayer is a local-first voice composition layer for Ubuntu desktop workflows.
+VoiceLayer is a local-first voice composition layer for Ubuntu and macOS (Apple Silicon) desktop workflows.
 It combines fast dictation, structured text composition, rewrite, and translation into a single daemon, CLI/TUI, and host-injection stack.
 
 ## Scope
@@ -101,7 +101,7 @@ If `VOICELAYER_LLM_AUTO_START=true`, the worker can also auto-launch `llama-serv
 ### Run the Daemon
 
 ```bash
-cargo run -p vl -- daemon run --project-root "$(pwd)"
+cargo run -p voicelayerd
 ```
 
 By default the daemon listens on:
@@ -173,7 +173,7 @@ The request body's `segmentation` field selects between one-shot, fixed-duration
 The `vl` CLI exercises that control plane directly:
 
 ```bash
-cargo run -p vl -- dictation start --backend pipewire --language auto
+cargo run -p vl -- dictation start --language auto
 cargo run -p vl -- dictation start --mode fixed --segment-secs 8 --language auto
 cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
 cargo run -p vl -- dictation list
@@ -205,7 +205,7 @@ Panel controls:
 If you also want a clipboard fallback after each completed dictation:
 
 ```bash
-cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto --copy-on-stop
+cargo run -p vl -- dictation foreground-ptt --language auto --copy-on-stop
 ```
 
 This writes the finished transcript to the system clipboard before any optional terminal-target injection.
@@ -244,7 +244,7 @@ The config file lives at:
 For terminal-focused fallback usage, `vl` also provides a foreground raw-terminal mode:
 
 ```bash
-cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto
+cargo run -p vl -- dictation foreground-ptt --language auto
 ```
 
 When the terminal reports key release events, this behaves like hold-to-record.
@@ -257,7 +257,7 @@ When release events are not available, it degrades to:
 If you run the controller inside tmux and want the transcript pasted into another pane:
 
 ```bash
-cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto --tmux-target-pane %2
+cargo run -p vl -- dictation foreground-ptt --language auto --tmux-target-pane %2
 ```
 
 This uses `tmux set-buffer` plus `tmux paste-buffer -dpr -t <pane>`.

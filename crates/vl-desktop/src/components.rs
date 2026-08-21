@@ -9,7 +9,7 @@
 use iced::widget::{button, container, pick_list, row, slider, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Shadow, Vector};
 
-use voicelayer_core::{CompositionArchetype, InjectTarget, RecorderBackend, RewriteStyle};
+use voicelayer_core::{CompositionArchetype, InjectTarget, RewriteStyle};
 use voicelayer_ui::a11y::Accessibility;
 use voicelayer_ui::color::Rgba;
 use voicelayer_ui::tokens::{self, Surface, Weight};
@@ -370,29 +370,6 @@ pub fn target_choices() -> Vec<TargetChoice> {
         InjectTarget::TerminalKittyRemote,
     ]
     .map(TargetChoice)
-    .to_vec()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecorderChoice(pub RecorderBackend);
-
-impl std::fmt::Display for RecorderChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self.0 {
-            RecorderBackend::Auto => "Automatic",
-            RecorderBackend::Pipewire => "PipeWire",
-            RecorderBackend::Alsa => "ALSA",
-        })
-    }
-}
-
-pub fn recorder_choices() -> Vec<RecorderChoice> {
-    [
-        RecorderBackend::Auto,
-        RecorderBackend::Pipewire,
-        RecorderBackend::Alsa,
-    ]
-    .map(RecorderChoice)
     .to_vec()
 }
 

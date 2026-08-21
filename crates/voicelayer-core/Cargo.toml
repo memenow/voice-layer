@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+directories.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

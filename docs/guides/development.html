@@ -71,13 +71,13 @@ uv run pytest -q tests/python</code></pre>
 cargo run -p vl -- preview compose "Write a concise technical summary."
 cargo run -p vl -- transcribe-file /path/to/sample.wav --language auto
 cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto
-cargo run -p vl -- dictation start --backend pipewire --language auto
+cargo run -p vl -- dictation start --language auto
 cargo run -p vl -- dictation start --mode fixed --segment-secs 8 --language auto
 cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
 cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --duration-seconds 10 --language auto
 cargo run -p vl -- dictation stop &lt;session-id&gt;
 cargo run -p vl -- dictation list
-cargo run -p vl -- dictation foreground-ptt --backend pipewire --language auto
+cargo run -p vl -- dictation foreground-ptt --language auto
 cargo run -p vl -- hotkeys portal-status
 cargo run -p vl-desktop</code></pre>
 <h2 id="daemon-socket">Daemon Socket</h2>
@@ -89,7 +89,7 @@ cargo run -p vl-desktop</code></pre>
 daemon falls back to the current working directory.</p>
 <p>For source-based development, start the daemon from the repository
 root or pass:</p>
-<pre><code>cargo run -p vl -- daemon run --project-root "$(pwd)"</code></pre>
+<pre><code>cargo run -p voicelayerd</code></pre>
 <p>For real composition / rewrite / translation, configure
 <code>VOICELAYER_LLM_ENDPOINT</code> and
 <code>VOICELAYER_LLM_MODEL</code> as described in
