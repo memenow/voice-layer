@@ -1,40 +1,36 @@
+//! Persistent Python worker process manager.
+//!
+//! The daemon spawns `voicelayer_orchestrator.worker` once (lazily, on the
+//! first inference call) and multiplexes every JSON-RPC method over the same
+//! stdio pair. The first frame after spawn is always `initialize`, carrying
+//! the provider configuration payload; the worker answers it before serving
+//! anything else.
+//!
+//! Calls are serialized through a single mutex: the worker serves one
+//! request at a time by design, so pipelining would buy nothing. A process
+//! that dies mid-call fails the in-flight request and is respawned on the
+//! next call.
+
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout},
+    sync::Mutex,
     time::timeout,
 };
 use uuid::Uuid;
-use voicelayer_core::{ProviderDescriptor, TranscriptionResult};
+use voicelayer_core::{ProviderDescriptor, TranscriptionResult, WorkerInitPayload};
 
 const JSONRPC_VERSION: &str = "2.0";
 const WORKER_MODULE: &str = "voicelayer_orchestrator.worker";
 
-/// Upper bound on how long the daemon waits for a worker response.
-///
 /// `health` and `list_providers` are cheap probes and stay short so CLI
-/// commands that depend on them (e.g., `vl doctor`, `vl providers`) don't
-/// hang on a misconfigured worker. Every other method invokes real
-/// inference (whisper-cli / whisper-server for transcribe, llama-server
-/// for compose/rewrite/translate) and must outlast the provider's own
-/// timeout. The inference budget is overridable through the
-/// `VOICELAYER_WORKER_TIMEOUT_SECONDS` environment variable.
-const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 15;
-const DEFAULT_INFERENCE_TIMEOUT_SECS: u64 = 600;
-
-fn worker_call_timeout(method: &str) -> Duration {
-    let seconds = match method {
-        "health" | "list_providers" => DEFAULT_PROBE_TIMEOUT_SECS,
-        _ => std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_INFERENCE_TIMEOUT_SECS),
-    };
-    Duration::from_secs(seconds)
-}
+/// commands that depend on them don't hang on a misconfigured worker. Every
+/// other method invokes real inference and uses the configured budget.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
@@ -73,6 +69,53 @@ impl WorkerCommand {
             .chain(self.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+/// Owns the worker child process. Dropping the manager kills the child
+/// (`kill_on_drop`).
+pub struct WorkerManager {
+    command: WorkerCommand,
+    init_payload: WorkerInitPayload,
+    inference_timeout: Duration,
+    process: Mutex<Option<WorkerProcess>>,
+}
+
+struct WorkerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+}
+
+impl WorkerManager {
+    pub fn new(
+        project_root: PathBuf,
+        init_payload: WorkerInitPayload,
+        inference_timeout: Duration,
+    ) -> Self {
+        Self {
+            command: WorkerCommand::discover(project_root),
+            init_payload,
+            inference_timeout,
+            process: Mutex::new(None),
+        }
+    }
+
+    pub fn command_display(&self) -> String {
+        self.command.display()
+    }
+
+    /// Whether the worker child is currently running (used to keep health
+    /// refreshes lazy: no refresh may spawn the worker by itself).
+    pub async fn is_running(&self) -> bool {
+        self.process.lock().await.is_some()
+    }
+
+    fn call_timeout(&self, method: &str) -> Duration {
+        match method {
+            "health" | "list_providers" => PROBE_TIMEOUT,
+            _ => self.inference_timeout,
+        }
     }
 
     pub async fn health(&self) -> Result<WorkerHealthResult, WorkerCallError> {
@@ -116,25 +159,39 @@ impl WorkerCommand {
         P: Serialize,
         R: DeserializeOwned,
     {
-        let request = JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION,
-            id: Uuid::new_v4().to_string(),
-            method: method.to_owned(),
-            params,
-        };
-        let payload = serde_json::to_string(&request)?;
+        let mut guard = self.process.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.spawn_and_initialize().await?);
+        }
+        let process = guard.as_mut().expect("worker process just spawned");
 
-        let mut command = Command::new(&self.executable);
+        match self.round_trip(process, method, params).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if error.is_process_failure() {
+                    // The pipe is gone or the process died; drop it so the
+                    // next call respawns instead of writing into a void.
+                    if let Some(mut dead) = guard.take() {
+                        let _ = dead.child.kill().await;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn spawn_and_initialize(&self) -> Result<WorkerProcess, WorkerCallError> {
+        let mut command = tokio::process::Command::new(&self.command.executable);
         command
-            .args(&self.args)
-            .current_dir(&self.project_root)
+            .args(&self.command.args)
+            .current_dir(&self.command.project_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
 
         let mut child = command.spawn()?;
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or(WorkerCallError::MissingPipe("stdin"))?;
@@ -142,46 +199,94 @@ impl WorkerCommand {
             .stdout
             .take()
             .ok_or(WorkerCallError::MissingPipe("stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(WorkerCallError::MissingPipe("stderr"))?;
 
-        let stderr_task = tokio::spawn(async move {
-            let mut buffer = String::new();
-            let mut reader = BufReader::new(stderr);
-            let _ = reader.read_to_string(&mut buffer).await;
-            buffer
-        });
+        let mut process = WorkerProcess {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+        };
 
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.shutdown().await?;
-        drop(stdin);
-
-        let mut reader = BufReader::new(stdout).lines();
-        let line = timeout(worker_call_timeout(method), reader.next_line())
-            .await
-            .map_err(|_| WorkerCallError::TimedOut)??
-            .ok_or(WorkerCallError::EmptyResponse)?;
-
-        let response: JsonRpcResponse<R> = serde_json::from_str(&line)?;
-        if response.jsonrpc != JSONRPC_VERSION {
-            return Err(WorkerCallError::InvalidProtocolVersion(response.jsonrpc));
-        }
-
-        let status = child.wait().await?;
-        let stderr_output = stderr_task.await.unwrap_or_default();
-        if !status.success() {
-            return Err(WorkerCallError::ProcessExited(status.code(), stderr_output));
-        }
-
-        match (response.result, response.error) {
-            (Some(result), None) => Ok(result),
-            (None, Some(error)) => Err(WorkerCallError::Rpc(error)),
-            _ => Err(WorkerCallError::MalformedResponse),
+        let id = Uuid::new_v4().to_string();
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION,
+            id: id.clone(),
+            method: "initialize".to_owned(),
+            params: Some(&self.init_payload),
+        };
+        write_request(&mut process.stdin, &request).await?;
+        let response: JsonRpcResponse<InitializeResult> =
+            read_response(&mut process.stdout, PROBE_TIMEOUT).await?;
+        match response.into_result(&id)? {
+            Ok(result) if result.status == "ok" => Ok(process),
+            Ok(result) => Err(WorkerCallError::InitializeFailed(format!(
+                "worker reported status `{}`",
+                result.status
+            ))),
+            Err(error) => Err(WorkerCallError::InitializeFailed(error.to_string())),
         }
     }
+
+    async fn round_trip<P, R>(
+        &self,
+        process: &mut WorkerProcess,
+        method: &str,
+        params: Option<P>,
+    ) -> Result<R, WorkerCallError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let id = Uuid::new_v4().to_string();
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION,
+            id: id.clone(),
+            method: method.to_owned(),
+            params,
+        };
+        write_request(&mut process.stdin, &request).await?;
+        let response: JsonRpcResponse<R> =
+            read_response(&mut process.stdout, self.call_timeout(method)).await?;
+        response.into_result(&id)?.map_err(WorkerCallError::Rpc)
+    }
+
+    /// Kill the worker child. Called on daemon shutdown.
+    pub async fn shutdown(&self) {
+        let mut guard = self.process.lock().await;
+        if let Some(mut process) = guard.take() {
+            let _ = process.child.kill().await;
+        }
+    }
+}
+
+async fn write_request<P: Serialize>(
+    stdin: &mut ChildStdin,
+    request: &JsonRpcRequest<P>,
+) -> Result<(), WorkerCallError> {
+    let payload = serde_json::to_string(request)?;
+    stdin
+        .write_all(payload.as_bytes())
+        .await
+        .map_err(|_| WorkerCallError::ProcessDied)?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|_| WorkerCallError::ProcessDied)?;
+    stdin
+        .flush()
+        .await
+        .map_err(|_| WorkerCallError::ProcessDied)
+}
+
+async fn read_response<R: DeserializeOwned>(
+    stdout: &mut Lines<BufReader<ChildStdout>>,
+    budget: Duration,
+) -> Result<JsonRpcResponse<R>, WorkerCallError> {
+    let line = timeout(budget, stdout.next_line())
+        .await
+        .map_err(|_| WorkerCallError::TimedOut)?
+        .map_err(|_| WorkerCallError::ProcessDied)?
+        .ok_or(WorkerCallError::ProcessDied)?;
+    Ok(serde_json::from_str(&line)?)
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -213,6 +318,11 @@ pub struct WorkerPreviewPayload {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct InitializeResult {
+    pub status: String,
+}
+
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest<P> {
     jsonrpc: &'static str,
@@ -225,8 +335,29 @@ struct JsonRpcRequest<P> {
 #[derive(Debug, Deserialize)]
 struct JsonRpcResponse<R> {
     jsonrpc: String,
+    id: Option<String>,
     result: Option<R>,
     error: Option<JsonRpcError>,
+}
+
+impl<R> JsonRpcResponse<R> {
+    /// Validate protocol version and response id, then unwrap result/error.
+    fn into_result(self, expected_id: &str) -> Result<Result<R, JsonRpcError>, WorkerCallError> {
+        if self.jsonrpc != JSONRPC_VERSION {
+            return Err(WorkerCallError::InvalidProtocolVersion(self.jsonrpc));
+        }
+        if self.id.as_deref() != Some(expected_id) {
+            return Err(WorkerCallError::IdMismatch {
+                expected: expected_id.to_owned(),
+                got: self.id,
+            });
+        }
+        match (self.result, self.error) {
+            (Some(result), None) => Ok(Ok(result)),
+            (None, Some(error)) => Ok(Err(error)),
+            _ => Err(WorkerCallError::MalformedResponse),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Error)]
@@ -234,6 +365,12 @@ struct JsonRpcResponse<R> {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+}
+
+impl JsonRpcError {
+    pub fn is_provider_unavailable(&self) -> bool {
+        self.code == -32004
+    }
 }
 
 #[derive(Debug, Error)]
@@ -244,96 +381,104 @@ pub enum WorkerCallError {
     Json(#[from] serde_json::Error),
     #[error("worker process did not provide a {0} pipe")]
     MissingPipe(&'static str),
-    #[error("worker process returned no response")]
-    EmptyResponse,
+    #[error("worker process died or closed its pipes")]
+    ProcessDied,
     #[error("worker process timed out while waiting for a response")]
     TimedOut,
-    #[error("worker process exited with code {0:?}: {1}")]
-    ProcessExited(Option<i32>, String),
+    #[error("worker initialize handshake failed: {0}")]
+    InitializeFailed(String),
     #[error("worker returned unsupported JSON-RPC version `{0}`")]
     InvalidProtocolVersion(String),
+    #[error("worker response id mismatch: expected {expected}, got {got:?}")]
+    IdMismatch {
+        expected: String,
+        got: Option<String>,
+    },
     #[error("worker returned a malformed JSON-RPC response")]
     MalformedResponse,
     #[error("worker RPC error {0}")]
     Rpc(JsonRpcError),
 }
 
+impl WorkerCallError {
+    /// Errors after which the process must be discarded and respawned.
+    ///
+    /// `TimedOut` is included: a late response from the timed-out request is
+    /// undrainable, so the pipe state is unknowable and the next call would
+    /// read the stale line and fail with an id mismatch.
+    fn is_process_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(_)
+                | Self::MissingPipe(_)
+                | Self::ProcessDied
+                | Self::TimedOut
+                | Self::InvalidProtocolVersion(_)
+                | Self::IdMismatch { .. }
+                | Self::MalformedResponse
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use super::{
-        DEFAULT_INFERENCE_TIMEOUT_SECS, DEFAULT_PROBE_TIMEOUT_SECS, WorkerCommand,
-        worker_call_timeout,
-    };
-
-    /// Serializes any test that mutates process-wide env vars. Cargo runs
-    /// unit tests concurrently by default, and Rust 2024 flagged
-    /// `std::env::set_var` as `unsafe` precisely because a concurrent
-    /// reader in another thread is UB. Any future test that touches
-    /// `VOICELAYER_WORKER_TIMEOUT_SECONDS` (or any other process env)
-    /// must take this lock for the duration of the mutation.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::*;
 
     #[test]
-    fn probe_methods_use_short_timeout() {
-        assert_eq!(
-            worker_call_timeout("health").as_secs(),
-            DEFAULT_PROBE_TIMEOUT_SECS,
-        );
-        assert_eq!(
-            worker_call_timeout("list_providers").as_secs(),
-            DEFAULT_PROBE_TIMEOUT_SECS,
-        );
+    fn response_id_is_validated() {
+        let response: JsonRpcResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":"abc","result":{"ok":true}}"#).unwrap();
+        assert!(response.into_result("abc").is_ok());
+
+        let mismatched: JsonRpcResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":"other","result":{"ok":true}}"#).unwrap();
+        assert!(matches!(
+            mismatched.into_result("abc"),
+            Err(WorkerCallError::IdMismatch { .. })
+        ));
     }
 
     #[test]
-    fn inference_methods_use_env_overridden_budget() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var("VOICELAYER_WORKER_TIMEOUT_SECONDS").ok();
-        // SAFETY: ENV_LOCK serializes every mutation of this variable with
-        // every other env-touching test in this module, so no other thread
-        // can observe the mutation while we hold the lock.
-        unsafe {
-            std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
-        }
-        assert_eq!(
-            worker_call_timeout("transcribe").as_secs(),
-            DEFAULT_INFERENCE_TIMEOUT_SECS,
+    fn response_rejects_wrong_protocol_version() {
+        let response: JsonRpcResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"jsonrpc":"1.0","id":"abc","result":null}"#).unwrap();
+        assert!(matches!(
+            response.into_result("abc"),
+            Err(WorkerCallError::InvalidProtocolVersion(_))
+        ));
+    }
+
+    #[test]
+    fn timeout_is_a_process_failure() {
+        // A late response to a timed-out request is undrainable; keeping the
+        // process would poison the next call with an id mismatch.
+        assert!(WorkerCallError::TimedOut.is_process_failure());
+        assert!(WorkerCallError::ProcessDied.is_process_failure());
+        assert!(
+            !WorkerCallError::Rpc(JsonRpcError {
+                code: -32004,
+                message: "unavailable".to_owned(),
+            })
+            .is_process_failure()
         );
-        unsafe {
-            std::env::set_var("VOICELAYER_WORKER_TIMEOUT_SECONDS", "42");
-        }
-        assert_eq!(worker_call_timeout("transcribe").as_secs(), 42);
-        assert_eq!(worker_call_timeout("compose").as_secs(), 42);
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("VOICELAYER_WORKER_TIMEOUT_SECONDS", value);
-            },
-            None => unsafe {
-                std::env::remove_var("VOICELAYER_WORKER_TIMEOUT_SECONDS");
-            },
-        }
     }
 
     #[tokio::test]
-    async fn worker_command_can_call_health() {
-        let project_root = std::env::current_dir().expect("current_dir should be available");
-        let worker = WorkerCommand::discover(project_root);
+    async fn worker_manager_serves_multiple_calls_on_one_process() {
+        let manager = WorkerManager::new(
+            std::env::current_dir().expect("current_dir should be available"),
+            voicelayer_core::VoiceLayerConfig::default().worker_payload(),
+            Duration::from_secs(60),
+        );
 
-        let health = worker.health().await.expect("worker health should succeed");
+        let health = manager
+            .health()
+            .await
+            .expect("worker health should succeed");
         assert_eq!(health.status, "ok");
         assert_eq!(health.protocol, "2.0");
-    }
 
-    #[tokio::test]
-    async fn worker_command_can_list_providers() {
-        let project_root = std::env::current_dir().expect("current_dir should be available");
-        let worker = WorkerCommand::discover(project_root);
-
-        let providers = worker
+        let providers = manager
             .list_providers()
             .await
             .expect("worker provider listing should succeed");
@@ -343,5 +488,7 @@ mod tests {
                 .iter()
                 .any(|provider| provider.id == "whisper_cpp")
         );
+
+        manager.shutdown().await;
     }
 }

@@ -14,7 +14,17 @@ The preferred order for GUI insertion on Ubuntu GNOME Wayland is:
 2. Clipboard-assisted paste with restoration
 3. Keyboard simulation fallback
 
-### Why AT-SPI First
+On macOS the order is:
+
+1. Clipboard write + synthetic Cmd+V (CoreGraphics event)
+2. Keyboard simulation fallback
+
+macOS has no AT-SPI equivalent available without Accessibility API
+entitlements; the clipboard + Cmd+V path works across browsers, Electron
+apps, and native text fields, and requires the user to grant the host app
+Input Monitoring permission.
+
+### Why AT-SPI First (Linux)
 
 AT-SPI provides direct editable text operations and avoids timing races common with simulated input.
 This is the preferred path for browser editors, GTK apps, Electron apps, and IDE surfaces that expose accessibility trees correctly.

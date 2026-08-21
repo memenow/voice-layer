@@ -1,11 +1,16 @@
-"""Environment-backed configuration for VoiceLayer provider backends."""
+"""Worker configuration received via the JSON-RPC ``initialize`` handshake.
+
+The daemon owns configuration: it parses the unified TOML config file (with
+``VOICELAYER_*`` environment overrides) and hands the provider-facing
+sections to the worker in the ``initialize`` payload. The worker never
+reads the process environment for provider settings.
+"""
 
 from __future__ import annotations
 
-import os
 import shlex
-from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -80,136 +85,174 @@ class WhisperServerConfig:
         return f"http://{self.host}:{self.port}"
 
 
-def load_llm_provider_config(
-    environ: Mapping[str, str] | None = None,
-) -> OpenAICompatibleConfig | None:
-    """Load an OpenAI-compatible provider configuration from the environment."""
+@dataclass(frozen=True)
+class _WorkerConfig:
+    llm: OpenAICompatibleConfig | None
+    llama_launch: LlamaServerLaunchConfig | None
+    whisper: WhisperCppConfig | None
+    whisper_server: WhisperServerConfig | None
+    vad: WhisperVadConfig | None
 
-    source = environ or os.environ
-    endpoint = source.get("VOICELAYER_LLM_ENDPOINT")
-    model = source.get("VOICELAYER_LLM_MODEL")
+
+_CONFIG: _WorkerConfig | None = None
+
+
+def configure(payload: dict[str, Any]) -> None:
+    """Store the initialize payload as the worker's configuration."""
+    global _CONFIG
+    whisper = _parse_whisper(payload.get("whisper") or {})
+    _CONFIG = _WorkerConfig(
+        llm=_parse_llm(payload.get("llm") or {}),
+        llama_launch=_parse_llama_launch(payload.get("llm") or {}),
+        whisper=whisper,
+        whisper_server=_parse_whisper_server(
+            payload.get("whisper_server") or {},
+            whisper.model_path if whisper else None,
+        ),
+        vad=_parse_vad(payload.get("vad") or {}),
+    )
+
+
+def is_configured() -> bool:
+    return _CONFIG is not None
+
+
+def _require_config() -> _WorkerConfig:
+    if _CONFIG is None:
+        raise RuntimeError("worker has not been initialized")
+    return _CONFIG
+
+
+def llm_config() -> OpenAICompatibleConfig | None:
+    return _require_config().llm
+
+
+def llama_launch_config() -> LlamaServerLaunchConfig | None:
+    return _require_config().llama_launch
+
+
+def whisper_config() -> WhisperCppConfig | None:
+    return _require_config().whisper
+
+
+def whisper_server_config() -> WhisperServerConfig | None:
+    return _require_config().whisper_server
+
+
+def vad_config() -> WhisperVadConfig | None:
+    return _require_config().vad
+
+
+def _text(section: dict[str, Any], key: str) -> str | None:
+    value = section.get(key)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _number(section: dict[str, Any], key: str, default: float) -> float:
+    value = section.get(key)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
+
+
+def _integer(section: dict[str, Any], key: str, default: int) -> int:
+    value = section.get(key)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    return default
+
+
+def _flag(section: dict[str, Any], key: str) -> bool:
+    return bool(section.get(key, False))
+
+
+def _args(section: dict[str, Any], key: str) -> tuple[str, ...]:
+    return tuple(shlex.split(_text(section, key) or ""))
+
+
+def _parse_llm(section: dict[str, Any]) -> OpenAICompatibleConfig | None:
+    endpoint = _text(section, "endpoint")
+    model = _text(section, "model")
     if not endpoint or not model:
         return None
-
-    timeout_seconds = float(source.get("VOICELAYER_LLM_TIMEOUT_SECONDS", "60"))
-    api_key = source.get("VOICELAYER_LLM_API_KEY") or None
     return OpenAICompatibleConfig(
-        endpoint=endpoint.strip(),
-        model=model.strip(),
-        api_key=api_key,
-        timeout_seconds=timeout_seconds,
+        endpoint=endpoint,
+        model=model,
+        api_key=_text(section, "api_key"),
+        timeout_seconds=_number(section, "timeout_seconds", 60.0),
     )
 
 
-def load_llama_server_launch_config(
-    environ: Mapping[str, str] | None = None,
-) -> LlamaServerLaunchConfig | None:
-    """Load optional auto-start configuration for `llama-server`."""
-
-    source = environ or os.environ
-    enabled = source.get("VOICELAYER_LLM_AUTO_START", "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+def _parse_llama_launch(section: dict[str, Any]) -> LlamaServerLaunchConfig | None:
+    if not _flag(section, "auto_start"):
         return None
-
     return LlamaServerLaunchConfig(
-        server_bin=source.get("VOICELAYER_LLAMA_SERVER_BIN", "llama-server"),
-        model_path=source.get("VOICELAYER_LLAMA_MODEL_PATH"),
-        hf_repo=source.get("VOICELAYER_LLAMA_HF_REPO"),
-        extra_args=tuple(shlex.split(source.get("VOICELAYER_LLAMA_SERVER_ARGS", ""))),
-        launch_timeout_seconds=float(source.get("VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS", "45")),
-        poll_interval_seconds=float(source.get("VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS", "0.5")),
+        server_bin=_text(section, "server_bin") or "llama-server",
+        model_path=_text(section, "model_path"),
+        hf_repo=_text(section, "hf_repo"),
+        extra_args=_args(section, "server_args"),
+        launch_timeout_seconds=_number(section, "launch_timeout_seconds", 45.0),
+        poll_interval_seconds=_number(section, "poll_interval_seconds", 0.5),
     )
 
 
-def load_whisper_provider_config(
-    environ: Mapping[str, str] | None = None,
-) -> WhisperCppConfig | None:
-    """Load `whisper-cli` configuration from the environment."""
-
-    source = environ or os.environ
-    model_path = source.get("VOICELAYER_WHISPER_MODEL_PATH")
+def _parse_whisper(section: dict[str, Any]) -> WhisperCppConfig | None:
+    model_path = _text(section, "model_path")
     if not model_path:
         return None
-
     return WhisperCppConfig(
-        binary=source.get("VOICELAYER_WHISPER_BIN", "whisper-cli"),
-        model_path=model_path.strip(),
-        timeout_seconds=float(source.get("VOICELAYER_WHISPER_TIMEOUT_SECONDS", "300")),
-        no_gpu=source.get("VOICELAYER_WHISPER_NO_GPU", "").strip().lower()
-        in {"1", "true", "yes", "on"},
-        extra_args=tuple(shlex.split(source.get("VOICELAYER_WHISPER_ARGS", ""))),
-    )
-
-
-def load_whisper_vad_config(
-    environ: Mapping[str, str] | None = None,
-) -> WhisperVadConfig | None:
-    """Load silero-vad pre-pass configuration from the environment.
-
-    Returns ``None`` when VAD is not explicitly enabled or the model path is
-    missing. Callers treat a ``None`` config as "no VAD" and fall back to the
-    raw WAV transcribe path.
-    """
-
-    source = environ or os.environ
-    enabled = source.get("VOICELAYER_WHISPER_VAD_ENABLED", "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
-        return None
-
-    model_path = source.get("VOICELAYER_WHISPER_VAD_MODEL_PATH", "").strip()
-    if not model_path:
-        return None
-
-    return WhisperVadConfig(
+        binary=_text(section, "binary") or "whisper-cli",
         model_path=model_path,
-        threshold=float(source.get("VOICELAYER_WHISPER_VAD_THRESHOLD", "0.5")),
-        min_speech_ms=int(source.get("VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS", "250")),
-        min_silence_ms=int(source.get("VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS", "100")),
-        speech_pad_ms=int(source.get("VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS", "30")),
-        max_segment_secs=float(source.get("VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS", "30")),
-        sample_rate=int(source.get("VOICELAYER_WHISPER_VAD_SAMPLE_RATE", "16000")),
+        timeout_seconds=_number(section, "timeout_seconds", 300.0),
+        no_gpu=_flag(section, "no_gpu"),
+        extra_args=_args(section, "extra_args"),
     )
 
 
-def load_whisper_server_config(
-    environ: Mapping[str, str] | None = None,
+def _parse_whisper_server(
+    section: dict[str, Any],
+    whisper_model_path: str | None,
 ) -> WhisperServerConfig | None:
-    """Load persistent `whisper-server` configuration from the environment.
-
-    Returns None when neither a host/port pair nor an autostart binary is
-    configured, so callers can fall back to the one-shot ``whisper-cli``
-    provider without handling an error.
-    """
-
-    source = environ or os.environ
-    host = source.get("VOICELAYER_WHISPER_SERVER_HOST", "").strip()
-    port_str = source.get("VOICELAYER_WHISPER_SERVER_PORT", "").strip()
-    server_bin = source.get("VOICELAYER_WHISPER_SERVER_BIN")
-    auto_start = source.get("VOICELAYER_WHISPER_SERVER_AUTO_START", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-    if not host and not port_str and not server_bin and not auto_start:
+    host = _text(section, "host")
+    port = _integer(section, "port", 0)
+    server_bin = _text(section, "server_bin")
+    auto_start = _flag(section, "auto_start")
+    if not host and not port and not server_bin and not auto_start:
         return None
-
-    resolved_host = host or "127.0.0.1"
-    resolved_port = int(port_str) if port_str else 8188
-
     return WhisperServerConfig(
-        host=resolved_host,
-        port=resolved_port,
-        timeout_seconds=float(source.get("VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS", "60")),
+        host=host or "127.0.0.1",
+        port=port or 8188,
+        timeout_seconds=_number(section, "timeout_seconds", 60.0),
         auto_start=auto_start,
         server_bin=server_bin,
-        model_path=source.get("VOICELAYER_WHISPER_MODEL_PATH"),
-        extra_args=tuple(shlex.split(source.get("VOICELAYER_WHISPER_SERVER_ARGS", ""))),
-        launch_timeout_seconds=float(
-            source.get("VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS", "30")
-        ),
-        poll_interval_seconds=float(
-            source.get("VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS", "0.5")
-        ),
+        # Autostart needs the ggml model path; it lives in the whisper
+        # section of the shared config.
+        model_path=whisper_model_path,
+        extra_args=_args(section, "extra_args"),
+        launch_timeout_seconds=_number(section, "launch_timeout_seconds", 30.0),
+        poll_interval_seconds=_number(section, "poll_interval_seconds", 0.5),
+    )
+
+
+def _parse_vad(section: dict[str, Any]) -> WhisperVadConfig | None:
+    if not _flag(section, "enabled"):
+        return None
+    model_path = _text(section, "model_path")
+    if not model_path:
+        return None
+    return WhisperVadConfig(
+        model_path=model_path,
+        threshold=_number(section, "threshold", 0.5),
+        min_speech_ms=_integer(section, "min_speech_ms", 250),
+        min_silence_ms=_integer(section, "min_silence_ms", 100),
+        speech_pad_ms=_integer(section, "speech_pad_ms", 30),
+        max_segment_secs=_number(section, "max_segment_secs", 30.0),
+        sample_rate=_integer(section, "sample_rate", 16000),
     )

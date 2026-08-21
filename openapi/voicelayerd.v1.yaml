@@ -1,17 +1,34 @@
 openapi: 3.1.0
 info:
   title: VoiceLayer Local Control API
-  version: 0.1.0
+  version: 0.2.0
+  contact:
+    name: VoiceLayer maintainers
   description: |
     Local control API exposed by the VoiceLayer daemon over a Unix domain socket.
+
+    Error model: failures return a semantic 4xx/5xx status with an RFC 9457
+    `application/problem+json` body. Success payloads never encode errors.
 servers:
   - url: http://localhost
     description: Logical placeholder. The daemon is served over a Unix domain socket.
+tags:
+  - name: health
+  - name: providers
+  - name: events
+  - name: dictation
+  - name: composition
+  - name: transcription
 paths:
   /v1/health:
     get:
       operationId: getHealth
-      summary: Read daemon health state.
+      tags: [health]
+      summary: Read the cached daemon health snapshot (cheap liveness).
+      description: |
+        Returns the most recent health snapshot without probing the worker or
+        platform; the daemon refreshes the snapshot in the background. Use
+        `POST /v1/health/refresh` for an on-demand deep probe.
       responses:
         "200":
           description: Daemon health report.
@@ -19,9 +36,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+  /v1/health/refresh:
+    post:
+      operationId: refreshHealth
+      tags: [health]
+      description: Probes the worker and platform on demand and returns a fresh health report.
+      summary: Force a fresh worker + platform probe and return the result.
+      responses:
+        "200":
+          description: Freshly probed daemon health report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
   /v1/providers:
     get:
       operationId: listProviders
+      tags: [providers]
+      description: Lists host adapters plus the providers reported by the worker.
       summary: List supported providers and host adapters.
       responses:
         "200":
@@ -36,27 +68,32 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/ProviderDescriptor"
+        "503":
+          $ref: "#/components/responses/Problem"
   /v1/events/stream:
     get:
       operationId: streamEvents
+      tags: [events]
       summary: Subscribe to daemon events.
+      description: |
+        Server-Sent Events stream. The SSE `event:` field carries the typed
+        event name (`dictation_session_created`, `segment_recorded`, ...);
+        the `data:` field carries the full event envelope JSON. When a
+        subscriber lags behind the broadcast channel, the daemon emits a
+        synthetic `events_lost` event with the dropped count.
       responses:
         "200":
           description: Server-Sent Events stream.
           content:
             text/event-stream:
               schema:
-                type: string
+                $ref: "#/components/schemas/EventEnvelope"
   /v1/sessions/dictation:
     post:
       operationId: startLiveDictationSession
-      summary: Create a live dictation session and start recording audio.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/StartDictationRequest"
+      tags: [dictation]
+      description: Starts in-process audio capture and returns the new session.
+      summary: Create a live dictation session and start capturing audio.
       responses:
         "200":
           description: Dictation session created.
@@ -64,16 +101,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CaptureSession"
-  /v1/sessions/dictation/stop:
-    post:
-      operationId: stopLiveDictationSession
-      summary: Stop a live dictation session, transcribe the recorded audio, and return the result.
+        "400":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/StopDictationRequest"
+              $ref: "#/components/schemas/StartDictationRequest"
+  /v1/sessions/dictation/stop:
+    post:
+      operationId: stopLiveDictationSession
+      tags: [dictation]
+      description: Stops capture, transcribes the audio, and returns the result.
+      summary: Stop a live dictation session, transcribe the captured audio, and return the result.
       responses:
         "200":
           description: Dictation capture result.
@@ -81,16 +124,28 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DictationCaptureResult"
-  /v1/sessions/compose:
-    post:
-      operationId: createCompositionJob
-      summary: Register a composition request and return a preview artifact.
+        "404":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
+        "504":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ComposeRequest"
+              $ref: "#/components/schemas/StopDictationRequest"
+  /v1/sessions/compose:
+    post:
+      operationId: createCompositionJob
+      tags: [composition]
+      description: Runs a composition request through the configured LLM provider.
+      summary: Run a composition request and return a preview artifact.
       responses:
         "200":
           description: Composition job receipt.
@@ -98,16 +153,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompositionReceipt"
-  /v1/rewrites:
-    post:
-      operationId: rewriteText
-      summary: Register a rewrite request and return a preview artifact.
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RewriteRequest"
+              $ref: "#/components/schemas/ComposeRequest"
+  /v1/rewrites:
+    post:
+      operationId: rewriteText
+      tags: [composition]
+      description: Runs a rewrite request through the configured LLM provider.
+      summary: Run a rewrite request and return a preview artifact.
       responses:
         "200":
           description: Rewrite job receipt.
@@ -115,16 +178,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompositionReceipt"
-  /v1/translations:
-    post:
-      operationId: translateText
-      summary: Register a translation request and return a preview artifact.
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/TranslateRequest"
+              $ref: "#/components/schemas/RewriteRequest"
+  /v1/translations:
+    post:
+      operationId: translateText
+      tags: [composition]
+      description: Runs a translation request through the configured LLM provider.
+      summary: Run a translation request and return a preview artifact.
       responses:
         "200":
           description: Translation job receipt.
@@ -132,16 +203,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompositionReceipt"
-  /v1/transcriptions:
-    post:
-      operationId: transcribeAudioFile
-      summary: Transcribe a local audio file through the configured ASR provider.
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/TranscribeRequest"
+              $ref: "#/components/schemas/TranslateRequest"
+  /v1/transcriptions:
+    post:
+      operationId: transcribeAudioFile
+      tags: [transcription]
+      description: Transcribes a local audio file through the configured ASR provider.
+      summary: Transcribe a local audio file through the configured ASR provider.
       responses:
         "200":
           description: Transcription result.
@@ -149,16 +228,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TranscriptionResult"
-  /v1/dictation/capture:
-    post:
-      operationId: captureDictation
-      summary: Record a short clip, transcribe it, and return the resulting dictation session.
+        "400":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/DictationCaptureRequest"
+              $ref: "#/components/schemas/TranscribeRequest"
+  /v1/dictation/capture:
+    post:
+      operationId: captureDictation
+      tags: [dictation]
+      description: Records a fixed-duration clip in-process and transcribes it.
+      summary: Record a short clip, transcribe it, and return the resulting dictation session.
       responses:
         "200":
           description: Dictation capture result.
@@ -166,25 +253,52 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DictationCaptureResult"
-  /v1/inject:
-    post:
-      operationId: planInjection
-      summary: Build an injection plan for a target.
+        "400":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
+        "502":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Problem"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/InjectRequest"
-      responses:
-        "200":
-          description: Injection plan response.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/InjectionPlan"
+              $ref: "#/components/schemas/DictationCaptureRequest"
 components:
+  responses:
+    Problem:
+      description: RFC 9457 problem details describing the failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
   schemas:
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          description: Problem type URN, e.g. `urn:voicelayer:problem:provider_unavailable`.
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+      description: |
+        Problem type registry:
+        - `urn:voicelayer:problem:bad_request` (400)
+        - `urn:voicelayer:problem:session_not_found` (404)
+        - `urn:voicelayer:problem:recording_failed` (500)
+        - `urn:voicelayer:problem:internal` (500)
+        - `urn:voicelayer:problem:provider_request_failed` (502)
+        - `urn:voicelayer:problem:provider_unavailable` (503)
+        - `urn:voicelayer:problem:worker_unavailable` (503)
+        - `urn:voicelayer:problem:worker_timeout` (504)
     HealthResponse:
       type: object
       required: [status, socket_path, version, worker]
@@ -237,6 +351,17 @@ components:
           type:
             - string
             - "null"
+        global_hotkeys_available:
+          type: boolean
+        global_hotkeys_backend:
+          type:
+            - string
+            - "null"
+          description: xdg_portal on Linux, global_hotkey on macOS.
+        global_hotkeys_detail:
+          type:
+            - string
+            - "null"
         message:
           type:
             - string
@@ -267,6 +392,36 @@ components:
           type: boolean
         license:
           type: string
+    EventEnvelope:
+      type: object
+      required: [created_at_millis, event_type]
+      properties:
+        created_at_millis:
+          type: integer
+          format: int64
+        event_type:
+          type: string
+          enum:
+            - dictation_session_created
+            - dictation_listening
+            - dictation_transcribing
+            - dictation_completed
+            - dictation_failed
+            - dictation_segmented_started
+            - segment_recorded
+            - segment_transcribed
+            - segment_transcribe_failed
+            - compose_job_created
+            - rewrite_job_created
+            - translate_job_created
+            - transcription_completed
+            - worker_providers_unavailable
+            - events_lost
+      description: |
+        The envelope flattens the typed event payload: every event carries
+        `created_at_millis` and `event_type`, plus event-specific fields
+        (e.g. `session_id`, `segment_id`, `transcript_chars`, `detail`,
+        `count`).
     LanguageProfile:
       type: object
       required: [strategy, input_languages]
@@ -291,8 +446,6 @@ components:
           enum: [push_to_talk, toggle, cli, tui, tray_button]
         language_profile:
           $ref: "#/components/schemas/LanguageProfile"
-        recorder_backend:
-          $ref: "#/components/schemas/RecorderBackend"
         translate_to_english:
           type: boolean
         keep_audio:
@@ -301,11 +454,12 @@ components:
           $ref: "#/components/schemas/SegmentationMode"
     SegmentationMode:
       description: |
-        Controls how the recorder subprocess is rolled during a live dictation
-        session. When omitted the daemon uses `one_shot`, which keeps the
-        pre-Phase-3 behavior (a single recording across the whole session).
-        `fixed` rotates the recorder every `segment_secs` seconds so each
-        chunk can be transcribed while the next segment captures.
+        Controls how the continuous capture buffer is cut during a live
+        dictation session. When omitted the daemon uses `one_shot` (a single
+        transcription at stop). `fixed` cuts a chunk every `segment_secs`
+        seconds so each chunk is transcribed while capture continues; chunks
+        are cut from one uninterrupted stream, so no audio is lost at
+        boundaries.
       oneOf:
         - type: object
           required: [mode]
@@ -323,13 +477,6 @@ components:
               type: integer
               minimum: 1
               description: Duration of each captured segment in whole seconds.
-            overlap_secs:
-              type: integer
-              minimum: 0
-              default: 0
-              description: |
-                Reserved for later stitching; the Phase 3B MVP accepts the
-                value but does not yet overlap consecutive segments.
     StopDictationRequest:
       type: object
       required: [session_id]
@@ -337,9 +484,6 @@ components:
         session_id:
           type: string
           format: uuid
-    RecorderBackend:
-      type: string
-      enum: [auto, pipewire, alsa]
     DictationCaptureRequest:
       type: object
       required: [trigger, duration_seconds]
@@ -352,8 +496,6 @@ components:
         duration_seconds:
           type: integer
           minimum: 1
-        recorder_backend:
-          $ref: "#/components/schemas/RecorderBackend"
         translate_to_english:
           type: boolean
         keep_audio:
@@ -414,7 +556,7 @@ components:
           type: string
         style:
           type: string
-          enum: [more_formal, shorter, politer, more_technical, translate]
+          enum: [more_formal, shorter, politer, more_technical]
         output_language:
           type:
             - string
@@ -448,7 +590,7 @@ components:
           format: uuid
         status:
           type: string
-          enum: [ready, needs_provider, rejected]
+          enum: [ready, rejected]
         title:
           type: string
         generated_text:
@@ -468,37 +610,6 @@ components:
           format: uuid
         preview:
           $ref: "#/components/schemas/PreviewArtifact"
-    InjectRequest:
-      type: object
-      required: [target, text]
-      properties:
-        target:
-          type: string
-          enum:
-            - gui_accessible
-            - gui_clipboard
-            - terminal_bracketed_paste
-            - terminal_kitty_remote
-        text:
-          type: string
-        auto_submit:
-          type: boolean
-          default: false
-    InjectionPlan:
-      type: object
-      required: [target, payload, auto_submit]
-      properties:
-        target:
-          type: string
-          enum:
-            - gui_accessible
-            - gui_clipboard
-            - terminal_bracketed_paste
-            - terminal_kitty_remote
-        payload:
-          type: string
-        auto_submit:
-          type: boolean
     TranscriptionResult:
       type: object
       required: [text, notes]
@@ -525,22 +636,7 @@ components:
           type:
             - string
             - "null"
-        failure_kind:
           description: |
-            When the dictation session did not complete successfully, identifies which
-            stage failed so clients can route the error to the right subsystem. Absent
-            (or null) on successful completions.
-            - `recording_failed`: the recorder subprocess could not capture or cleanly
-              stop audio.
-            - `asr_failed`: audio was captured but the worker failed to transcribe it.
-            - `injection_failed`: the transcript was produced but injecting it into the
-              foreground target failed. Only set by the client (CLI, desktop shell);
-              the daemon never emits this variant.
-          type:
-            - string
-            - "null"
-          enum:
-            - recording_failed
-            - asr_failed
-            - injection_failed
-            - null
+            Present only when the request set `keep_audio`. For one-shot
+            captures this is the WAV file path; for segmented sessions it is
+            the segment directory (one WAV per segment, zero-padded names).

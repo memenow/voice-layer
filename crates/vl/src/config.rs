@@ -1,28 +1,16 @@
+//! CLI-side access to the unified VoiceLayer config file.
+//!
+//! The schema lives in `voicelayer_core::config`; this module adds the
+//! `vl config set` dotted-key writer and the push-to-talk key enum used by
+//! clap and crossterm.
+
 use std::path::PathBuf;
 
 use clap::ValueEnum;
 use crossterm::event::KeyCode;
-use serde::{Deserialize, Serialize};
-use voicelayer_core::RecorderBackend;
+use voicelayer_core::{VoiceLayerConfig, config_path};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-pub(crate) enum CliRecorderBackend {
-    Auto,
-    Pipewire,
-    Alsa,
-}
-
-impl From<CliRecorderBackend> for RecorderBackend {
-    fn from(value: CliRecorderBackend) -> Self {
-        match value {
-            CliRecorderBackend::Auto => Self::Auto,
-            CliRecorderBackend::Pipewire => Self::Pipewire,
-            CliRecorderBackend::Alsa => Self::Alsa,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum CliPttKey {
     Space,
     Enter,
@@ -33,6 +21,20 @@ pub(crate) enum CliPttKey {
 }
 
 impl CliPttKey {
+    pub(crate) fn parse(name: &str) -> Result<Self, String> {
+        match name.to_ascii_lowercase().as_str() {
+            "space" => Ok(Self::Space),
+            "enter" => Ok(Self::Enter),
+            "tab" => Ok(Self::Tab),
+            "f8" => Ok(Self::F8),
+            "f9" => Ok(Self::F9),
+            "f10" => Ok(Self::F10),
+            _ => Err(format!(
+                "unknown key `{name}`; expected one of: space, enter, tab, f8, f9, f10"
+            )),
+        }
+    }
+
     pub(crate) fn as_key_code(self) -> KeyCode {
         match self {
             CliPttKey::Space => KeyCode::Char(' '),
@@ -56,71 +58,18 @@ impl CliPttKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-pub(crate) enum StopAction {
-    None,
-    Copy,
-    Inject,
-    Save,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ForegroundPttConfig {
-    pub(crate) language: Option<String>,
-    pub(crate) backend: CliRecorderBackend,
-    pub(crate) translate_to_english: bool,
-    pub(crate) keep_audio: bool,
-    pub(crate) key: CliPttKey,
-    pub(crate) tmux_target_pane: Option<String>,
-    pub(crate) wezterm_target_pane_id: Option<String>,
-    pub(crate) kitty_match: Option<String>,
-    pub(crate) copy_on_stop: bool,
-    pub(crate) default_stop_action: StopAction,
-    pub(crate) restore_clipboard_on_exit: bool,
-    pub(crate) save_dir: Option<PathBuf>,
-}
-
-impl Default for ForegroundPttConfig {
-    fn default() -> Self {
-        Self {
-            language: None,
-            backend: CliRecorderBackend::Auto,
-            translate_to_english: false,
-            keep_audio: false,
-            key: CliPttKey::Space,
-            tmux_target_pane: None,
-            wezterm_target_pane_id: None,
-            kitty_match: None,
-            copy_on_stop: false,
-            default_stop_action: StopAction::None,
-            restore_clipboard_on_exit: false,
-            save_dir: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct VlConfig {
-    #[serde(default)]
-    pub(crate) foreground_ptt: ForegroundPttConfig,
-}
-
 pub(crate) fn vl_config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let project_dirs = directories::ProjectDirs::from("com", "memenow", "voicelayer")
-        .ok_or("Unable to determine the platform config directory for VoiceLayer")?;
-    Ok(project_dirs.config_dir().join("config.toml"))
+    Ok(config_path()?)
 }
 
-pub(crate) fn load_vl_config() -> Result<VlConfig, Box<dyn std::error::Error>> {
-    let path = vl_config_path()?;
-    if !path.is_file() {
-        return Ok(VlConfig::default());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&contents)?)
+/// Effective config (file + env overrides) for CLI behavior.
+pub(crate) fn load_vl_config() -> Result<VoiceLayerConfig, Box<dyn std::error::Error>> {
+    Ok(VoiceLayerConfig::load()?)
 }
 
-pub(crate) fn write_vl_config(config: &VlConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn write_vl_config(
+    config: &VoiceLayerConfig,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let path = vl_config_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -129,195 +78,109 @@ pub(crate) fn write_vl_config(config: &VlConfig) -> Result<PathBuf, Box<dyn std:
     Ok(path)
 }
 
-const SUPPORTED_CONFIG_KEYS: &[&str] = &[
-    "foreground_ptt.language",
-    "foreground_ptt.backend",
-    "foreground_ptt.translate_to_english",
-    "foreground_ptt.keep_audio",
-    "foreground_ptt.key",
-    "foreground_ptt.tmux_target_pane",
-    "foreground_ptt.wezterm_target_pane_id",
-    "foreground_ptt.kitty_match",
-    "foreground_ptt.copy_on_stop",
-    "foreground_ptt.default_stop_action",
-    "foreground_ptt.restore_clipboard_on_exit",
-    "foreground_ptt.save_dir",
-];
-
+/// Set a dotted config key (`llm.endpoint`, `foreground_ptt.key`, ...) to a
+/// scalar value; `"none"` removes the key. The file is validated against
+/// the schema before being written, so unknown keys are rejected.
 pub(crate) fn set_config_value(
-    config: &mut VlConfig,
     key: &str,
     value: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match key {
-        "foreground_ptt.default_stop_action" => {
-            config.foreground_ptt.default_stop_action = match value {
-                "none" => StopAction::None,
-                "copy" => StopAction::Copy,
-                "inject" => StopAction::Inject,
-                "save" => StopAction::Save,
-                _ => return Err("expected one of: none, copy, inject, save".into()),
-            };
-        }
-        "foreground_ptt.copy_on_stop" => {
-            config.foreground_ptt.copy_on_stop = parse_bool(value)?;
-        }
-        "foreground_ptt.restore_clipboard_on_exit" => {
-            config.foreground_ptt.restore_clipboard_on_exit = parse_bool(value)?;
-        }
-        "foreground_ptt.save_dir" => {
-            config.foreground_ptt.save_dir = parse_optional_path(value);
-        }
-        "foreground_ptt.backend" => {
-            config.foreground_ptt.backend = match value {
-                "auto" => CliRecorderBackend::Auto,
-                "pipewire" => CliRecorderBackend::Pipewire,
-                "alsa" => CliRecorderBackend::Alsa,
-                _ => return Err("expected one of: auto, pipewire, alsa".into()),
-            };
-        }
-        "foreground_ptt.key" => {
-            config.foreground_ptt.key = match value {
-                "space" => CliPttKey::Space,
-                "enter" => CliPttKey::Enter,
-                "tab" => CliPttKey::Tab,
-                "f8" => CliPttKey::F8,
-                "f9" => CliPttKey::F9,
-                "f10" => CliPttKey::F10,
-                _ => return Err("expected one of: space, enter, tab, f8, f9, f10".into()),
-            };
-        }
-        "foreground_ptt.language" => {
-            config.foreground_ptt.language = parse_optional_string(value);
-        }
-        "foreground_ptt.translate_to_english" => {
-            config.foreground_ptt.translate_to_english = parse_bool(value)?;
-        }
-        "foreground_ptt.keep_audio" => {
-            config.foreground_ptt.keep_audio = parse_bool(value)?;
-        }
-        "foreground_ptt.tmux_target_pane" => {
-            config.foreground_ptt.tmux_target_pane = parse_optional_string(value);
-        }
-        "foreground_ptt.wezterm_target_pane_id" => {
-            config.foreground_ptt.wezterm_target_pane_id = parse_optional_string(value);
-        }
-        "foreground_ptt.kitty_match" => {
-            config.foreground_ptt.kitty_match = parse_optional_string(value);
-        }
-        _ => {
-            return Err(format!(
-                "unsupported config key `{key}`; supported keys: {}",
-                SUPPORTED_CONFIG_KEYS.join(", ")
-            )
-            .into());
-        }
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = vl_config_path()?;
+    let mut document: toml::Value = if path.is_file() {
+        toml::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let segments: Vec<&str> = key.split('.').collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(
+            format!("config keys must be dotted paths like `llm.endpoint`, got `{key}`").into(),
+        );
     }
+
+    if value.eq_ignore_ascii_case("none") {
+        remove_nested(&mut document, &segments);
+    } else {
+        set_nested(&mut document, &segments, parse_scalar(value))?;
+    }
+
+    // Validate against the schema (rejects unknown keys), then write the
+    // normalized form.
+    let config: VoiceLayerConfig = document
+        .try_into()
+        .map_err(|error| format!("invalid config key or value for `{key}`: {error}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(&config)?)?;
+    Ok(path)
+}
+
+fn parse_scalar(value: &str) -> toml::Value {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => return toml::Value::Boolean(true),
+        "false" => return toml::Value::Boolean(false),
+        _ => {}
+    }
+    if let Ok(integer) = value.parse::<i64>() {
+        return toml::Value::Integer(integer);
+    }
+    if let Ok(float) = value.parse::<f64>() {
+        return toml::Value::Float(float);
+    }
+    toml::Value::String(value.to_owned())
+}
+
+fn set_nested(
+    document: &mut toml::Value,
+    segments: &[&str],
+    value: toml::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut current = document;
+    for segment in &segments[..segments.len() - 1] {
+        if !current.is_table() {
+            return Err(format!("config path component `{segment}` is not a table").into());
+        }
+        current = current
+            .as_table_mut()
+            .expect("checked is_table")
+            .entry(segment.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    }
+    let table = current
+        .as_table_mut()
+        .ok_or("config path does not resolve to a table")?;
+    table.insert(segments[segments.len() - 1].to_string(), value);
     Ok(())
 }
 
-fn parse_optional_string(value: &str) -> Option<String> {
-    if value.eq_ignore_ascii_case("none") {
-        None
-    } else {
-        Some(value.to_owned())
+fn remove_nested(document: &mut toml::Value, segments: &[&str]) {
+    let mut current = document;
+    for segment in &segments[..segments.len() - 1] {
+        match current.get_mut(segment) {
+            Some(next) if next.is_table() => current = next,
+            _ => return,
+        }
     }
-}
-
-fn parse_optional_path(value: &str) -> Option<PathBuf> {
-    if value.eq_ignore_ascii_case("none") {
-        None
-    } else {
-        Some(PathBuf::from(value))
-    }
-}
-
-fn parse_bool(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err("expected a boolean value: true/false".into()),
+    if let Some(table) = current.as_table_mut() {
+        table.remove(segments[segments.len() - 1]);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CliPttKey, CliRecorderBackend, StopAction, VlConfig, set_config_value};
-    use crossterm::event::KeyCode;
-    use voicelayer_core::RecorderBackend;
+    use super::parse_scalar;
 
     #[test]
-    fn cli_backend_maps_to_domain_backend() {
+    fn scalar_parsing_prefers_bool_then_int_then_float_then_string() {
+        assert_eq!(parse_scalar("true"), toml::Value::Boolean(true));
+        assert_eq!(parse_scalar("off"), toml::Value::String("off".to_owned()));
+        assert_eq!(parse_scalar("42"), toml::Value::Integer(42));
+        assert_eq!(parse_scalar("0.5"), toml::Value::Float(0.5));
         assert_eq!(
-            RecorderBackend::from(CliRecorderBackend::Auto),
-            RecorderBackend::Auto
+            parse_scalar("http://127.0.0.1:8080"),
+            toml::Value::String("http://127.0.0.1:8080".to_owned())
         );
-    }
-
-    #[test]
-    fn ptt_key_maps_to_terminal_key_code() {
-        assert_eq!(CliPttKey::Space.as_key_code(), KeyCode::Char(' '));
-        assert_eq!(CliPttKey::F9.as_key_code(), KeyCode::F(9));
-    }
-
-    #[test]
-    fn set_config_value_updates_default_stop_action() {
-        let mut config = VlConfig::default();
-        set_config_value(&mut config, "foreground_ptt.default_stop_action", "inject").unwrap();
-        assert_eq!(
-            config.foreground_ptt.default_stop_action,
-            StopAction::Inject
-        );
-    }
-
-    #[test]
-    fn set_config_value_rejects_unknown_key() {
-        let mut config = VlConfig::default();
-        let error = set_config_value(&mut config, "foreground_ptt.unknown", "x").unwrap_err();
-        assert!(error.to_string().contains("unsupported config key"));
-    }
-
-    #[test]
-    fn set_config_value_accepts_language_and_clears_with_none() {
-        let mut config = VlConfig::default();
-        set_config_value(&mut config, "foreground_ptt.language", "en").unwrap();
-        assert_eq!(config.foreground_ptt.language.as_deref(), Some("en"));
-        set_config_value(&mut config, "foreground_ptt.language", "none").unwrap();
-        assert!(config.foreground_ptt.language.is_none());
-    }
-
-    #[test]
-    fn set_config_value_accepts_translate_and_keep_audio_booleans() {
-        let mut config = VlConfig::default();
-        set_config_value(&mut config, "foreground_ptt.translate_to_english", "true").unwrap();
-        set_config_value(&mut config, "foreground_ptt.keep_audio", "yes").unwrap();
-        assert!(config.foreground_ptt.translate_to_english);
-        assert!(config.foreground_ptt.keep_audio);
-    }
-
-    #[test]
-    fn set_config_value_accepts_target_selectors() {
-        let mut config = VlConfig::default();
-        set_config_value(&mut config, "foreground_ptt.tmux_target_pane", "%3").unwrap();
-        set_config_value(&mut config, "foreground_ptt.wezterm_target_pane_id", "12").unwrap();
-        set_config_value(&mut config, "foreground_ptt.kitty_match", "title:editor").unwrap();
-        assert_eq!(
-            config.foreground_ptt.tmux_target_pane.as_deref(),
-            Some("%3")
-        );
-        assert_eq!(
-            config.foreground_ptt.wezterm_target_pane_id.as_deref(),
-            Some("12")
-        );
-        assert_eq!(
-            config.foreground_ptt.kitty_match.as_deref(),
-            Some("title:editor")
-        );
-        set_config_value(&mut config, "foreground_ptt.tmux_target_pane", "none").unwrap();
-        set_config_value(&mut config, "foreground_ptt.wezterm_target_pane_id", "None").unwrap();
-        set_config_value(&mut config, "foreground_ptt.kitty_match", "NONE").unwrap();
-        assert!(config.foreground_ptt.tmux_target_pane.is_none());
-        assert!(config.foreground_ptt.wezterm_target_pane_id.is_none());
-        assert!(config.foreground_ptt.kitty_match.is_none());
     }
 }

@@ -54,22 +54,22 @@ use crossterm::{
         enable_raw_mode, size,
     },
 };
+use voicelayer_client::Client;
 use voicelayer_core::{
-    DictationCaptureResult, DictationFailureKind, LanguageProfile, LanguageStrategy,
-    SegmentationMode, SessionState, StartDictationRequest, StopDictationRequest, TriggerKind,
+    DictationCaptureResult, LanguageProfile, LanguageStrategy, SegmentationMode, SessionState,
+    StartDictationRequest, StopAction, StopDictationRequest, TriggerKind,
 };
 
-use crate::config::{CliPttKey, CliRecorderBackend, StopAction};
+use crate::config::CliPttKey;
 use crate::terminal_targets::{
     ForegroundInjectionTarget, paste_into_kitty_target, paste_into_tmux_pane,
     paste_into_wezterm_pane, resolve_foreground_injection_target, resolve_tmux_target_pane,
 };
-use crate::uds::{cli_socket_path, uds_post_json};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_foreground_ptt(
+    client: Client,
     language: Option<String>,
-    backend: CliRecorderBackend,
     translate_to_english: bool,
     keep_audio: bool,
     key: CliPttKey,
@@ -111,19 +111,26 @@ pub(crate) async fn run_foreground_ptt(
 
         if key_event.code == KeyCode::Esc {
             if let Some(session_id) = active_session.take() {
-                let result: DictationCaptureResult = uds_post_json(
-                    &cli_socket_path(),
-                    "/v1/sessions/dictation/stop",
-                    &StopDictationRequest { session_id },
-                )
-                .await?;
-                apply_dictation_result_to_ui(
-                    &mut ui,
-                    &result,
-                    &foreground_target,
-                    tmux_target_pane.as_deref(),
-                    copy_on_stop,
-                );
+                match client
+                    .post::<_, DictationCaptureResult>(
+                        "/v1/sessions/dictation/stop",
+                        &StopDictationRequest { session_id },
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        apply_dictation_result_to_ui(
+                            &mut ui,
+                            &result,
+                            &foreground_target,
+                            tmux_target_pane.as_deref(),
+                            copy_on_stop,
+                        );
+                    }
+                    Err(error) => {
+                        ui.last_error = Some(format!("[daemon-error] {error}"));
+                    }
+                }
                 ui.push_event("Stopped active session before exit.".to_owned());
                 render_foreground_ptt_ui(&ui)?;
             }
@@ -250,19 +257,29 @@ pub(crate) async fn run_foreground_ptt(
                             input_languages: vec![language],
                             output_language: None,
                         }),
-                        recorder_backend: Some(backend.into()),
                         translate_to_english,
                         keep_audio,
                         segmentation: SegmentationMode::default(),
                     };
-                    let session: voicelayer_core::CaptureSession =
-                        uds_post_json(&cli_socket_path(), "/v1/sessions/dictation", &request)
-                            .await?;
-                    active_session = Some(session.session_id);
-                    ui.status_label = "Listening".to_owned();
-                    ui.active_session_id = Some(session.session_id.to_string());
-                    ui.last_error = None;
-                    ui.push_event(format!("Dictation started: {}", session.session_id));
+                    match client
+                        .post::<_, voicelayer_core::CaptureSession>(
+                            "/v1/sessions/dictation",
+                            &request,
+                        )
+                        .await
+                    {
+                        Ok(session) => {
+                            active_session = Some(session.session_id);
+                            ui.status_label = "Listening".to_owned();
+                            ui.active_session_id = Some(session.session_id.to_string());
+                            ui.last_error = None;
+                            ui.push_event(format!("Dictation started: {}", session.session_id));
+                        }
+                        Err(error) => {
+                            ui.last_error = Some(format!("[daemon-error] {error}"));
+                            ui.push_event(format!("Failed to start dictation: {error}"));
+                        }
+                    }
                     render_foreground_ptt_ui(&ui)?;
                 } else if let Some(session_id) = active_session.take() {
                     ui.status_label = "Transcribing".to_owned();
@@ -270,20 +287,29 @@ pub(crate) async fn run_foreground_ptt(
                         "Stopping session {session_id} via key press toggle.",
                     ));
                     render_foreground_ptt_ui(&ui)?;
-                    let result: DictationCaptureResult = uds_post_json(
-                        &cli_socket_path(),
-                        "/v1/sessions/dictation/stop",
-                        &StopDictationRequest { session_id },
-                    )
-                    .await?;
-                    apply_dictation_result_to_ui(
-                        &mut ui,
-                        &result,
-                        &foreground_target,
-                        tmux_target_pane.as_deref(),
-                        copy_on_stop,
-                    );
-                    ui.push_event("Dictation stopped via key press toggle.".to_owned());
+                    match client
+                        .post::<_, DictationCaptureResult>(
+                            "/v1/sessions/dictation/stop",
+                            &StopDictationRequest { session_id },
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            apply_dictation_result_to_ui(
+                                &mut ui,
+                                &result,
+                                &foreground_target,
+                                tmux_target_pane.as_deref(),
+                                copy_on_stop,
+                            );
+                            ui.push_event("Dictation stopped via key press toggle.".to_owned());
+                        }
+                        Err(error) => {
+                            ui.status_label = "Failed".to_owned();
+                            ui.last_error = Some(format!("[daemon-error] {error}"));
+                            ui.push_event(format!("Failed to stop session: {error}"));
+                        }
+                    }
                     render_foreground_ptt_ui(&ui)?;
                 }
             }
@@ -292,20 +318,29 @@ pub(crate) async fn run_foreground_ptt(
                     ui.status_label = "Transcribing".to_owned();
                     ui.push_event(format!("Stopping session {session_id} via key release."));
                     render_foreground_ptt_ui(&ui)?;
-                    let result: DictationCaptureResult = uds_post_json(
-                        &cli_socket_path(),
-                        "/v1/sessions/dictation/stop",
-                        &StopDictationRequest { session_id },
-                    )
-                    .await?;
-                    apply_dictation_result_to_ui(
-                        &mut ui,
-                        &result,
-                        &foreground_target,
-                        tmux_target_pane.as_deref(),
-                        copy_on_stop,
-                    );
-                    ui.push_event("Dictation stopped via key release.".to_owned());
+                    match client
+                        .post::<_, DictationCaptureResult>(
+                            "/v1/sessions/dictation/stop",
+                            &StopDictationRequest { session_id },
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            apply_dictation_result_to_ui(
+                                &mut ui,
+                                &result,
+                                &foreground_target,
+                                tmux_target_pane.as_deref(),
+                                copy_on_stop,
+                            );
+                            ui.push_event("Dictation stopped via key release.".to_owned());
+                        }
+                        Err(error) => {
+                            ui.status_label = "Failed".to_owned();
+                            ui.last_error = Some(format!("[daemon-error] {error}"));
+                            ui.push_event(format!("Failed to stop session: {error}"));
+                        }
+                    }
                     render_foreground_ptt_ui(&ui)?;
                 }
             }
@@ -449,6 +484,25 @@ fn apply_dictation_result_to_ui(
             }
         }
         ForegroundInjectionTarget::None => {
+            #[cfg(target_os = "macos")]
+            if matches!(ui.default_stop_action, StopAction::Inject) {
+                // macOS GUI injection: clipboard write + synthetic Cmd+V into
+                // the focused application.
+                copy_result_to_clipboard(ui, &result.transcription.text);
+                match crate::injection::post_command_v() {
+                    Ok(()) => {
+                        ui.last_injection_status = Some(
+                            "Pasted into the focused application via clipboard + Cmd+V.".to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.last_error = Some(format!(
+                            "[injection-failed] Cmd+V post (Input Monitoring permission?): {error}"
+                        ));
+                    }
+                }
+                return;
+            }
             if ui.last_injection_status.is_none() {
                 ui.last_injection_status =
                     Some(if matches!(ui.default_stop_action, StopAction::Inject) {
@@ -459,33 +513,8 @@ fn apply_dictation_result_to_ui(
             }
         }
     }
-    if let Some(kind) = result.failure_kind {
-        let tag = failure_kind_tag(kind);
-        let detail = result
-            .transcription
-            .notes
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "dictation failure reported without detail.".to_owned());
-        let prefixed = format!("{tag} {detail}");
-        if ui
-            .last_error
-            .as_deref()
-            .is_none_or(|existing| !existing.starts_with("[injection-failed]"))
-        {
-            ui.last_error = Some(prefixed.clone());
-        }
-        ui.push_event(prefixed);
-    } else if result.session.state == SessionState::Failed && ui.last_error.is_none() {
+    if result.session.state == SessionState::Failed && ui.last_error.is_none() {
         ui.last_error = result.transcription.notes.first().cloned();
-    }
-}
-
-fn failure_kind_tag(kind: DictationFailureKind) -> &'static str {
-    match kind {
-        DictationFailureKind::RecordingFailed => "[recording-failed]",
-        DictationFailureKind::AsrFailed => "[asr-failed]",
-        DictationFailureKind::InjectionFailed => "[injection-failed]",
     }
 }
 

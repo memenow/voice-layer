@@ -14,32 +14,16 @@ concurrency:
 
 jobs:
   verify:
-    name: verify
-    runs-on: ubuntu-latest
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout source
         uses: actions/checkout@v5
-
-      - name: Install system dependencies for vl-desktop and the recorder probe
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libwayland-dev \
-            libwayland-cursor0 \
-            libwayland-egl1 \
-            libdbus-1-dev \
-            libgl1-mesa-dev \
-            libfreetype6-dev \
-            libfontconfig1-dev \
-            libx11-dev \
-            libxi-dev \
-            libxcursor-dev \
-            libxrandr-dev \
-            alsa-utils
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -64,11 +48,11 @@ jobs:
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy --all-targets --all-features -- -D warnings
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: cargo test --all
-        run: cargo test --all
+      - name: cargo test
+        run: cargo test
 
       - name: uv run ruff check python tests/python
         run: uv run ruff check python tests/python
@@ -78,3 +62,50 @@ jobs:
 
       - name: uv run pytest -q tests/python
         run: uv run pytest -q tests/python
+
+      - name: Lint the OpenAPI contract
+        if: matrix.os == 'ubuntu-latest'
+        run: npx --yes @stoplight/spectral-cli lint openapi/voicelayerd.v1.yaml
+
+  check-desktop:
+    name: cargo check vl-desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install system dependencies for vl-desktop
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libwayland-cursor0 \
+            libwayland-egl1 \
+            libdbus-1-dev \
+            libgl1-mesa-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check -p vl-desktop
+        run: cargo check -p vl-desktop

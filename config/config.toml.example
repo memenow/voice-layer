@@ -1,0 +1,65 @@
+# VoiceLayer unified configuration.
+#
+# Linux:   ~/.config/voicelayer/config.toml
+# macOS:   ~/Library/Application Support/com.memenow.voicelayer/config.toml
+#
+# Every setting can also be overridden with a VOICELAYER_* environment
+# variable (see docs/guides/local-asr-provider.md and local-llm-provider.md).
+
+[daemon]
+# socket_path = "/run/user/1000/voicelayer/daemon.sock"
+# project_root = "/path/to/voice-layer"   # required for service-launched daemons
+# worker_timeout_seconds = 600
+
+[llm]
+# endpoint = "http://127.0.0.1:8080"
+# model = "gemma-3-1b-it"
+# api_key = ""
+# timeout_seconds = 60
+# auto_start = false
+# server_bin = "llama-server"
+# model_path = "/models/gemma.gguf"
+# hf_repo = "ggml-org/gemma-3-1b-it-GGUF"
+# server_args = "--ctx-size 8192"
+# launch_timeout_seconds = 45
+# poll_interval_seconds = 0.5
+
+[whisper]
+# model_path = "/models/ggml-base.en.bin"
+# binary = "whisper-cli"
+# timeout_seconds = 300
+# no_gpu = false
+# extra_args = ""
+
+[whisper_server]
+# host = "127.0.0.1"
+# port = 8188
+# timeout_seconds = 60
+# auto_start = false
+# server_bin = "whisper-server"
+# extra_args = ""
+# launch_timeout_seconds = 30
+# poll_interval_seconds = 0.5
+
+[vad]
+# enabled = false
+# model_path = "/models/silero-vad.onnx"
+# threshold = 0.5
+# min_speech_ms = 250
+# min_silence_ms = 100
+# speech_pad_ms = 30
+# max_segment_secs = 30
+# sample_rate = 16000
+
+[foreground_ptt]
+# language = "en"
+# translate_to_english = false
+# keep_audio = false
+# key = "space"
+# tmux_target_pane = "%2"
+# wezterm_target_pane_id = "12"
+# kitty_match = "title:Output"
+# copy_on_stop = false
+# default_stop_action = "none"   # none | copy | inject | save
+# restore_clipboard_on_exit = false
+# save_dir = "~/Documents/voice-layer"

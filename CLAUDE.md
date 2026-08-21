@@ -26,16 +26,20 @@ It is not a traditional input method editor. The product must support:
 
 - Rust owns the long-running daemon, CLI/TUI, desktop integration, process supervision, and host adapters.
 - Python owns model orchestration, experimentation, and provider-specific worker implementations.
-- Inter-process communication between Rust and Python uses JSON-RPC over stdio.
-- The daemon exposes a local `/v1` API over a Unix domain socket and documents it with OpenAPI 3.1.
+- Inter-process communication between Rust and Python uses JSON-RPC 2.0 over stdio with one persistent worker process; the first frame is `initialize`, which carries the provider configuration from the daemon.
+- The daemon exposes a local `/v1` API over a Unix domain socket and documents it with OpenAPI 3.1 (`openapi/voicelayerd.v1.yaml`). Failures use RFC 9457 problem+json.
+- Every daemon consumer (CLI, desktop shell) goes through the `voicelayer-client` crate; no consumer links daemon internals.
+- Configuration lives in a single TOML file; `VOICELAYER_*` environment variables are an override layer applied only by Rust.
 
 ## Host Strategy
 
-- Ubuntu GNOME Wayland is the primary desktop target.
-- Global shortcuts should prefer the XDG Global Shortcuts portal.
-- GUI text injection should prefer AT-SPI editable text operations.
+- Ubuntu GNOME Wayland is the primary desktop target; macOS (Apple Silicon) is the second supported platform.
+- Global shortcuts: XDG Global Shortcuts portal on Linux, `global-hotkey` (Carbon) on macOS.
+- GUI text injection: AT-SPI editable text operations on Linux; clipboard + synthetic Cmd+V (CoreGraphics) on macOS.
 - Terminal injection should prefer bracketed paste and must not auto-submit by default.
 - Keyboard simulation tools such as `ydotool` or `wtype` are fallbacks, not the primary strategy.
+- Audio capture is in-process via `cpal` (PipeWire ALSA shim on Linux, CoreAudio on macOS); no recorder subprocesses.
+- Platform differences live in `voicelayerd::platform` and the `vl-desktop` hotkeys module; business code must stay free of `cfg(target_os)`.
 
 ## Workflow
 
@@ -52,17 +56,21 @@ It is not a traditional input method editor. The product must support:
 
   ```bash
   cargo fmt --all \
-    && cargo clippy --all-targets --all-features -- -D warnings \
-    && cargo test --all \
+    && cargo clippy --all-targets -- -D warnings \
+    && cargo test \
     && uv run ruff check python tests/python \
     && uv run ruff format --check python tests/python \
     && uv run pytest -q tests/python
   ```
 
+  `cargo test` covers the default workspace members (core, client, daemon,
+  CLI). `vl-desktop` is excluded from default members (GUI system packages
+  on Linux); run `cargo check -p vl-desktop` when touching it.
+
 - Sync Python dev environment: `uv sync --group dev`
-- Run the daemon from source: `cargo run -p vl -- daemon run --project-root "$(pwd)"`
-- Inspect runtime environment and provider reachability: `cargo run -p vl -- doctor`
-- List host adapters and worker providers: `cargo run -p vl -- providers`
+- Run the daemon from source: `cargo run -p voicelayerd`
+- Inspect runtime environment and provider reachability: `vl doctor`
+- List host adapters and worker providers: `vl providers`
 - If the daemon is launched outside the repo root, set `VOICELAYER_PROJECT_ROOT` so the Python worker resolves.
 
 ## Domain Vocabulary

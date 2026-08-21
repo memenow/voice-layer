@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import time
@@ -36,7 +35,6 @@ def validate_whisper_provider(
 def transcribe_with_whisper_cli(
     params: Mapping[str, Any],
     config: WhisperCppConfig,
-    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run `whisper-cli` against a local audio file and return the transcript."""
 
@@ -53,7 +51,7 @@ def transcribe_with_whisper_cli(
     if not ready:
         raise ProviderInvocationError(error or "whisper.cpp is not ready.")
 
-    runtime_dir = provider_runtime_dir(environ)
+    runtime_dir = provider_runtime_dir()
     output_stem = runtime_dir / f"transcribe-{int(time.time() * 1000)}"
     command = [
         config.binary,
@@ -79,7 +77,6 @@ def transcribe_with_whisper_cli(
         capture_output=True,
         text=True,
         timeout=config.timeout_seconds,
-        env=(dict(os.environ) | dict(environ or {})),
         check=False,
     )
     if result.returncode != 0:

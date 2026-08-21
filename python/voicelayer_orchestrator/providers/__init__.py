@@ -5,25 +5,26 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from voicelayer_orchestrator.config import (
-    load_llm_provider_config,
-    load_whisper_provider_config,
-)
+import psutil
+
+from voicelayer_orchestrator.config import llm_config, whisper_config
 
 
 class ProviderInvocationError(RuntimeError):
     """Raised when the configured provider cannot satisfy a request."""
 
 
-def provider_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
+class ProviderUnavailableError(ProviderInvocationError):
+    """Raised when no provider is configured for the requested workflow."""
+
+
+def provider_runtime_dir() -> Path:
     """Return the runtime directory used for provider state files."""
 
-    source = environ or os.environ
-    base = source.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
     runtime_dir = Path(base) / "voicelayer" / "providers"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     return runtime_dir
@@ -52,35 +53,23 @@ def _read_pid_from_lock(lock_path: Path) -> int | None:
 
 
 def _pid_runs_binary(pid: int, expected_binary: str) -> bool:
-    """Best-effort Linux-only check that ``pid`` still runs ``expected_binary``.
+    """Check that ``pid`` still runs ``expected_binary`` (cross-platform).
 
-    Reads ``/proc/<pid>/cmdline`` (NUL-separated argv) and compares the
+    Uses psutil's process table (works on Linux and macOS) and compares the
     basename of argv[0] to the basename of ``expected_binary`` so both
     absolute paths and bare names resolve correctly. Returns False on any
-    failure (process gone, non-Linux platform, binary mismatch).
-
-    TODO(portable): on non-Linux targets ``/proc`` is absent and this
-    function always returns False, so :func:`reclaim_stale_lock` would
-    evict every lock regardless of owner liveness. When VoiceLayer grows
-    a macOS or BSD target, derive the cmdline check from ``ps``,
-    ``sysctl``, or ``psutil`` instead.
+    failure (process gone, unreadable cmdline, binary mismatch).
     """
 
     if pid <= 0:
         return False
-    cmdline_path = Path(f"/proc/{pid}/cmdline")
     try:
-        raw = cmdline_path.read_bytes()
-    except (FileNotFoundError, PermissionError, OSError):
+        cmdline = psutil.Process(pid).cmdline()
+    except (psutil.Error, OSError):
         return False
-    argv0_bytes = raw.split(b"\x00", 1)[0]
-    if not argv0_bytes:
+    if not cmdline or not cmdline[0]:
         return False
-    try:
-        argv0 = argv0_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return Path(argv0).name == Path(expected_binary).name
+    return Path(cmdline[0]).name == Path(expected_binary).name
 
 
 def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
@@ -89,7 +78,7 @@ def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
     Returns True when a stale lock was deleted so the caller can retry
     the ``os.open(..., O_EXCL)`` happy path. Returns False when the lock
     owner is still alive (the caller must wait) or when the state is
-    ambiguous (partially-written PID, /proc unreadable) so we err on the
+    ambiguous (partially-written PID, cmdline unreadable) so we err on the
     safe side and leave the lock intact.
     """
 
@@ -108,21 +97,18 @@ def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
     return True
 
 
-def supported_providers(
-    environ: Mapping[str, str] | None = None,
-) -> list[dict[str, Any]]:
+def supported_providers() -> list[dict[str, Any]]:
     """Return provider descriptors for the Python worker boundary."""
 
     from voicelayer_orchestrator.providers.llm_openai_compatible import (
         configured_llm_descriptor,
     )
 
-    whisper_config = load_whisper_provider_config(environ)
     providers: list[dict[str, Any]] = [
         {
             "id": "whisper_cpp",
             "kind": "asr",
-            "transport": "whisper_cli" if whisper_config is not None else "stdio_worker",
+            "transport": "whisper_cli" if whisper_config() is not None else "stdio_worker",
             "local": True,
             "default_enabled": True,
             "experimental": False,
@@ -139,7 +125,7 @@ def supported_providers(
         },
     ]
 
-    configured = configured_llm_descriptor(load_llm_provider_config(environ))
+    configured = configured_llm_descriptor(llm_config())
     if configured is not None:
         providers.append(configured)
     else:

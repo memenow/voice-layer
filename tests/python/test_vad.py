@@ -16,8 +16,10 @@ if str(PYTHON_ROOT) not in sys.path:
 
 from voicelayer_orchestrator.config import (  # noqa: E402
     WhisperVadConfig,
-    load_whisper_vad_config,
+    configure,
+    vad_config,
 )
+from voicelayer_orchestrator.providers import pipeline  # noqa: E402
 from voicelayer_orchestrator.providers.vad_segmenter import (  # noqa: E402
     _frames_to_regions,
     _window_size_for,
@@ -47,31 +49,31 @@ def _vad_config(
 
 class WhisperVadConfigTest(unittest.TestCase):
     def test_returns_none_when_not_enabled(self) -> None:
-        self.assertIsNone(load_whisper_vad_config({}))
-        self.assertIsNone(
-            load_whisper_vad_config(
-                {"VOICELAYER_WHISPER_VAD_MODEL_PATH": "/tmp/silero.onnx"},
-            )
-        )
+        configure({})
+        self.assertIsNone(vad_config())
+        configure({"vad": {"model_path": "/tmp/silero.onnx"}})
+        self.assertIsNone(vad_config())
 
     def test_returns_none_when_model_path_missing(self) -> None:
-        self.assertIsNone(
-            load_whisper_vad_config({"VOICELAYER_WHISPER_VAD_ENABLED": "true"}),
-        )
+        configure({"vad": {"enabled": True}})
+        self.assertIsNone(vad_config())
 
     def test_reads_all_tunables(self) -> None:
-        config = load_whisper_vad_config(
+        configure(
             {
-                "VOICELAYER_WHISPER_VAD_ENABLED": "1",
-                "VOICELAYER_WHISPER_VAD_MODEL_PATH": "/tmp/silero.onnx",
-                "VOICELAYER_WHISPER_VAD_THRESHOLD": "0.42",
-                "VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS": "200",
-                "VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS": "150",
-                "VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS": "50",
-                "VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS": "15",
-                "VOICELAYER_WHISPER_VAD_SAMPLE_RATE": "16000",
+                "vad": {
+                    "enabled": True,
+                    "model_path": "/tmp/silero.onnx",
+                    "threshold": 0.42,
+                    "min_speech_ms": 200,
+                    "min_silence_ms": 150,
+                    "speech_pad_ms": 50,
+                    "max_segment_secs": 15,
+                    "sample_rate": 16000,
+                }
             }
         )
+        config = vad_config()
         assert config is not None
         self.assertEqual(config.model_path, "/tmp/silero.onnx")
         self.assertAlmostEqual(config.threshold, 0.42)
@@ -200,15 +202,11 @@ class FramesToRegionsTest(unittest.TestCase):
         self.assertEqual(regions, [(0, 10), (20, 30)])
 
 
-class VadWorkerIntegrationTest(unittest.TestCase):
-    """VAD integration into the transcribe dispatch, using monkey-patched apply_vad_prepass."""
+class VadPipelineIntegrationTest(unittest.TestCase):
+    """VAD integration into the transcribe dispatch via the pipeline module."""
 
     def setUp(self) -> None:
         super().setUp()
-        # Lazy import to keep the module reference fresh after patches.
-        from voicelayer_orchestrator import worker
-
-        self.worker = worker
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-worker-"))
 
     def _write_silent_wav(self, path: pathlib.Path, duration_sec: float = 1.0) -> None:
@@ -226,10 +224,10 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         self._write_silent_wav(audio_file)
 
         with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=None),
-            patch.object(self.worker, "apply_vad_prepass") as prepass,
+            patch.object(pipeline, "vad_config", return_value=None),
+            patch.object(pipeline, "apply_vad_prepass") as prepass,
         ):
-            params, notes, short = self.worker._apply_vad_prepass_if_configured(
+            params, notes, short = pipeline._apply_vad_prepass(
                 {"audio_file": str(audio_file)},
             )
 
@@ -242,19 +240,19 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         audio_file = self.tmp_dir / "silence.wav"
         self._write_silent_wav(audio_file)
 
-        vad_config = _vad_config()
+        vad = _vad_config()
         trimmed = self.tmp_dir / "silence.vad-empty.wav"
         trimmed.write_bytes(b"")
 
         with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=vad_config),
+            patch.object(pipeline, "vad_config", return_value=vad),
             patch.object(
-                self.worker,
+                pipeline,
                 "apply_vad_prepass",
                 return_value=(str(trimmed), []),
             ),
         ):
-            _, _, short = self.worker._apply_vad_prepass_if_configured(
+            _, _, short = pipeline._apply_vad_prepass(
                 {"audio_file": str(audio_file)},
             )
 
@@ -269,20 +267,20 @@ class VadWorkerIntegrationTest(unittest.TestCase):
         audio_file = self.tmp_dir / "raw.wav"
         self._write_silent_wav(audio_file, duration_sec=2.0)
 
-        vad_config = _vad_config()
+        vad = _vad_config()
         trimmed = self.tmp_dir / "raw.vad-trimmed.wav"
         trimmed.write_bytes(b"")
         regions = [(0.5, 1.0), (1.2, 1.7)]
 
         with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=vad_config),
+            patch.object(pipeline, "vad_config", return_value=vad),
             patch.object(
-                self.worker,
+                pipeline,
                 "apply_vad_prepass",
                 return_value=(str(trimmed), regions),
             ),
         ):
-            params, notes, short = self.worker._apply_vad_prepass_if_configured(
+            params, notes, short = pipeline._apply_vad_prepass(
                 {"audio_file": str(audio_file)},
             )
 
@@ -297,17 +295,17 @@ class VadWorkerIntegrationTest(unittest.TestCase):
 
         audio_file = self.tmp_dir / "raw.wav"
         self._write_silent_wav(audio_file)
-        vad_config = _vad_config()
+        vad = _vad_config()
 
         with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=vad_config),
+            patch.object(pipeline, "vad_config", return_value=vad),
             patch.object(
-                self.worker,
+                pipeline,
                 "apply_vad_prepass",
                 side_effect=ProviderInvocationError("onnxruntime missing"),
             ),
         ):
-            params, notes, short = self.worker._apply_vad_prepass_if_configured(
+            params, notes, short = pipeline._apply_vad_prepass(
                 {"audio_file": str(audio_file)},
             )
 

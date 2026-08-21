@@ -9,12 +9,11 @@ import os
 import subprocess
 import time
 import urllib.parse
-from collections.abc import Mapping
 
 from voicelayer_orchestrator.config import (
     LlamaServerLaunchConfig,
     OpenAICompatibleConfig,
-    load_llama_server_launch_config,
+    llama_launch_config,
 )
 from voicelayer_orchestrator.providers import (
     ProviderInvocationError,
@@ -109,18 +108,14 @@ def wait_for_llm_endpoint(
 def autostart_llama_server(
     config: OpenAICompatibleConfig,
     launch: LlamaServerLaunchConfig,
-    environ: Mapping[str, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Launch `llama-server` when the endpoint is local and currently unavailable."""
 
-    runtime_dir = provider_runtime_dir(environ)
+    runtime_dir = provider_runtime_dir()
     key = endpoint_key(config.endpoint)
     lock_path = runtime_dir / f"{key}.lock"
     log_path = runtime_dir / f"{key}.log"
     state_path = runtime_dir / f"{key}.json"
-    source = dict(os.environ)
-    if environ:
-        source.update(environ)
 
     try:
         command = build_llama_server_command(config, launch)
@@ -149,7 +144,6 @@ def autostart_llama_server(
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=source,
                 start_new_session=True,
             )
         _BACKGROUND_PROCESSES.append(process)
@@ -192,7 +186,6 @@ def autostart_llama_server(
 
 def ensure_llm_endpoint(
     config: OpenAICompatibleConfig | None,
-    environ: Mapping[str, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Return endpoint readiness, launching `llama-server` when configured to do so."""
 
@@ -203,8 +196,8 @@ def ensure_llm_endpoint(
     if reachable:
         return True, None
 
-    launch = load_llama_server_launch_config(environ)
+    launch = llama_launch_config()
     if launch is None:
         return False, error
 
-    return autostart_llama_server(config, launch, environ)
+    return autostart_llama_server(config, launch)

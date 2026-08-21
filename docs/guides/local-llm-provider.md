@@ -2,10 +2,9 @@
 
 ## Recommended Baseline
 
-The first real composition provider in VoiceLayer targets an OpenAI-compatible chat endpoint.
-For local-first development, the intended baseline is `llama.cpp server`.
-
-The official `llama.cpp` project documents an OpenAI-compatible endpoint at:
+VoiceLayer's composition/rewrite/translation workflows target an
+OpenAI-compatible chat endpoint. For local-first development the baseline is
+`llama.cpp server`, which serves:
 
 ```text
 http://localhost:8080/v1/chat/completions
@@ -15,74 +14,68 @@ http://localhost:8080/v1/chat/completions
 
 ```bash
 llama-server -m /path/to/model.gguf --port 8080
-```
 
-If you want to start directly from Hugging Face in a development environment:
-
-```bash
+# or straight from Hugging Face in a development environment
 llama-server -hf ggml-org/gemma-3-1b-it-GGUF --port 8080
 ```
 
-## VoiceLayer Environment Variables
+On the NVIDIA Linux box, use a CUDA build of `llama-server`; on Apple
+Silicon the Metal build is the default.
 
-VoiceLayer reads the following variables inside the Python worker:
+## VoiceLayer Configuration
+
+The daemon owns provider configuration and hands it to the worker in the
+`initialize` handshake. Set it in the unified config file (see
+`vl config path`):
+
+```toml
+[llm]
+endpoint = "http://127.0.0.1:8080"
+model = "gemma-3-1b-it"
+# api_key = ""
+# timeout_seconds = 60
+
+# Optional llama-server autostart:
+# auto_start = true
+# server_bin = "llama-server"
+# model_path = "/absolute/path/to/model.gguf"
+# hf_repo = "ggml-org/gemma-3-1b-it-GGUF"
+# server_args = "--ctx-size 8192"
+# launch_timeout_seconds = 45
+# poll_interval_seconds = 0.5
+```
+
+or via `vl config set`:
 
 ```bash
-VOICELAYER_LLM_ENDPOINT=http://127.0.0.1:8080
-VOICELAYER_LLM_MODEL=gemma-3-1b-it
-VOICELAYER_LLM_API_KEY=
-VOICELAYER_LLM_TIMEOUT_SECONDS=60
-VOICELAYER_LLM_AUTO_START=true
-VOICELAYER_LLAMA_SERVER_BIN=llama-server
-VOICELAYER_LLAMA_MODEL_PATH=/absolute/path/to/model.gguf
-VOICELAYER_LLAMA_HF_REPO=
-VOICELAYER_LLAMA_SERVER_ARGS=
-VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS=45
-VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS=0.5
+vl config set llm.endpoint http://127.0.0.1:8080
+vl config set llm.model gemma-3-1b-it
+vl config set llm.auto_start true
+vl config set llm.hf_repo ggml-org/gemma-3-1b-it-GGUF
 ```
 
-`VOICELAYER_LLM_ENDPOINT` may be provided as:
+`endpoint` may be provided as `http://127.0.0.1:8080`, `.../v1`, or
+`.../v1/chat/completions`; VoiceLayer normalizes all of them. Health checks
+probe the corresponding `/v1/models` endpoint.
 
-- `http://127.0.0.1:8080`
-- `http://127.0.0.1:8080/v1`
-- `http://127.0.0.1:8080/v1/chat/completions`
+When `auto_start` is true, VoiceLayer launches `llama-server` automatically
+if the configured endpoint is local, currently unreachable, and either
+`model_path` or `hf_repo` is set. Provider state files are written under the
+runtime directory (`$XDG_RUNTIME_DIR/voicelayer/providers` on Linux,
+`$TMPDIR/voicelayer/providers` on macOS).
 
-VoiceLayer normalizes all of them to the chat completions endpoint.
-For health checks, VoiceLayer probes the corresponding `/v1/models` endpoint.
+Every `[llm]` key maps to a `VOICELAYER_*` environment override
+(`VOICELAYER_LLM_ENDPOINT`, `VOICELAYER_LLM_MODEL`,
+`VOICELAYER_LLM_API_KEY`, `VOICELAYER_LLM_TIMEOUT_SECONDS`,
+`VOICELAYER_LLM_AUTO_START`, `VOICELAYER_LLAMA_SERVER_BIN`,
+`VOICELAYER_LLAMA_MODEL_PATH`, `VOICELAYER_LLAMA_HF_REPO`,
+`VOICELAYER_LLAMA_SERVER_ARGS`, `VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS`,
+`VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS`).
 
-When `VOICELAYER_LLM_AUTO_START=true`, VoiceLayer will try to launch `llama-server` automatically if:
-
-- the configured endpoint is local
-- the endpoint is currently unreachable
-- either `VOICELAYER_LLAMA_MODEL_PATH` or `VOICELAYER_LLAMA_HF_REPO` is configured
-
-Automatic startup writes provider state files under:
-
-```text
-$XDG_RUNTIME_DIR/voicelayer/providers
-```
-
-## Example Source Workflow
+## Verify
 
 ```bash
-export VOICELAYER_PROJECT_ROOT="$(pwd)"
-export VOICELAYER_LLM_ENDPOINT="http://127.0.0.1:8080"
-export VOICELAYER_LLM_MODEL="gemma-3-1b-it"
-export VOICELAYER_LLM_AUTO_START="true"
-export VOICELAYER_LLAMA_SERVER_BIN="llama-server"
-export VOICELAYER_LLAMA_HF_REPO="ggml-org/gemma-3-1b-it-GGUF"
-
-cargo run -p vl -- doctor
-cargo run -p vl -- providers
-cargo run -p vl -- preview compose "Write a concise professional status update for today's backend work."
+vl doctor        # reports llm_configured / llm_reachable
+vl providers
+vl preview compose "Write a concise professional status update for today's backend work."
 ```
-
-## systemd User Service
-
-The provided user service reads an optional env file at:
-
-```text
-~/.config/voicelayer/voicelayerd.env
-```
-
-Populate it with the project root and provider variables before enabling the service.

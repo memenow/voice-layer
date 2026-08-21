@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use voicelayerd::{DaemonConfig, default_project_root, default_socket_path, run_daemon};
+use voicelayerd::{DaemonConfig, run_daemon};
 
 #[derive(Debug, Parser)]
 #[command(name = "voicelayerd")]
@@ -22,9 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let socket_path = args.socket_path.unwrap_or_else(default_socket_path);
-    let project_root = args.project_root.unwrap_or_else(default_project_root);
-
-    run_daemon(DaemonConfig::with_project_root(socket_path, project_root)).await?;
+    run_daemon(DaemonConfig::new(args.socket_path, args.project_root)).await?;
     Ok(())
 }

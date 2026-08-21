@@ -20,53 +20,16 @@ pub struct ProviderDescriptor {
     pub license: String,
 }
 
-pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
-    vec![
-        ProviderDescriptor {
-            id: "whisper_cpp".to_owned(),
-            kind: ProviderKind::Asr,
-            transport: "local_process".to_owned(),
-            local: true,
-            default_enabled: true,
-            experimental: false,
-            license: "MIT".to_owned(),
-        },
-        ProviderDescriptor {
-            id: "voxtral_realtime".to_owned(),
-            kind: ProviderKind::Asr,
-            transport: "local_process".to_owned(),
-            local: true,
-            default_enabled: false,
-            experimental: true,
-            license: "Apache-2.0".to_owned(),
-        },
-        ProviderDescriptor {
-            id: "gemma_4_local".to_owned(),
-            kind: ProviderKind::Llm,
-            transport: "local_process".to_owned(),
-            local: true,
-            default_enabled: true,
-            experimental: false,
-            license: "Apache-2.0".to_owned(),
-        },
-    ]
-}
-
 pub fn default_host_adapter_catalog() -> Vec<ProviderDescriptor> {
-    vec![
+    let mut catalog = vec![
         ProviderDescriptor {
-            id: "atspi_accessible_text".to_owned(),
+            id: "global_shortcuts".to_owned(),
             kind: ProviderKind::HostAdapter,
-            transport: "desktop_bus".to_owned(),
-            local: true,
-            default_enabled: true,
-            experimental: false,
-            license: "system".to_owned(),
-        },
-        ProviderDescriptor {
-            id: "global_shortcuts_portal".to_owned(),
-            kind: ProviderKind::HostAdapter,
-            transport: "desktop_bus".to_owned(),
+            transport: if cfg!(target_os = "linux") {
+                "xdg_portal".to_owned()
+            } else {
+                "global_hotkey".to_owned()
+            },
             local: true,
             default_enabled: true,
             experimental: false,
@@ -81,28 +44,40 @@ pub fn default_host_adapter_catalog() -> Vec<ProviderDescriptor> {
             experimental: false,
             license: "n/a".to_owned(),
         },
-    ]
+    ];
+    if cfg!(target_os = "linux") {
+        catalog.insert(
+            0,
+            ProviderDescriptor {
+                id: "atspi_accessible_text".to_owned(),
+                kind: ProviderKind::HostAdapter,
+                transport: "desktop_bus".to_owned(),
+                local: true,
+                default_enabled: true,
+                experimental: false,
+                license: "system".to_owned(),
+            },
+        );
+    } else {
+        catalog.insert(
+            0,
+            ProviderDescriptor {
+                id: "macos_clipboard_paste".to_owned(),
+                kind: ProviderKind::HostAdapter,
+                transport: "core_graphics".to_owned(),
+                local: true,
+                default_enabled: true,
+                experimental: false,
+                license: "system".to_owned(),
+            },
+        );
+    }
+    catalog
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderKind, default_host_adapter_catalog, default_provider_catalog};
-
-    #[test]
-    fn catalog_contains_required_local_defaults() {
-        let catalog = default_provider_catalog();
-        assert!(catalog.iter().any(|provider| provider.id == "whisper_cpp"));
-        assert!(
-            catalog
-                .iter()
-                .any(|provider| provider.id == "gemma_4_local")
-        );
-        assert!(
-            catalog
-                .iter()
-                .any(|provider| provider.kind == ProviderKind::Asr && provider.default_enabled)
-        );
-    }
+    use super::default_host_adapter_catalog;
 
     #[test]
     fn host_adapter_catalog_contains_terminal_path() {
@@ -112,5 +87,23 @@ mod tests {
                 .iter()
                 .any(|provider| provider.id == "terminal_bracketed_paste")
         );
+    }
+
+    #[test]
+    fn host_adapter_catalog_is_platform_specific() {
+        let catalog = default_host_adapter_catalog();
+        if cfg!(target_os = "linux") {
+            assert!(
+                catalog
+                    .iter()
+                    .any(|provider| provider.id == "atspi_accessible_text")
+            );
+        } else {
+            assert!(
+                catalog
+                    .iter()
+                    .any(|provider| provider.id == "macos_clipboard_paste")
+            );
+        }
     }
 }

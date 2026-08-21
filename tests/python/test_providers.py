@@ -29,12 +29,12 @@ class ReclaimStaleLockTest(unittest.TestCase):
 
     def test_leaves_lock_intact_when_owner_still_runs(self) -> None:
         # The current test process is guaranteed to be alive; write its PID
-        # and claim its own argv[0] as the expected binary. argv[0] is
-        # usually /usr/bin/python or similar; reading /proc/self/cmdline
-        # tells us what the file-name comparison should match.
+        # and claim its own argv[0] as the expected binary. psutil resolves
+        # argv[0] on both Linux and macOS.
+        import psutil
+
         my_pid = os.getpid()
-        cmdline = pathlib.Path(f"/proc/{my_pid}/cmdline").read_bytes()
-        argv0 = cmdline.split(b"\x00", 1)[0].decode("utf-8")
+        argv0 = psutil.Process(my_pid).cmdline()[0]
         binary_name = pathlib.Path(argv0).name
         self.lock_path.write_text(str(my_pid), encoding="utf-8")
 
