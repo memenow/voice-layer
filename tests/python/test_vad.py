@@ -18,6 +18,7 @@ if str(PYTHON_ROOT) not in sys.path:
 from voicelayer_orchestrator.config import (  # noqa: E402
     WhisperVadConfig,
     load_whisper_vad_config,
+    reset_configuration_for_tests,  # noqa: E402
 )
 from voicelayer_orchestrator.providers.vad_segmenter import (  # noqa: E402
     _frames_to_regions,
@@ -207,6 +208,7 @@ class VadWorkerIntegrationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         # Lazy import to keep the module reference fresh after patches.
         from voicelayer_orchestrator import worker
 
@@ -349,6 +351,7 @@ class VadDispatcherCleanupTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         from voicelayer_orchestrator import worker
 
         self.worker = worker
@@ -514,6 +517,7 @@ class ProbeAudioFileTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-probe-helper-"))
 
     def test_raises_when_audio_file_missing(self) -> None:
@@ -630,6 +634,7 @@ class SegmentProbeDispatchTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         from voicelayer_orchestrator import worker
 
         self.worker = worker
@@ -744,6 +749,7 @@ class VadWavHelpersTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-wav-"))
 
     def _write_wav(self, path: pathlib.Path, samples: object, sample_rate: int = 16000) -> None:

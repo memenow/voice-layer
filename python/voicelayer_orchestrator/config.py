@@ -1,4 +1,10 @@
-"""Environment-backed configuration for VoiceLayer provider backends."""
+"""Worker configuration received via the JSON-RPC ``initialize`` handshake.
+
+The daemon owns configuration: it parses the unified TOML config file (with
+``VOICELAYER_*`` environment overrides) and hands the provider-facing
+sections to the worker in the ``initialize`` payload. The worker never
+reads the process environment for provider settings.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,7 @@ import os
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -177,54 +184,338 @@ class Qwen3AsrConfig:
     extra_args: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _WorkerConfig:
+    llm: OpenAICompatibleConfig | None
+    llama_launch: LlamaServerLaunchConfig | None
+    whisper: WhisperCppConfig | None
+    whisper_server: WhisperServerConfig | None
+    vad: WhisperVadConfig | None
+    mimo_asr: MimoAsrConfig | None
+    qwen3_asr: Qwen3AsrConfig | None
+
+
+_CONFIG: _WorkerConfig | None = None
+
+
+def configure(payload: dict[str, Any]) -> None:
+    """Store the initialize payload as the worker's configuration."""
+    global _CONFIG
+    whisper = _parse_whisper(payload.get("whisper") or {})
+    _CONFIG = _WorkerConfig(
+        llm=_parse_llm(payload.get("llm") or {}),
+        llama_launch=_parse_llama_launch(payload.get("llm") or {}),
+        whisper=whisper,
+        whisper_server=_parse_whisper_server(
+            payload.get("whisper_server") or {},
+            whisper.model_path if whisper else None,
+        ),
+        vad=_parse_vad(payload.get("vad") or {}),
+        mimo_asr=_parse_mimo_asr(payload.get("mimo_asr") or {}),
+        qwen3_asr=_parse_qwen3_asr(payload.get("qwen3_asr") or {}),
+    )
+
+
+def is_configured() -> bool:
+    return _CONFIG is not None
+
+
+def reset_configuration_for_tests() -> None:
+    """Drop the stored configuration.
+
+    Test-only: process-global state otherwise leaks across tests that patch
+    different `VOICELAYER_*` environments. Production workers are configured
+    exactly once by the daemon's `initialize` handshake.
+    """
+    global _CONFIG
+    _CONFIG = None
+
+
+def _require_config() -> _WorkerConfig:
+    if _CONFIG is None:
+        raise RuntimeError("worker has not been initialized")
+    return _CONFIG
+
+
+def llm_config() -> OpenAICompatibleConfig | None:
+    return _require_config().llm
+
+
+def llama_launch_config() -> LlamaServerLaunchConfig | None:
+    return _require_config().llama_launch
+
+
+def whisper_config() -> WhisperCppConfig | None:
+    return _require_config().whisper
+
+
+def whisper_server_config() -> WhisperServerConfig | None:
+    return _require_config().whisper_server
+
+
+def vad_config() -> WhisperVadConfig | None:
+    return _require_config().vad
+
+
+def mimo_asr_config() -> MimoAsrConfig | None:
+    return _require_config().mimo_asr
+
+
+def qwen3_asr_config() -> Qwen3AsrConfig | None:
+    return _require_config().qwen3_asr
+
+
+def _text(section: dict[str, Any], key: str) -> str | None:
+    value = section.get(key)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _number(section: dict[str, Any], key: str, default: float) -> float:
+    value = section.get(key)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
+
+
+def _integer(section: dict[str, Any], key: str, default: int) -> int:
+    value = section.get(key)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    return default
+
+
+def _flag(section: dict[str, Any], key: str) -> bool:
+    return bool(section.get(key, False))
+
+
+def _args(section: dict[str, Any], key: str) -> tuple[str, ...]:
+    return tuple(shlex.split(_text(section, key) or ""))
+
+
+def _parse_llm(section: dict[str, Any]) -> OpenAICompatibleConfig | None:
+    endpoint = _text(section, "endpoint")
+    model = _text(section, "model")
+    if not endpoint or not model:
+        return None
+    return OpenAICompatibleConfig(
+        endpoint=endpoint,
+        model=model,
+        api_key=_text(section, "api_key"),
+        timeout_seconds=_number(section, "timeout_seconds", 60.0),
+    )
+
+
+def _parse_llama_launch(section: dict[str, Any]) -> LlamaServerLaunchConfig | None:
+    if not _flag(section, "auto_start"):
+        return None
+    return LlamaServerLaunchConfig(
+        server_bin=_text(section, "server_bin") or "llama-server",
+        model_path=_text(section, "model_path"),
+        hf_repo=_text(section, "hf_repo"),
+        extra_args=_args(section, "server_args"),
+        launch_timeout_seconds=_number(section, "launch_timeout_seconds", 45.0),
+        poll_interval_seconds=_number(section, "poll_interval_seconds", 0.5),
+    )
+
+
+def _parse_whisper(section: dict[str, Any]) -> WhisperCppConfig | None:
+    model_path = _text(section, "model_path")
+    if not model_path:
+        return None
+    return WhisperCppConfig(
+        binary=_text(section, "binary") or "whisper-cli",
+        model_path=model_path,
+        timeout_seconds=_number(section, "timeout_seconds", 300.0),
+        no_gpu=_flag(section, "no_gpu"),
+        extra_args=_args(section, "extra_args"),
+    )
+
+
+def _parse_whisper_server(
+    section: dict[str, Any],
+    whisper_model_path: str | None,
+) -> WhisperServerConfig | None:
+    host = _text(section, "host")
+    port = _integer(section, "port", 0)
+    server_bin = _text(section, "server_bin")
+    auto_start = _flag(section, "auto_start")
+    if not host and not port and not server_bin and not auto_start:
+        return None
+    return WhisperServerConfig(
+        host=host or "127.0.0.1",
+        port=port or 8188,
+        timeout_seconds=_number(section, "timeout_seconds", 60.0),
+        auto_start=auto_start,
+        server_bin=server_bin,
+        # Autostart needs the ggml model path; it lives in the whisper
+        # section of the shared config.
+        model_path=whisper_model_path,
+        extra_args=_args(section, "extra_args"),
+        launch_timeout_seconds=_number(section, "launch_timeout_seconds", 30.0),
+        poll_interval_seconds=_number(section, "poll_interval_seconds", 0.5),
+    )
+
+
+def _parse_vad(section: dict[str, Any]) -> WhisperVadConfig | None:
+    if not _flag(section, "enabled"):
+        return None
+    model_path = _text(section, "model_path")
+    if not model_path:
+        return None
+    return WhisperVadConfig(
+        model_path=model_path,
+        threshold=_number(section, "threshold", 0.5),
+        min_speech_ms=_integer(section, "min_speech_ms", 250),
+        min_silence_ms=_integer(section, "min_silence_ms", 100),
+        speech_pad_ms=_integer(section, "speech_pad_ms", 30),
+        max_segment_secs=_number(section, "max_segment_secs", 30.0),
+        sample_rate=_integer(section, "sample_rate", 16000),
+    )
+
+
+# --- Environment bridge -------------------------------------------------
+#
+# `configure_from_environment()` maps the `VOICELAYER_*` override layer
+# into the initialize payload shape. Production daemons always send an
+# explicit `initialize`, so this path exists for (a) running the worker
+# standalone during development and (b) the upstream test suites, which
+# patch os.environ around worker calls.
+
+_ENV_TO_PAYLOAD: dict[str, tuple[str, str, str]] = {
+    "VOICELAYER_LLM_ENDPOINT": ("llm", "endpoint", "str"),
+    "VOICELAYER_LLM_MODEL": ("llm", "model", "str"),
+    "VOICELAYER_LLM_API_KEY": ("llm", "api_key", "str"),
+    "VOICELAYER_LLM_TIMEOUT_SECONDS": ("llm", "timeout_seconds", "float"),
+    "VOICELAYER_LLM_AUTO_START": ("llm", "auto_start", "bool"),
+    "VOICELAYER_LLAMA_SERVER_BIN": ("llm", "server_bin", "str"),
+    "VOICELAYER_LLAMA_MODEL_PATH": ("llm", "model_path", "str"),
+    "VOICELAYER_LLAMA_HF_REPO": ("llm", "hf_repo", "str"),
+    "VOICELAYER_LLAMA_SERVER_ARGS": ("llm", "server_args", "str"),
+    "VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS": ("llm", "launch_timeout_seconds", "float"),
+    "VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS": ("llm", "poll_interval_seconds", "float"),
+    "VOICELAYER_WHISPER_BIN": ("whisper", "binary", "str"),
+    "VOICELAYER_WHISPER_MODEL_PATH": ("whisper", "model_path", "str"),
+    "VOICELAYER_WHISPER_TIMEOUT_SECONDS": ("whisper", "timeout_seconds", "float"),
+    "VOICELAYER_WHISPER_NO_GPU": ("whisper", "no_gpu", "bool"),
+    "VOICELAYER_WHISPER_ARGS": ("whisper", "extra_args", "str"),
+    "VOICELAYER_WHISPER_SERVER_HOST": ("whisper_server", "host", "str"),
+    "VOICELAYER_WHISPER_SERVER_PORT": ("whisper_server", "port", "int"),
+    "VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS": ("whisper_server", "timeout_seconds", "float"),
+    "VOICELAYER_WHISPER_SERVER_AUTO_START": ("whisper_server", "auto_start", "bool"),
+    "VOICELAYER_WHISPER_SERVER_BIN": ("whisper_server", "server_bin", "str"),
+    "VOICELAYER_WHISPER_SERVER_ARGS": ("whisper_server", "extra_args", "str"),
+    "VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS": (
+        "whisper_server",
+        "launch_timeout_seconds",
+        "float",
+    ),
+    "VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS": (
+        "whisper_server",
+        "poll_interval_seconds",
+        "float",
+    ),
+    "VOICELAYER_WHISPER_VAD_ENABLED": ("vad", "enabled", "bool"),
+    "VOICELAYER_WHISPER_VAD_MODEL_PATH": ("vad", "model_path", "str"),
+    "VOICELAYER_WHISPER_VAD_THRESHOLD": ("vad", "threshold", "float"),
+    "VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS": ("vad", "min_speech_ms", "int"),
+    "VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS": ("vad", "min_silence_ms", "int"),
+    "VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS": ("vad", "speech_pad_ms", "int"),
+    "VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS": ("vad", "max_segment_secs", "float"),
+    "VOICELAYER_WHISPER_VAD_SAMPLE_RATE": ("vad", "sample_rate", "int"),
+    "VOICELAYER_MIMO_MODEL_PATH": ("mimo_asr", "model_path", "str"),
+    "VOICELAYER_MIMO_TOKENIZER_PATH": ("mimo_asr", "tokenizer_path", "str"),
+    "VOICELAYER_MIMO_REPO_PATH": ("mimo_asr", "repo_path", "str"),
+    "VOICELAYER_MIMO_DEVICE": ("mimo_asr", "device", "str"),
+    "VOICELAYER_MIMO_AUDIO_TAG": ("mimo_asr", "audio_tag", "str"),
+    "VOICELAYER_MIMO_TIMEOUT_SECONDS": ("mimo_asr", "timeout_seconds", "float"),
+    "VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS": ("mimo_asr", "long_audio_split_seconds", "float"),
+    "VOICELAYER_MIMO_ARGS": ("mimo_asr", "extra_args", "str"),
+    "VOICELAYER_QWEN3_ASR_MODEL_PATH": ("qwen3_asr", "model_path", "str"),
+    "VOICELAYER_QWEN3_ASR_DEVICE": ("qwen3_asr", "device", "str"),
+    "VOICELAYER_QWEN3_ASR_TORCH_DTYPE": ("qwen3_asr", "torch_dtype", "str"),
+    "VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS": ("qwen3_asr", "timeout_seconds", "float"),
+    "VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS": (
+        "qwen3_asr",
+        "long_audio_split_seconds",
+        "float",
+    ),
+    "VOICELAYER_QWEN3_ASR_ARGS": ("qwen3_asr", "extra_args", "str"),
+}
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def payload_from_environ(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Build an initialize payload from `VOICELAYER_*` environment variables."""
+
+    source = environ if environ is not None else os.environ
+    payload: dict[str, Any] = {}
+    for env_key, (section, field, kind) in _ENV_TO_PAYLOAD.items():
+        if env_key not in source:
+            continue
+        raw = source[env_key]
+        if kind == "bool":
+            value: Any = raw.strip().lower() in _TRUTHY
+        elif kind == "int":
+            if not raw.strip():
+                continue
+            value = int(raw)
+        elif kind == "float":
+            if not raw.strip():
+                continue
+            value = float(raw)
+        else:
+            if raw == "":
+                continue
+            value = raw
+        payload.setdefault(section, {})[field] = value
+    return payload
+
+
+def configure_from_environment(environ: Mapping[str, str] | None = None) -> None:
+    """Initialize worker configuration from the `VOICELAYER_*` environment."""
+
+    configure(payload_from_environ(environ))
+
+
+# --- Test-only environment loaders -------------------------------------
+#
+# Upstream test suites call these loaders directly with an injected
+# environment map. They parse the `VOICELAYER_*` override layer into the
+# same dataclasses the initialize handshake uses; production workers never
+# call them (the daemon hands config via `initialize`).
+
+
 def load_llm_provider_config(
     environ: Mapping[str, str] | None = None,
 ) -> OpenAICompatibleConfig | None:
-    """Load an OpenAI-compatible provider configuration from the environment.
-
-    Reads ``VOICELAYER_LLM_ENDPOINT`` and ``VOICELAYER_LLM_MODEL``;
-    optional ``VOICELAYER_LLM_API_KEY`` and
-    ``VOICELAYER_LLM_TIMEOUT_SECONDS`` (default ``60``). Returns ``None``
-    when either of the two required keys is missing so callers treat the
-    LLM workflows as "not configured" without surfacing an error.
-    """
-
-    source = environ or os.environ
+    source = environ if environ is not None else os.environ
     endpoint = source.get("VOICELAYER_LLM_ENDPOINT")
     model = source.get("VOICELAYER_LLM_MODEL")
     if not endpoint or not model:
         return None
-
-    timeout_seconds = float(source.get("VOICELAYER_LLM_TIMEOUT_SECONDS", "60"))
-    api_key = source.get("VOICELAYER_LLM_API_KEY") or None
     return OpenAICompatibleConfig(
         endpoint=endpoint.strip(),
         model=model.strip(),
-        api_key=api_key,
-        timeout_seconds=timeout_seconds,
+        api_key=source.get("VOICELAYER_LLM_API_KEY") or None,
+        timeout_seconds=float(source.get("VOICELAYER_LLM_TIMEOUT_SECONDS", "60")),
     )
 
 
 def load_llama_server_launch_config(
     environ: Mapping[str, str] | None = None,
 ) -> LlamaServerLaunchConfig | None:
-    """Load auto-start configuration for a local ``llama-server``.
-
-    Gated by ``VOICELAYER_LLM_AUTO_START`` (truthy values:
-    ``1``/``true``/``yes``/``on``); returns ``None`` when unset so
-    :func:`ensure_llm_endpoint` skips the launch path. When enabled,
-    reads ``VOICELAYER_LLAMA_SERVER_BIN`` (default ``llama-server``),
-    ``VOICELAYER_LLAMA_MODEL_PATH`` or ``VOICELAYER_LLAMA_HF_REPO``,
-    ``VOICELAYER_LLAMA_SERVER_ARGS``, ``VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS``
-    (default ``45``), and ``VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS``
-    (default ``0.5``).
-    """
-
-    source = environ or os.environ
+    source = environ if environ is not None else os.environ
     enabled = source.get("VOICELAYER_LLM_AUTO_START", "").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
         return None
-
     return LlamaServerLaunchConfig(
         server_bin=source.get("VOICELAYER_LLAMA_SERVER_BIN", "llama-server"),
         model_path=source.get("VOICELAYER_LLAMA_MODEL_PATH"),
@@ -238,21 +529,10 @@ def load_llama_server_launch_config(
 def load_whisper_provider_config(
     environ: Mapping[str, str] | None = None,
 ) -> WhisperCppConfig | None:
-    """Load ``whisper-cli`` configuration from the environment.
-
-    Requires ``VOICELAYER_WHISPER_MODEL_PATH``; returns ``None`` when
-    unset so callers treat the CLI provider as "not configured". Also
-    reads ``VOICELAYER_WHISPER_BIN`` (default ``whisper-cli``),
-    ``VOICELAYER_WHISPER_TIMEOUT_SECONDS`` (default ``300``),
-    ``VOICELAYER_WHISPER_NO_GPU`` (toggle, default off), and
-    ``VOICELAYER_WHISPER_ARGS`` for extra argv passthrough.
-    """
-
-    source = environ or os.environ
+    source = environ if environ is not None else os.environ
     model_path = source.get("VOICELAYER_WHISPER_MODEL_PATH")
     if not model_path:
         return None
-
     return WhisperCppConfig(
         binary=source.get("VOICELAYER_WHISPER_BIN", "whisper-cli"),
         model_path=model_path.strip(),
@@ -266,24 +546,13 @@ def load_whisper_provider_config(
 def load_whisper_vad_config(
     environ: Mapping[str, str] | None = None,
 ) -> WhisperVadConfig | None:
-    """Load silero-vad pre-pass configuration from the environment.
-
-    Gated by ``VOICELAYER_WHISPER_VAD_ENABLED`` plus a non-empty
-    ``VOICELAYER_WHISPER_VAD_MODEL_PATH``; returns ``None`` otherwise so
-    callers treat it as "no VAD" and fall back to the raw WAV transcribe
-    path. Optional tuning knobs:
-    ``VOICELAYER_WHISPER_VAD_{THRESHOLD,MIN_SPEECH_MS,MIN_SILENCE_MS,SPEECH_PAD_MS,MAX_SEGMENT_SECS,SAMPLE_RATE}``.
-    """
-
-    source = environ or os.environ
+    source = environ if environ is not None else os.environ
     enabled = source.get("VOICELAYER_WHISPER_VAD_ENABLED", "").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
         return None
-
     model_path = source.get("VOICELAYER_WHISPER_VAD_MODEL_PATH", "").strip()
     if not model_path:
         return None
-
     return WhisperVadConfig(
         model_path=model_path,
         threshold=float(source.get("VOICELAYER_WHISPER_VAD_THRESHOLD", "0.5")),
@@ -298,20 +567,7 @@ def load_whisper_vad_config(
 def load_whisper_server_config(
     environ: Mapping[str, str] | None = None,
 ) -> WhisperServerConfig | None:
-    """Load persistent ``whisper-server`` configuration from the environment.
-
-    Activates when any of ``VOICELAYER_WHISPER_SERVER_HOST``,
-    ``VOICELAYER_WHISPER_SERVER_PORT``, ``VOICELAYER_WHISPER_SERVER_BIN``,
-    or ``VOICELAYER_WHISPER_SERVER_AUTO_START`` is set; returns ``None``
-    when none are, so callers fall back to the one-shot ``whisper-cli``
-    provider without handling an error. Host defaults to ``127.0.0.1``
-    and port to ``8188`` when only autostart is configured. Reads
-    ``VOICELAYER_WHISPER_MODEL_PATH`` for autostart and the
-    ``VOICELAYER_WHISPER_SERVER_{TIMEOUT_SECONDS,ARGS,LAUNCH_TIMEOUT_SECONDS,POLL_INTERVAL_SECONDS}``
-    tuning knobs.
-    """
-
-    source = environ or os.environ
+    source = environ if environ is not None else os.environ
     host = source.get("VOICELAYER_WHISPER_SERVER_HOST", "").strip()
     port_str = source.get("VOICELAYER_WHISPER_SERVER_PORT", "").strip()
     server_bin = source.get("VOICELAYER_WHISPER_SERVER_BIN")
@@ -321,16 +577,11 @@ def load_whisper_server_config(
         "yes",
         "on",
     }
-
     if not host and not port_str and not server_bin and not auto_start:
         return None
-
-    resolved_host = host or "127.0.0.1"
-    resolved_port = int(port_str) if port_str else 8188
-
     return WhisperServerConfig(
-        host=resolved_host,
-        port=resolved_port,
+        host=host or "127.0.0.1",
+        port=int(port_str) if port_str else 8188,
         timeout_seconds=float(source.get("VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS", "60")),
         auto_start=auto_start,
         server_bin=server_bin,
@@ -348,42 +599,19 @@ def load_whisper_server_config(
 def load_mimo_asr_config(
     environ: Mapping[str, str] | None = None,
 ) -> MimoAsrConfig | None:
-    """Load Xiaomi MiMo-V2.5-ASR provider configuration from the environment.
-
-    Requires both ``VOICELAYER_MIMO_MODEL_PATH`` and
-    ``VOICELAYER_MIMO_TOKENIZER_PATH``; returns ``None`` when either is
-    missing so callers treat the provider as "not configured" without
-    surfacing an error. Optional knobs:
-    ``VOICELAYER_MIMO_REPO_PATH`` (parent of upstream ``src/``),
-    ``VOICELAYER_MIMO_DEVICE`` (default ``cuda:0``),
-    ``VOICELAYER_MIMO_AUDIO_TAG``,
-    ``VOICELAYER_MIMO_TIMEOUT_SECONDS`` (default ``600``),
-    ``VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS`` (default ``180``), and
-    ``VOICELAYER_MIMO_ARGS``.
-    """
-
-    source = environ or os.environ
-    model_path = (source.get("VOICELAYER_MIMO_MODEL_PATH") or "").strip()
-    tokenizer_path = (source.get("VOICELAYER_MIMO_TOKENIZER_PATH") or "").strip()
+    source = environ if environ is not None else os.environ
+    model_path = source.get("VOICELAYER_MIMO_MODEL_PATH")
+    tokenizer_path = source.get("VOICELAYER_MIMO_TOKENIZER_PATH")
     if not model_path or not tokenizer_path:
         return None
-
-    raw_audio_tag = (source.get("VOICELAYER_MIMO_AUDIO_TAG") or "").strip()
-    audio_tag = raw_audio_tag or None
-
-    raw_repo_path = (source.get("VOICELAYER_MIMO_REPO_PATH") or "").strip()
-    repo_path = raw_repo_path or None
-
     return MimoAsrConfig(
-        model_path=model_path,
-        tokenizer_path=tokenizer_path,
-        repo_path=repo_path,
-        device=(source.get("VOICELAYER_MIMO_DEVICE") or "cuda:0").strip(),
-        audio_tag=audio_tag,
-        timeout_seconds=float(source.get("VOICELAYER_MIMO_TIMEOUT_SECONDS", "600")),
-        long_audio_split_seconds=float(
-            source.get("VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS", "180")
-        ),
+        model_path=model_path.strip(),
+        tokenizer_path=tokenizer_path.strip(),
+        repo_path=source.get("VOICELAYER_MIMO_REPO_PATH") or None,
+        device=source.get("VOICELAYER_MIMO_DEVICE", "cuda"),
+        audio_tag=(source.get("VOICELAYER_MIMO_AUDIO_TAG") or "").strip() or None,
+        timeout_seconds=float(source.get("VOICELAYER_MIMO_TIMEOUT_SECONDS", "300")),
+        long_audio_split_seconds=float(source.get("VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS", "0")),
         extra_args=tuple(shlex.split(source.get("VOICELAYER_MIMO_ARGS", ""))),
     )
 
@@ -391,34 +619,54 @@ def load_mimo_asr_config(
 def load_qwen3_asr_config(
     environ: Mapping[str, str] | None = None,
 ) -> Qwen3AsrConfig | None:
-    """Load Qwen3-ASR-1.7B provider configuration from the environment.
-
-    Requires ``VOICELAYER_QWEN3_ASR_MODEL_PATH``; returns ``None`` when
-    unset so callers treat the provider as "not configured" the same way
-    they treat MiMo, without surfacing an error. Operators must
-    pre-stage the weights themselves; the loader does not trigger
-    HuggingFace downloads to keep cold-start cost predictable on the
-    local-first runtime path. Optional knobs:
-    ``VOICELAYER_QWEN3_ASR_DEVICE`` (default ``cuda:0``),
-    ``VOICELAYER_QWEN3_ASR_DTYPE`` (default ``bfloat16``),
-    ``VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS`` (default ``600``),
-    ``VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS`` (default ``0`` —
-    upstream wrapper handles long-audio chunking; set positive to force
-    worker-side splitting), and ``VOICELAYER_QWEN3_ASR_ARGS``.
-    """
-
-    source = environ or os.environ
+    source = environ if environ is not None else os.environ
     model_path = (source.get("VOICELAYER_QWEN3_ASR_MODEL_PATH") or "").strip()
     if not model_path:
         return None
-
     return Qwen3AsrConfig(
         model_path=model_path,
-        device=(source.get("VOICELAYER_QWEN3_ASR_DEVICE") or "cuda:0").strip(),
-        torch_dtype=(source.get("VOICELAYER_QWEN3_ASR_DTYPE") or "bfloat16").strip().lower(),
-        timeout_seconds=float(source.get("VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS", "600")),
+        device=source.get("VOICELAYER_QWEN3_ASR_DEVICE", "cuda"),
+        torch_dtype=(
+            source.get(
+                "VOICELAYER_QWEN3_ASR_TORCH_DTYPE",
+                source.get("VOICELAYER_QWEN3_ASR_DTYPE", "bfloat16"),
+            )
+            or "bfloat16"
+        ).lower(),
+        timeout_seconds=float(source.get("VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS", "300")),
         long_audio_split_seconds=float(
             source.get("VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS", "0")
         ),
         extra_args=tuple(shlex.split(source.get("VOICELAYER_QWEN3_ASR_ARGS", ""))),
+    )
+
+
+def _parse_mimo_asr(section: dict[str, Any]) -> MimoAsrConfig | None:
+    model_path = _text(section, "model_path")
+    tokenizer_path = _text(section, "tokenizer_path")
+    if not model_path or not tokenizer_path:
+        return None
+    return MimoAsrConfig(
+        model_path=model_path,
+        tokenizer_path=tokenizer_path,
+        repo_path=_text(section, "repo_path"),
+        device=_text(section, "device") or "cuda",
+        audio_tag=_text(section, "audio_tag"),
+        timeout_seconds=_number(section, "timeout_seconds", 300.0),
+        long_audio_split_seconds=_number(section, "long_audio_split_seconds", 0.0),
+        extra_args=_args(section, "extra_args"),
+    )
+
+
+def _parse_qwen3_asr(section: dict[str, Any]) -> Qwen3AsrConfig | None:
+    model_path = _text(section, "model_path")
+    if not model_path:
+        return None
+    return Qwen3AsrConfig(
+        model_path=model_path,
+        device=_text(section, "device") or "cuda",
+        torch_dtype=_text(section, "torch_dtype") or "bfloat16",
+        timeout_seconds=_number(section, "timeout_seconds", 300.0),
+        long_audio_split_seconds=_number(section, "long_audio_split_seconds", 0.0),
+        extra_args=_args(section, "extra_args"),
     )

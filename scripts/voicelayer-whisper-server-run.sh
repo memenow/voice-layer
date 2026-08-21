@@ -88,4 +88,4 @@ exec "${VOICELAYER_WHISPER_SERVER_BIN}" \
   -m "${VOICELAYER_WHISPER_MODEL_PATH}" \
   --host "${host}" \
   --port "${port}" \
-  "${extra_args[@]}"
+  ${extra_args[@]+"${extra_args[@]}"}

@@ -3,24 +3,6 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use crossterm::event::KeyCode;
 use serde::{Deserialize, Serialize};
-use voicelayer_core::RecorderBackend;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-pub(crate) enum CliRecorderBackend {
-    Auto,
-    Pipewire,
-    Alsa,
-}
-
-impl From<CliRecorderBackend> for RecorderBackend {
-    fn from(value: CliRecorderBackend) -> Self {
-        match value {
-            CliRecorderBackend::Auto => Self::Auto,
-            CliRecorderBackend::Pipewire => Self::Pipewire,
-            CliRecorderBackend::Alsa => Self::Alsa,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub(crate) enum CliPttKey {
@@ -87,7 +69,6 @@ pub(crate) enum CliSegmentationMode {
 pub(crate) fn build_segmentation_mode(
     mode: CliSegmentationMode,
     segment_secs: Option<u32>,
-    overlap_secs: u32,
     probe_secs: Option<u32>,
     max_segment_secs: Option<u32>,
     silence_gap_probes: u32,
@@ -97,7 +78,6 @@ pub(crate) fn build_segmentation_mode(
         CliSegmentationMode::Fixed => voicelayer_core::SegmentationMode::Fixed {
             segment_secs: segment_secs
                 .expect("clap required_if_eq(mode, fixed) must populate segment_secs"),
-            overlap_secs,
         },
         CliSegmentationMode::VadGated => voicelayer_core::SegmentationMode::VadGated {
             probe_secs: probe_secs
@@ -112,7 +92,6 @@ pub(crate) fn build_segmentation_mode(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ForegroundPttConfig {
     pub(crate) language: Option<String>,
-    pub(crate) backend: CliRecorderBackend,
     pub(crate) translate_to_english: bool,
     pub(crate) keep_audio: bool,
     pub(crate) key: CliPttKey,
@@ -131,7 +110,6 @@ impl Default for ForegroundPttConfig {
     fn default() -> Self {
         Self {
             language: None,
-            backend: CliRecorderBackend::Auto,
             translate_to_english: false,
             keep_audio: false,
             key: CliPttKey::Space,
@@ -179,7 +157,6 @@ pub(crate) fn write_vl_config(config: &VlConfig) -> Result<PathBuf, Box<dyn std:
 
 const SUPPORTED_CONFIG_KEYS: &[&str] = &[
     "foreground_ptt.language",
-    "foreground_ptt.backend",
     "foreground_ptt.translate_to_english",
     "foreground_ptt.keep_audio",
     "foreground_ptt.key",
@@ -216,14 +193,6 @@ pub(crate) fn set_config_value(
         }
         "foreground_ptt.save_dir" => {
             config.foreground_ptt.save_dir = parse_optional_path(value);
-        }
-        "foreground_ptt.backend" => {
-            config.foreground_ptt.backend = match value {
-                "auto" => CliRecorderBackend::Auto,
-                "pipewire" => CliRecorderBackend::Pipewire,
-                "alsa" => CliRecorderBackend::Alsa,
-                _ => return Err("expected one of: auto, pipewire, alsa".into()),
-            };
         }
         "foreground_ptt.key" => {
             config.foreground_ptt.key = match value {
@@ -295,19 +264,11 @@ fn parse_bool(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliPttKey, CliRecorderBackend, CliSegmentationMode, StopAction, VlConfig,
-        build_segmentation_mode, set_config_value,
+        CliPttKey, CliSegmentationMode, StopAction, VlConfig, build_segmentation_mode,
+        set_config_value,
     };
     use crossterm::event::KeyCode;
-    use voicelayer_core::{RecorderBackend, SegmentationMode};
-
-    #[test]
-    fn cli_backend_maps_to_domain_backend() {
-        assert_eq!(
-            RecorderBackend::from(CliRecorderBackend::Auto),
-            RecorderBackend::Auto
-        );
-    }
+    use voicelayer_core::SegmentationMode;
 
     #[test]
     fn ptt_key_maps_to_terminal_key_code() {
@@ -317,33 +278,21 @@ mod tests {
 
     #[test]
     fn build_segmentation_mode_one_shot_ignores_numeric_knobs() {
-        let mode = build_segmentation_mode(
-            CliSegmentationMode::OneShot,
-            Some(8),
-            0,
-            Some(2),
-            Some(30),
-            1,
-        );
+        let mode =
+            build_segmentation_mode(CliSegmentationMode::OneShot, Some(8), Some(2), Some(30), 1);
         assert_eq!(mode, SegmentationMode::OneShot);
     }
 
     #[test]
     fn build_segmentation_mode_fixed_populates_from_required_knob() {
-        let mode = build_segmentation_mode(CliSegmentationMode::Fixed, Some(8), 2, None, None, 1);
-        assert_eq!(
-            mode,
-            SegmentationMode::Fixed {
-                segment_secs: 8,
-                overlap_secs: 2,
-            },
-        );
+        let mode = build_segmentation_mode(CliSegmentationMode::Fixed, Some(8), None, None, 1);
+        assert_eq!(mode, SegmentationMode::Fixed { segment_secs: 8 },);
     }
 
     #[test]
     fn build_segmentation_mode_vad_gated_populates_from_required_knobs() {
         let mode =
-            build_segmentation_mode(CliSegmentationMode::VadGated, None, 0, Some(2), Some(30), 2);
+            build_segmentation_mode(CliSegmentationMode::VadGated, None, Some(2), Some(30), 2);
         assert_eq!(
             mode,
             SegmentationMode::VadGated {
@@ -361,19 +310,19 @@ mod tests {
         // production, but if the `required_if_eq` attribute is ever
         // stripped this pin ensures we fail loudly instead of silently
         // downgrading to a zero-duration segment.
-        let _ = build_segmentation_mode(CliSegmentationMode::Fixed, None, 0, None, None, 1);
+        let _ = build_segmentation_mode(CliSegmentationMode::Fixed, None, None, None, 1);
     }
 
     #[test]
     #[should_panic(expected = "probe_secs")]
     fn build_segmentation_mode_vad_gated_panics_when_probe_secs_missing() {
-        let _ = build_segmentation_mode(CliSegmentationMode::VadGated, None, 0, None, Some(30), 1);
+        let _ = build_segmentation_mode(CliSegmentationMode::VadGated, None, None, Some(30), 1);
     }
 
     #[test]
     #[should_panic(expected = "max_segment_secs")]
     fn build_segmentation_mode_vad_gated_panics_when_max_segment_secs_missing() {
-        let _ = build_segmentation_mode(CliSegmentationMode::VadGated, None, 0, Some(2), None, 1);
+        let _ = build_segmentation_mode(CliSegmentationMode::VadGated, None, Some(2), None, 1);
     }
 
     #[test]

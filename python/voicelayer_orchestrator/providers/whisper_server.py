@@ -24,17 +24,14 @@ import mimetypes
 import os
 import subprocess
 import time
-import urllib.error
-import urllib.request
-import uuid
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from voicelayer_orchestrator.config import WhisperServerConfig
 from voicelayer_orchestrator.providers import (
     ProviderInvocationError,
-    collapse_nonspeech_transcript,
     provider_runtime_dir,
     reclaim_stale_lock,
 )
@@ -68,23 +65,18 @@ def probe_whisper_server(
     probe_timeout = (
         timeout_seconds if timeout_seconds is not None else min(config.timeout_seconds, 5.0)
     )
-    request = urllib.request.Request(config.base_url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=probe_timeout) as response:
-            status = response.status
-    except urllib.error.HTTPError as exc:
-        # An HTTP error means the server is up but the path returned non-2xx; still reachable.
-        return True, f"HTTP {exc.code}"
-    except urllib.error.URLError as exc:
-        return False, f"unreachable: {exc.reason}"
-    except TimeoutError:
+        response = httpx.get(config.base_url, timeout=probe_timeout)
+    except httpx.TimeoutException:
         return False, "timeout"
-    except ConnectionError as exc:
-        return False, f"connection error: {exc}"
+    except httpx.HTTPError as exc:
+        return False, f"unreachable: {exc}"
 
-    if 200 <= status < 500:
+    # Any HTTP response at all means the server is up; whisper-server answers
+    # GET / with its web UI or a 404 depending on build flags.
+    if response.status_code < 500:
         return True, None
-    return False, f"unexpected HTTP status {status}"
+    return False, f"unexpected HTTP status {response.status_code}"
 
 
 def _server_endpoint_key(config: WhisperServerConfig) -> str:
@@ -114,20 +106,32 @@ def _build_whisper_server_command(config: WhisperServerConfig) -> list[str]:
     ]
 
 
-def autostart_whisper_server(
+def validate_autostart_prerequisites(
     config: WhisperServerConfig,
-    environ: Mapping[str, str] | None = None,
 ) -> tuple[bool, str | None]:
+    """Return (ok, error) for whether autostart can spawn a whisper-server.
+
+    Mirrors :func:`_build_whisper_server_command` so callers like the health
+    handler can preempt false-positive ``asr_configured`` reports when
+    autostart is enabled without the binary and model path that
+    ``transcribe`` would need on first call.
+    """
+
+    try:
+        _build_whisper_server_command(config)
+    except ProviderInvocationError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def autostart_whisper_server(config: WhisperServerConfig) -> tuple[bool, str | None]:
     """Launch ``whisper-server`` in the background and wait for readiness."""
 
-    runtime_dir = provider_runtime_dir(environ)
+    runtime_dir = provider_runtime_dir()
     key = _server_endpoint_key(config)
     lock_path = runtime_dir / f"{key}.lock"
     log_path = runtime_dir / f"{key}.log"
     state_path = runtime_dir / f"{key}.json"
-    source = dict(os.environ)
-    if environ:
-        source.update(environ)
 
     try:
         command = _build_whisper_server_command(config)
@@ -156,7 +160,6 @@ def autostart_whisper_server(
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=source,
                 start_new_session=True,
             )
         _BACKGROUND_PROCESSES.append(process)
@@ -203,7 +206,6 @@ def _wait_for_whisper_server(config: WhisperServerConfig) -> tuple[bool, str | N
 
 def ensure_whisper_server(
     config: WhisperServerConfig | None,
-    environ: Mapping[str, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Return (reachable, error) for the configured server, auto-starting when asked."""
 
@@ -217,61 +219,11 @@ def ensure_whisper_server(
     if not config.auto_start:
         return False, error
 
-    return autostart_whisper_server(config, environ)
-
-
-def validate_autostart_prerequisites(
-    config: WhisperServerConfig,
-) -> tuple[bool, str | None]:
-    """Return (ok, error) for whether autostart can spawn a whisper-server.
-
-    Mirrors :func:`_build_whisper_server_command` so callers like the health
-    handler can preempt false-positive ``asr_configured`` reports when
-    ``VOICELAYER_WHISPER_SERVER_AUTO_START=1`` is set without the binary and
-    model path that ``transcribe`` would need on first call.
-    """
-
-    try:
-        _build_whisper_server_command(config)
-    except ProviderInvocationError as exc:
-        return False, str(exc)
-    return True, None
-
-
-def _encode_multipart(
-    file_path: str,
-    file_bytes: bytes,
-    fields: Mapping[str, str],
-) -> tuple[bytes, str]:
-    """Encode a multipart/form-data body with a file upload and plain fields."""
-
-    boundary = f"----voicelayer{uuid.uuid4().hex}"
-    crlf = b"\r\n"
-    pieces: list[bytes] = []
-    for name, value in fields.items():
-        pieces.append(f"--{boundary}".encode())
-        pieces.append(f'Content-Disposition: form-data; name="{name}"'.encode())
-        pieces.append(b"")
-        pieces.append(value.encode("utf-8"))
-
-    filename = Path(file_path).name
-    mime_type, _ = mimetypes.guess_type(filename)
-    mime_type = mime_type or "application/octet-stream"
-    pieces.append(f"--{boundary}".encode())
-    pieces.append(f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode())
-    pieces.append(f"Content-Type: {mime_type}".encode())
-    pieces.append(b"")
-    pieces.append(file_bytes)
-    pieces.append(f"--{boundary}--".encode())
-    pieces.append(b"")
-
-    body = crlf.join(pieces)
-    content_type = f"multipart/form-data; boundary={boundary}"
-    return body, content_type
+    return autostart_whisper_server(config)
 
 
 def transcribe_with_whisper_server(
-    params: Mapping[str, Any],
+    params: dict[str, Any],
     config: WhisperServerConfig,
 ) -> dict[str, Any]:
     """Send ``audio_file`` to ``whisper-server`` and return the VoiceLayer transcription shape."""
@@ -291,48 +243,37 @@ def transcribe_with_whisper_server(
     except OSError as exc:
         raise ProviderInvocationError(f"Unable to read audio file: {exc}") from exc
 
-    body, content_type = _encode_multipart(
-        audio_file,
-        file_bytes,
-        {
-            "response_format": "json",
-            "language": language,
-            "translate": "true" if translate_to_english else "false",
-        },
-    )
-
-    url = f"{config.base_url}/inference"
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": content_type},
-        method="POST",
-    )
+    mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
 
     try:
-        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
-        raise ProviderInvocationError(f"whisper-server returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise ProviderInvocationError(f"whisper-server is unreachable: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise ProviderInvocationError("whisper-server timed out.") from exc
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        response = httpx.post(
+            f"{config.base_url}/inference",
+            data={
+                "response_format": "json",
+                "language": language,
+                "translate": "true" if translate_to_english else "false",
+            },
+            files={"file": (file_path.name, file_bytes, mime_type)},
+            timeout=config.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip()
         raise ProviderInvocationError(
-            f"whisper-server returned non-JSON body: {raw[:200]!r}"
+            f"whisper-server returned HTTP {exc.response.status_code}: {detail}"
         ) from exc
+    except httpx.TimeoutException as exc:
+        raise ProviderInvocationError("whisper-server timed out.") from exc
+    except httpx.HTTPError as exc:
+        raise ProviderInvocationError(f"whisper-server is unreachable: {exc}") from exc
+    except ValueError as exc:
+        raise ProviderInvocationError("whisper-server returned a non-JSON body.") from exc
 
-    text_raw = payload.get("text", "") if isinstance(payload, dict) else ""
-    # Collapse whisper decorative annotations — see the filter doc in
-    # `providers/__init__.py` for the full rule. Keeping empty text
-    # rather than raising lets callers decide whether silence is an
-    # error, matching the whisper-cli path.
-    text = collapse_nonspeech_transcript(str(text_raw).strip())
+    text = str(payload.get("text", "")).strip() if isinstance(payload, dict) else ""
+    if text == "[BLANK_AUDIO]":
+        # Keep empty text rather than raising: callers decide whether silence is an error.
+        text = ""
 
     detected_language: str | None
     if language == "auto":

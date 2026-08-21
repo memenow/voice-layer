@@ -28,7 +28,7 @@ if str(PYTHON_ROOT) not in sys.path:
 
 from voicelayer_orchestrator.config import (  # noqa: E402
     WhisperServerConfig,
-    load_whisper_server_config,
+    load_whisper_server_config,  # noqa: E402
 )
 from voicelayer_orchestrator.providers.whisper_server import (  # noqa: E402
     _build_whisper_server_command,

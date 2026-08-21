@@ -28,7 +28,7 @@ if str(PYTHON_ROOT) not in sys.path:
 from voicelayer_orchestrator.config import (  # noqa: E402
     Qwen3AsrConfig,
     WhisperVadConfig,
-    load_qwen3_asr_config,
+    load_qwen3_asr_config,  # noqa: E402
 )
 from voicelayer_orchestrator.providers import (  # noqa: E402
     ProviderInvocationError,

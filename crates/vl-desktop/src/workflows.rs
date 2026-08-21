@@ -22,8 +22,8 @@ use voicelayer_ui::tokens::{self, Weight};
 
 use crate::app::{App, Message};
 use crate::components::{
-    self, ArchetypeChoice, Capsule, RecorderChoice, StyleChoice, TargetChoice, Tone,
-    archetype_choices, recorder_choices, style_choices, target_choices,
+    self, ArchetypeChoice, Capsule, StyleChoice, TargetChoice, Tone, archetype_choices,
+    style_choices, target_choices,
 };
 use crate::forms::JobStage;
 use crate::state::{SystemA11y, WorkflowTab};
@@ -235,15 +235,6 @@ pub(crate) fn settings_panel(app: &App) -> Element<'_, Message> {
                     target_choices(),
                     Some(TargetChoice(prefs.default_inject_target.clone())),
                     |choice| Message::PrefInjectTargetSelected(choice.0),
-                ),
-            ),
-            labeled(
-                "Recorder backend",
-                components::picker(
-                    "Recorder backend",
-                    recorder_choices(),
-                    Some(RecorderChoice(prefs.recorder_backend)),
-                    |choice| Message::PrefRecorderSelected(choice.0),
                 ),
             ),
             labeled(

@@ -146,8 +146,6 @@ pub struct StartDictationRequest {
     #[serde(default)]
     pub language_profile: Option<LanguageProfile>,
     #[serde(default)]
-    pub recorder_backend: Option<RecorderBackend>,
-    #[serde(default)]
     pub translate_to_english: bool,
     #[serde(default)]
     pub keep_audio: bool,
@@ -162,27 +160,17 @@ pub struct StartDictationRequest {
     pub provider_id: Option<String>,
 }
 
-/// Audio capture backend preference. `Auto` lets the daemon pick the
-/// first reachable subsystem; the explicit variants override that
-/// probing for deterministic CI and operator overrides.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderBackend {
-    Auto,
-    Pipewire,
-    Alsa,
-}
-
 /// Describes how audio capture should be segmented for transcription.
 ///
-/// `OneShot` (the default) keeps the pre-Phase-3 behavior: a single recorder
-/// subprocess runs from start to stop and the entire audio file is
-/// transcribed once at the end.
+/// `OneShot` (the default) captures continuously from start to stop and the
+/// entire audio is transcribed once at the end.
 ///
-/// `Fixed` rolls the recorder every `segment_secs` seconds and streams each
-/// finalized chunk to the worker while the next chunk captures, so stop-to-text
-/// latency stays bounded by the chunk length plus the configured whisper
-/// warm-state cost rather than the full session length.
+/// `Fixed` cuts `segment_secs`-sized chunks out of the continuous capture
+/// buffer and streams each chunk to the worker while capture continues, so
+/// stop-to-text latency stays bounded by the chunk length plus the
+/// configured whisper warm-state cost rather than the full session length.
+/// Chunks are cut from one uninterrupted stream, so no audio is lost at
+/// chunk boundaries.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum SegmentationMode {
@@ -190,15 +178,13 @@ pub enum SegmentationMode {
     OneShot,
     Fixed {
         segment_secs: u32,
-        #[serde(default)]
-        overlap_secs: u32,
     },
-    /// VAD-gated segmentation. The recorder rolls every `probe_secs`
-    /// seconds; each probe is classified by the Python worker's
-    /// `segment_probe` RPC. The orchestrator accumulates speech probes
-    /// into a pending buffer and flushes them as one logical speech unit
-    /// on the first run of `silence_gap_probes` silent probes or when the
-    /// buffered duration reaches `max_segment_secs` (whichever comes
+    /// VAD-gated segmentation. The capture buffer is probed every
+    /// `probe_secs` seconds; each probe is classified by the Python
+    /// worker's `segment_probe` RPC. The orchestrator accumulates speech
+    /// probes into a pending window and flushes it as one logical speech
+    /// unit on the first run of `silence_gap_probes` silent probes or when
+    /// the buffered duration reaches `max_segment_secs` (whichever comes
     /// first). Flushed units are transcribed in the background, exactly
     /// as in `Fixed` mode.
     VadGated {
@@ -223,8 +209,6 @@ pub struct DictationCaptureRequest {
     pub language_profile: Option<LanguageProfile>,
     pub duration_seconds: u32,
     #[serde(default)]
-    pub recorder_backend: Option<RecorderBackend>,
-    #[serde(default)]
     pub translate_to_english: bool,
     #[serde(default)]
     pub keep_audio: bool,
@@ -235,21 +219,6 @@ pub struct DictationCaptureRequest {
     pub provider_id: Option<String>,
 }
 
-/// Classification a [`DictationCaptureResult`] carries when a capture
-/// completes in a degraded state; clients use it to pick the right
-/// retry path (recorder vs ASR vs injection).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DictationFailureKind {
-    /// The recorder subprocess failed to capture audio or stop cleanly.
-    RecordingFailed,
-    /// The ASR worker reached the audio but failed to produce a transcript.
-    AsrFailed,
-    /// The transcript was produced but injecting it into the foreground target failed.
-    /// Only the client (CLI, desktop shell) can classify this; the daemon never sets it.
-    InjectionFailed,
-}
-
 /// Reply for one-shot capture and the final body emitted when a long
 /// session stops. Carries the session snapshot, the transcript, the
 /// retained audio path (if any), and an optional failure classification.
@@ -258,8 +227,6 @@ pub struct DictationCaptureResult {
     pub session: CaptureSession,
     pub transcription: TranscriptionResult,
     pub audio_file: Option<String>,
-    #[serde(default)]
-    pub failure_kind: Option<DictationFailureKind>,
 }
 
 /// Body of `POST /v1/dictation/stop`. Targets a single in-flight
@@ -484,6 +451,32 @@ pub struct StitchWavSegmentsResult {
 /// Reply for `GET /v1/healthz`. Pairs the daemon's own status with a
 /// summary of the Python worker so operators can probe both layers in
 /// one round trip.
+/// RFC 9457 problem details returned by the daemon on non-2xx responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProblemDetails {
+    #[serde(rename = "type")]
+    pub problem_type: String,
+    pub title: String,
+    pub status: u16,
+    pub detail: String,
+}
+
+impl ProblemDetails {
+    pub fn new(
+        problem_type: impl Into<String>,
+        title: impl Into<String>,
+        status: u16,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            problem_type: problem_type.into(),
+            title: title.into(),
+            status,
+            detail: detail.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse {
     pub status: String,
@@ -552,34 +545,137 @@ pub struct WorkerHealthSummary {
     pub llm_endpoint: Option<String>,
     pub llm_reachable: bool,
     pub llm_error: Option<String>,
-    pub global_shortcuts_portal_available: bool,
-    pub global_shortcuts_portal_version: Option<u32>,
-    pub global_shortcuts_portal_error: Option<String>,
+    pub global_hotkeys_available: bool,
+    pub global_hotkeys_backend: Option<String>,
+    pub global_hotkeys_detail: Option<String>,
     pub message: Option<String>,
 }
 
 /// One SSE payload published on the daemon's event stream. Carries a
 /// loosely-typed `event_type` plus enough context (`session_id`,
 /// `message`, timestamp) for clients to reconstruct lifecycle order.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Typed daemon event streamed over `GET /v1/events/stream` (SSE).
+/// The serde tag (`event_type`) doubles as the SSE `event:` field via
+/// [`DaemonEvent::name`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    DictationSessionCreated {
+        session_id: Uuid,
+    },
+    DictationListening {
+        session_id: Uuid,
+    },
+    DictationTranscribing {
+        session_id: Uuid,
+    },
+    DictationCompleted {
+        session_id: Uuid,
+        transcript_chars: usize,
+    },
+    DictationFailed {
+        session_id: Uuid,
+        detail: String,
+    },
+    DictationSegmentedStarted {
+        session_id: Uuid,
+        segment_secs: u32,
+    },
+    DictationVadGatedStarted {
+        session_id: Uuid,
+        probe_secs: u32,
+        max_segment_secs: u32,
+        silence_gap_probes: u32,
+    },
+    ProbeAnalyzed {
+        session_id: Uuid,
+        probe_id: u32,
+        has_speech: bool,
+        speech_ratio: f32,
+    },
+    SpeechUnitFlushed {
+        session_id: Uuid,
+        unit_id: u32,
+    },
+    SpeechUnitTranscribed {
+        session_id: Uuid,
+        unit_id: u32,
+        transcript_chars: usize,
+    },
+    SegmentRecorded {
+        session_id: Uuid,
+        segment_id: u32,
+    },
+    SegmentTranscribed {
+        session_id: Uuid,
+        segment_id: u32,
+        transcript_chars: usize,
+    },
+    SegmentTranscribeFailed {
+        session_id: Uuid,
+        segment_id: u32,
+        detail: String,
+    },
+    ComposeJobCreated {
+        title: String,
+    },
+    RewriteJobCreated {
+        title: String,
+    },
+    TranslateJobCreated {
+        title: String,
+    },
+    TranscriptionCompleted {
+        transcript_chars: usize,
+    },
+    WorkerProvidersUnavailable {
+        detail: String,
+    },
+    /// Synthesized by the SSE handler when a subscriber lagged behind the
+    /// broadcast channel; carries the number of dropped events.
+    EventsLost {
+        count: u64,
+    },
+}
+
+impl DaemonEvent {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::DictationSessionCreated { .. } => "dictation_session_created",
+            Self::DictationListening { .. } => "dictation_listening",
+            Self::DictationTranscribing { .. } => "dictation_transcribing",
+            Self::DictationCompleted { .. } => "dictation_completed",
+            Self::DictationFailed { .. } => "dictation_failed",
+            Self::DictationSegmentedStarted { .. } => "dictation_segmented_started",
+            Self::DictationVadGatedStarted { .. } => "dictation_vad_gated_started",
+            Self::ProbeAnalyzed { .. } => "probe_analyzed",
+            Self::SpeechUnitFlushed { .. } => "speech_unit_flushed",
+            Self::SpeechUnitTranscribed { .. } => "speech_unit_transcribed",
+            Self::SegmentRecorded { .. } => "segment_recorded",
+            Self::SegmentTranscribed { .. } => "segment_transcribed",
+            Self::SegmentTranscribeFailed { .. } => "segment_transcribe_failed",
+            Self::ComposeJobCreated { .. } => "compose_job_created",
+            Self::RewriteJobCreated { .. } => "rewrite_job_created",
+            Self::TranslateJobCreated { .. } => "translate_job_created",
+            Self::TranscriptionCompleted { .. } => "transcription_completed",
+            Self::WorkerProvidersUnavailable { .. } => "worker_providers_unavailable",
+            Self::EventsLost { .. } => "events_lost",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventEnvelope {
-    pub event_type: String,
-    pub session_id: Option<Uuid>,
     pub created_at_millis: u64,
-    pub message: String,
+    #[serde(flatten)]
+    pub event: DaemonEvent,
 }
 
 impl EventEnvelope {
-    pub fn new(
-        event_type: impl Into<String>,
-        session_id: Option<Uuid>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn new(event: DaemonEvent) -> Self {
         Self {
-            event_type: event_type.into(),
-            session_id,
             created_at_millis: now_epoch_millis(),
-            message: message.into(),
+            event,
         }
     }
 }
@@ -607,41 +703,17 @@ pub fn now_epoch_millis() -> u64 {
 mod tests {
     use super::{
         CaptureSession, ComposeRequest, CompositionArchetype, CompositionReceipt,
-        DictationCaptureRequest, DictationCaptureResult, DictationFailureKind, HealthResponse,
-        InjectRequest, InjectTarget, InjectionPlan, LanguageProfile, LanguageStrategy,
-        PreviewArtifact, PreviewStatus, RecorderBackend, RewriteRequest, RewriteStyle,
-        SegmentationMode, SessionMode, SessionState, StartDictationRequest, StopDictationRequest,
-        TranscribeRequest, TranscriptionResult, TranslateRequest, TriggerKind, WorkerHealthSummary,
+        DictationCaptureRequest, DictationCaptureResult, HealthResponse, InjectRequest,
+        InjectTarget, InjectionPlan, LanguageProfile, LanguageStrategy, PreviewArtifact,
+        PreviewStatus, RewriteRequest, RewriteStyle, SegmentationMode, SessionMode, SessionState,
+        StartDictationRequest, StopDictationRequest, TranscribeRequest, TranscriptionResult,
+        TranslateRequest, TriggerKind, WorkerHealthSummary,
     };
     // `ProviderDescriptor` and `ProviderKind` live in `provider.rs`;
     // pulled in here because the openapi drift guard machinery is
     // centralised in this module's tests rather than duplicated.
     use crate::{ProviderDescriptor, ProviderKind};
     use uuid::Uuid;
-
-    #[test]
-    fn dictation_failure_kind_serializes_to_snake_case_variants() {
-        assert_eq!(
-            serde_json::to_string(&DictationFailureKind::RecordingFailed).unwrap(),
-            "\"recording_failed\""
-        );
-        assert_eq!(
-            serde_json::to_string(&DictationFailureKind::AsrFailed).unwrap(),
-            "\"asr_failed\""
-        );
-        assert_eq!(
-            serde_json::to_string(&DictationFailureKind::InjectionFailed).unwrap(),
-            "\"injection_failed\""
-        );
-    }
-
-    #[test]
-    fn dictation_failure_kind_round_trips_through_json() {
-        let original = DictationFailureKind::AsrFailed;
-        let encoded = serde_json::to_string(&original).unwrap();
-        let decoded: DictationFailureKind = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, original);
-    }
 
     // Drift guard template for `components.schemas.<Name>` blocks in
     // openapi/voicelayerd.v1.yaml. Adding a `pub` field to a guarded
@@ -854,7 +926,6 @@ mod tests {
 
     /// Parse a top-level string-enum schema's `enum: [...]` line.
     ///
-    /// Targets schemas like `RecorderBackend` whose entire body is a
     /// `type: string` plus an inline `enum: [...]` at the schema's own
     /// property indent (six spaces). Returns the enum values in source
     /// order, or an empty vec when no top-level enum is declared.
@@ -976,57 +1047,6 @@ mod tests {
     ///
     /// Pair this with an `enumerate_*_variants` helper whose body
     /// matches every variant exhaustively, so adding a new Rust
-    /// variant fails compile until the helper is updated.
-    fn assert_openapi_documents_every_string_enum_variant<T: serde::Serialize>(
-        schema_name: &str,
-        rust_variants: &[T],
-    ) {
-        let openapi_path = format!(
-            "{}/../../openapi/voicelayerd.v1.yaml",
-            env!("CARGO_MANIFEST_DIR"),
-        );
-        let contents =
-            std::fs::read_to_string(&openapi_path).expect("openapi contract file should exist");
-        let section = isolate_schema_section(&contents, schema_name);
-        assert!(
-            !section.is_empty(),
-            "schema component {schema_name} not found in openapi file",
-        );
-
-        let openapi_variants = parse_top_level_string_enum(&section);
-        assert!(
-            !openapi_variants.is_empty(),
-            "openapi {schema_name} schema has no top-level `enum:` list — \
-             use the struct drift guard instead, this helper is for pure enums",
-        );
-
-        let rust_serialized: Vec<String> = rust_variants
-            .iter()
-            .map(|variant| match serde_json::to_value(variant) {
-                Ok(serde_json::Value::String(s)) => s,
-                Ok(other) => {
-                    panic!("{schema_name} variant must serialize to a JSON string; got {other:?}",)
-                }
-                Err(err) => panic!("{schema_name} variant must serialize: {err}"),
-            })
-            .collect();
-
-        for serialized in &rust_serialized {
-            assert!(
-                openapi_variants.iter().any(|value| value == serialized),
-                "openapi {schema_name} enum is missing `{serialized}` (rust enum has it). \
-                 Update openapi/voicelayerd.v1.yaml to keep the contract in sync.",
-            );
-        }
-        for openapi_variant in &openapi_variants {
-            assert!(
-                rust_serialized.iter().any(|value| value == openapi_variant),
-                "openapi {schema_name} enum lists `{openapi_variant}` but the rust enum does not. \
-                 Either add the variant to the rust enum or drop it from the openapi list.",
-            );
-        }
-    }
-
     /// Cross-check every variant of a Rust `#[serde(tag = "...")]`
     /// enum against an openapi `oneOf` schema's discriminator values.
     /// Each Rust variant must serialize to a JSON object that contains
@@ -3056,9 +3076,9 @@ components:
             llm_endpoint: None,
             llm_reachable: false,
             llm_error: None,
-            global_shortcuts_portal_available: false,
-            global_shortcuts_portal_version: None,
-            global_shortcuts_portal_error: None,
+            global_hotkeys_available: false,
+            global_hotkeys_backend: None,
+            global_hotkeys_detail: None,
             message: None,
         }
     }
@@ -3092,24 +3112,6 @@ components:
         }
     }
 
-    /// Materialise every `RecorderBackend` variant with a compile-time
-    /// exhaustiveness guard. The unused closure forces a missing-arm
-    /// error if a future variant is added without updating the list,
-    /// so the openapi drift guard cannot silently fall behind the rust
-    /// enum.
-    fn enumerate_recorder_backend_variants() -> Vec<RecorderBackend> {
-        let _exhaustive: fn(RecorderBackend) -> &'static str = |variant| match variant {
-            RecorderBackend::Auto => "auto",
-            RecorderBackend::Pipewire => "pipewire",
-            RecorderBackend::Alsa => "alsa",
-        };
-        vec![
-            RecorderBackend::Auto,
-            RecorderBackend::Pipewire,
-            RecorderBackend::Alsa,
-        ]
-    }
-
     /// Materialise every `SegmentationMode` variant. The exhaustiveness
     /// closure pins the discriminator labels every new variant must
     /// add to the openapi `oneOf` schema. The numeric payload values
@@ -3123,32 +3125,12 @@ components:
         };
         vec![
             SegmentationMode::OneShot,
-            SegmentationMode::Fixed {
-                segment_secs: 0,
-                overlap_secs: 0,
-            },
+            SegmentationMode::Fixed { segment_secs: 0 },
             SegmentationMode::VadGated {
                 probe_secs: 0,
                 max_segment_secs: 0,
                 silence_gap_probes: 0,
             },
-        ]
-    }
-
-    /// Materialise every `DictationFailureKind` variant. The
-    /// exhaustiveness closure pins the wire labels alongside the
-    /// openapi `failure_kind` enum entries; `null` is the absence of a
-    /// variant and is contributed by `Option<_>`, not the enum itself.
-    fn enumerate_dictation_failure_kind_variants() -> Vec<DictationFailureKind> {
-        let _exhaustive: fn(DictationFailureKind) -> &'static str = |variant| match variant {
-            DictationFailureKind::RecordingFailed => "recording_failed",
-            DictationFailureKind::AsrFailed => "asr_failed",
-            DictationFailureKind::InjectionFailed => "injection_failed",
-        };
-        vec![
-            DictationFailureKind::RecordingFailed,
-            DictationFailureKind::AsrFailed,
-            DictationFailureKind::InjectionFailed,
         ]
     }
 
@@ -3416,7 +3398,6 @@ components:
             session: capture_session_sentinel(),
             transcription: transcription_result_sentinel(),
             audio_file: None,
-            failure_kind: None,
         };
         assert_openapi_documents_every_field("DictationCaptureResult", &sentinel, &[]);
     }
@@ -3433,7 +3414,6 @@ components:
         let sentinel = StartDictationRequest {
             trigger: TriggerKind::Cli,
             language_profile: None,
-            recorder_backend: None,
             translate_to_english: false,
             keep_audio: false,
             segmentation: SegmentationMode::OneShot,
@@ -3465,7 +3445,6 @@ components:
             trigger: TriggerKind::Cli,
             language_profile: None,
             duration_seconds: 0,
-            recorder_backend: None,
             translate_to_english: false,
             keep_audio: false,
             provider_id: None,
@@ -3539,14 +3518,6 @@ components:
     // pin the variant set of an embedded enum.
 
     #[test]
-    fn openapi_recorder_backend_documents_every_variant() {
-        assert_openapi_documents_every_string_enum_variant(
-            "RecorderBackend",
-            &enumerate_recorder_backend_variants(),
-        );
-    }
-
-    #[test]
     fn openapi_segmentation_mode_documents_every_discriminator() {
         assert_openapi_documents_every_oneof_discriminator(
             "SegmentationMode",
@@ -3560,15 +3531,6 @@ components:
     // component. The struct-shape and top-level-enum guards above do
     // not cover this case, so a forgotten `failure_kind` variant
     // (rust adds, openapi doesn't, or vice versa) would slip through.
-
-    #[test]
-    fn openapi_dictation_capture_result_failure_kind_documents_every_variant() {
-        assert_openapi_documents_every_property_enum_variant(
-            "DictationCaptureResult",
-            "failure_kind",
-            &enumerate_dictation_failure_kind_variants(),
-        );
-    }
 
     #[test]
     fn openapi_rewrite_request_style_documents_every_variant() {
@@ -5750,23 +5712,5 @@ pub struct GenericThing<T> { _phantom: std::marker::PhantomData<T> }
             "now_epoch_millis() went backwards: {first} then {second}",
         );
         assert!(first > 0, "epoch ms must be a real wall-clock value");
-    }
-
-    /// Every `DictationFailureKind` variant must serialise to
-    /// snake_case on the wire so the openapi enum strings and the
-    /// client SDKs stay aligned with the Rust source of truth.
-    #[test]
-    fn dictation_failure_kind_every_variant_serializes_to_snake_case() {
-        for (variant, expected) in [
-            (DictationFailureKind::RecordingFailed, "recording_failed"),
-            (DictationFailureKind::AsrFailed, "asr_failed"),
-            (DictationFailureKind::InjectionFailed, "injection_failed"),
-        ] {
-            let encoded = serde_json::to_string(&variant).expect("serialise variant");
-            assert_eq!(encoded, format!("\"{expected}\""));
-            let decoded: DictationFailureKind =
-                serde_json::from_str(&encoded).expect("round-trip variant");
-            assert_eq!(decoded, variant);
-        }
     }
 }

@@ -25,9 +25,8 @@ use uuid::Uuid;
 use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionArchetype, CompositionReceipt,
     DictationCaptureRequest, DictationCaptureResult, EventEnvelope, HealthResponse, InjectRequest,
-    InjectTarget, InjectionPlan, ProviderDescriptor, ProviderKind, RecorderBackend, RewriteRequest,
-    RewriteStyle, StartDictationRequest, TranslateRequest, TriggerKind,
-    is_supported_transcribe_provider_id,
+    InjectTarget, InjectionPlan, ProviderDescriptor, ProviderKind, RewriteRequest, RewriteStyle,
+    StartDictationRequest, TranslateRequest, TriggerKind, is_supported_transcribe_provider_id,
 };
 use voicelayer_ui::a11y::Accessibility;
 
@@ -202,7 +201,6 @@ pub enum Message {
     // Settings (local preferences).
     PrefOutputLanguageEdited(String),
     PrefInjectTargetSelected(InjectTarget),
-    PrefRecorderSelected(RecorderBackend),
     PrefCaptureSecondsSelected(u32),
     PrefGlassOpacityChanged(f32),
     PrefReduceTransparencyToggled,
@@ -636,10 +634,6 @@ impl App {
                 self.preferences.default_inject_target = target;
                 Task::none()
             }
-            Message::PrefRecorderSelected(backend) => {
-                self.preferences.recorder_backend = backend;
-                Task::none()
-            }
             Message::PrefCaptureSecondsSelected(seconds) => {
                 self.preferences.capture_seconds = seconds;
                 Task::none()
@@ -753,7 +747,6 @@ impl App {
         let request = StartDictationRequest {
             trigger: TriggerKind::TrayButton,
             language_profile: language_profile_from_input(&self.dictation_language),
-            recorder_backend: Some(self.preferences.recorder_backend),
             translate_to_english,
             keep_audio: false,
             segmentation: self.dictation_segmentation.to_mode(),
@@ -788,7 +781,6 @@ impl App {
             trigger: TriggerKind::TrayButton,
             language_profile: language_profile_from_input(&self.dictation_language),
             duration_seconds: self.preferences.capture_seconds,
-            recorder_backend: Some(self.preferences.recorder_backend),
             translate_to_english,
             keep_audio: false,
             provider_id: self.dictation_provider.clone(),
@@ -1473,7 +1465,12 @@ mod tests {
         app.dictation_provider = Some("whisper_cpp".to_owned());
         app.sessions = Some(Vec::new());
         app.sessions_error = Some("old history error".to_owned());
-        app.last_event = Some(EventEnvelope::new("ready", None, "old daemon"));
+        app.last_event = Some(EventEnvelope::new(
+            voicelayer_core::DaemonEvent::DictationCompleted {
+                session_id: uuid::Uuid::nil(),
+                transcript_chars: 0,
+            },
+        ));
         app.session.stage = SessionStage::Completed;
         app.session.transcript = Some("old transcript".to_owned());
 
@@ -1555,7 +1552,10 @@ mod tests {
         )));
         drop(app.update(Message::EventReceived(
             0,
-            EventEnvelope::new("stale", None, "old daemon"),
+            EventEnvelope::new(voicelayer_core::DaemonEvent::DictationFailed {
+                session_id: uuid::Uuid::nil(),
+                detail: "old daemon".to_owned(),
+            }),
         )));
 
         assert_eq!(app.daemon, DaemonStatus::Unknown);

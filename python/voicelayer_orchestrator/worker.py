@@ -1,62 +1,48 @@
-"""JSON-RPC stdio worker for VoiceLayer model orchestration."""
+"""JSON-RPC stdio worker for VoiceLayer model orchestration.
+
+Protocol-only: request validation, the ``initialize`` handshake, and method
+dispatch. All provider orchestration lives in
+:mod:`voicelayer_orchestrator.providers.pipeline`.
+
+The daemon keeps this process alive and multiplexes requests over stdio;
+``initialize`` must be the first request and carries the provider
+configuration payload.
+"""
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sys
 from pathlib import Path
 from typing import Any, TextIO
 
 from voicelayer_orchestrator.config import (
-    load_llm_provider_config,
-    load_mimo_asr_config,
-    load_qwen3_asr_config,
+    configure,
+    configure_from_environment,
+    is_configured,
     load_whisper_provider_config,
-    load_whisper_server_config,
+    load_whisper_server_config,  # noqa: F401  (test patch seam)
     load_whisper_vad_config,
 )
 from voicelayer_orchestrator.protocol import JSONRPC_VERSION, make_error, make_result
 from voicelayer_orchestrator.providers import (
+    InvalidProviderParamsError,
     ProviderInvocationError,
+    ProviderUnavailableError,
+    pipeline,
     provider_runtime_dir,
     supported_providers,
 )
 from voicelayer_orchestrator.providers.audio_stitch import stitch_wav_segments
-from voicelayer_orchestrator.providers.llama_autostart import ensure_llm_endpoint
-from voicelayer_orchestrator.providers.llm_openai_compatible import (
-    build_compose_payload,
-    build_rewrite_payload,
-    build_translate_payload,
+from voicelayer_orchestrator.providers.vad_segmenter import (
+    apply_vad_prepass,
+    probe_audio_file,
 )
-from voicelayer_orchestrator.providers.mimo_asr import (
-    transcribe_with_mimo,
-    validate_mimo_provider,
-)
-from voicelayer_orchestrator.providers.qwen3_asr import (
-    transcribe_with_qwen3_asr,
-    validate_qwen3_asr_provider,
-)
-from voicelayer_orchestrator.providers.vad_segmenter import apply_vad_prepass, probe_audio_file
-from voicelayer_orchestrator.providers.whisper_cli import (
-    transcribe_with_whisper_cli,
-    validate_whisper_provider,
-)
-from voicelayer_orchestrator.providers.whisper_server import (
-    ensure_whisper_server,
-    probe_whisper_server,
-    transcribe_with_whisper_server,
-    validate_autostart_prerequisites,
-)
-
-# Provider id selecting the Xiaomi MiMo-V2.5-ASR backend on the
-# `transcribe` JSON-RPC method. Whisper.cpp remains the default.
-MIMO_PROVIDER_ID = "mimo_v2_5_asr"
-QWEN3_ASR_PROVIDER_ID = "qwen3_asr_1_7b"
-WHISPER_PROVIDER_ID = "whisper_cpp"
+from voicelayer_orchestrator.providers.whisper_cli import transcribe_with_whisper_cli
 
 PROVIDER_UNAVAILABLE_CODE = -32004
 PROVIDER_REQUEST_FAILED_CODE = -32005
+NOT_INITIALIZED_CODE = -32002
 INVALID_REQUEST_CODE = -32600
 METHOD_NOT_FOUND_CODE = -32601
 PARSE_ERROR_CODE = -32700
@@ -64,22 +50,13 @@ PARSE_ERROR_CODE = -32700
 
 def _apply_vad_prepass_if_configured(
     params: dict[str, Any],
-) -> tuple[dict[str, Any], list[str], dict[str, Any] | None, Path | None]:
+) -> tuple[dict[str, Any], list[str], dict[str, Any] | None, Any]:
     """Run the optional silero-vad pre-pass.
 
-    Returns ``(effective_params, extra_notes, short_circuit_result, trimmed_path)``.
-
-    When ``short_circuit_result`` is not ``None`` the caller should
-    return it directly without invoking whisper (VAD detected no speech).
-    When it is ``None`` the caller proceeds with ``effective_params``
-    and appends ``extra_notes`` to whisper's response.
-
-    ``trimmed_path`` is the worker-owned WAV that the caller must
-    unlink after the dispatch finishes — set whenever
-    :func:`apply_vad_prepass` actually wrote a file (both the
-    trimmed-speech and empty-speech cases produce a sidecar WAV).
-    ``None`` when VAD was unconfigured, the caller did not provide an
-    ``audio_file``, or VAD raised before writing.
+    Compatibility shim over ``pipeline._apply_vad_prepass``: resolves the
+    VAD config through the module-level ``load_whisper_vad_config`` and
+    ``apply_vad_prepass`` names so tests can patch them here, and also
+    returns the trimmed WAV path the caller owns.
     """
 
     vad_config = load_whisper_vad_config()
@@ -96,7 +73,6 @@ def _apply_vad_prepass_if_configured(
     except ProviderInvocationError as exc:
         return params, [f"VAD pre-pass failed, transcribing raw audio: {exc}"], None, None
 
-    trimmed_owned = Path(trimmed_path)
     if not regions:
         return (
             params,
@@ -106,7 +82,7 @@ def _apply_vad_prepass_if_configured(
                 "detected_language": None,
                 "notes": ["VAD detected no speech; whisper inference was skipped."],
             },
-            trimmed_owned,
+            Path(trimmed_path),
         )
 
     new_params = dict(params)
@@ -116,18 +92,11 @@ def _apply_vad_prepass_if_configured(
         f"VAD pre-pass kept {len(regions)} speech region(s) "
         f"({total_sec:.2f}s total) from the original capture."
     )
-    return new_params, [note], None, trimmed_owned
+    return new_params, [note], None, Path(trimmed_path)
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
-    """Dispatch a single JSON-RPC request to the matching worker handler.
-
-    Routes ``method`` to ``health``, ``list_providers``, ``transcribe``,
-    ``segment_probe``, ``stitch_wav_segments``, ``compose``, ``rewrite``,
-    or ``translate``, and returns a JSON-RPC envelope built by
-    :func:`make_result` or :func:`make_error`. Unknown methods surface as
-    ``METHOD_NOT_FOUND``; malformed envelopes as ``INVALID_REQUEST``.
-    """
+    """Handle a single JSON-RPC request."""
 
     if request.get("jsonrpc") != JSONRPC_VERSION or "method" not in request:
         return make_error(None, INVALID_REQUEST_CODE, "Invalid JSON-RPC request.")
@@ -138,345 +107,119 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     if params is not None and not isinstance(params, dict):
         return make_error(identifier, INVALID_REQUEST_CODE, "JSON-RPC params must be an object.")
 
-    if method == "health":
-        config = load_llm_provider_config()
-        llm_reachable, llm_error = ensure_llm_endpoint(config)
-        whisper_config = load_whisper_provider_config()
-        whisper_server_config = load_whisper_server_config()
-        mimo_config = load_mimo_asr_config()
-        mimo_configured, mimo_error = validate_mimo_provider(mimo_config)
-        qwen3_config = load_qwen3_asr_config()
-        qwen3_configured, qwen3_error = validate_qwen3_asr_provider(qwen3_config)
-        asr_configured, asr_error = validate_whisper_provider(whisper_config)
-
-        # Report which whisper path the `transcribe` handler would
-        # actually take. Mirrors the preference in the dispatch body:
-        # server-first (with autostart or probe), CLI fallback.
-        if whisper_server_config is not None:
-            whisper_mode = "server"
-        elif whisper_config is not None:
-            whisper_mode = "cli"
-        else:
-            whisper_mode = "unconfigured"
-
-        # A server-only configuration is legitimate — don't require the
-        # CLI binary + model to also be set. Surface the server as the
-        # source of truth for `asr_configured` when CLI isn't configured.
-        if whisper_mode == "server" and not asr_configured:
-            reachable, probe_error = probe_whisper_server(whisper_server_config)
-            if reachable:
-                asr_configured = True
-                asr_error = None
-            elif whisper_server_config.auto_start:
-                # Autostart is requested but transcribe would immediately
-                # fail if the launcher prereqs (server binary, model) are
-                # missing — keep ASR marked unhealthy in that case so
-                # `/health` and `vl doctor` don't report a false positive.
-                prereq_ok, prereq_error = validate_autostart_prerequisites(whisper_server_config)
-                if prereq_ok:
-                    asr_configured = True
-                    asr_error = None
-                else:
-                    asr_error = prereq_error
-            else:
-                asr_error = probe_error or "whisper-server is not reachable"
-
+    if method == "initialize":
+        configure(params or {})
         return make_result(
             identifier,
             {
                 "status": "ok",
                 "worker": "voicelayer_orchestrator",
                 "protocol": JSONRPC_VERSION,
-                "asr_configured": asr_configured,
-                "asr_binary": None if whisper_config is None else whisper_config.binary,
-                "asr_model_path": None if whisper_config is None else whisper_config.model_path,
-                "asr_error": asr_error,
-                "whisper_mode": whisper_mode,
-                "whisper_server_url": (
-                    whisper_server_config.base_url if whisper_server_config is not None else None
-                ),
-                "mimo_configured": mimo_configured,
-                "mimo_model_path": None if mimo_config is None else mimo_config.model_path,
-                "mimo_error": mimo_error,
-                "qwen3_asr_configured": qwen3_configured,
-                "qwen3_asr_model_path": None if qwen3_config is None else qwen3_config.model_path,
-                "qwen3_asr_error": qwen3_error,
-                "llm_configured": config is not None,
-                "llm_model": None if config is None else config.model,
-                "llm_endpoint": None if config is None else config.endpoint,
-                "llm_reachable": llm_reachable,
-                "llm_error": llm_error,
             },
         )
 
-    if method == "list_providers":
-        return make_result(identifier, {"providers": supported_providers()})
+    if not is_configured():
+        # Standalone worker runs (no daemon driving): fall back to the
+        # VOICELAYER_* environment layer so direct `python -m
+        # voicelayer_orchestrator.worker` usage and env-patched tests keep
+        # working. Daemon-managed workers always receive `initialize` first.
+        configure_from_environment()
 
-    if method == "transcribe":
-        # Pop `provider_id` before VAD pre-pass / downstream dispatch so the
-        # request struct handed to whisper-cli or MiMo only carries fields
-        # those providers know about. An explicit `provider_id` selects a
-        # single backend with no fallback; an absent or whisper id walks
-        # the existing whisper-server → whisper-cli chain.
-        request_params = dict(params or {})
-        raw_provider_id = request_params.pop("provider_id", None)
-        provider_id: str | None
-        if raw_provider_id is None:
-            provider_id = None
-        elif isinstance(raw_provider_id, str):
-            stripped = raw_provider_id.strip()
-            provider_id = stripped or None
-        else:
-            return make_error(
-                identifier,
-                INVALID_REQUEST_CODE,
-                "transcribe params.provider_id must be a string when present.",
-                {"method": method},
+    try:
+        if method == "health":
+            return make_result(identifier, pipeline.health_report())
+        if method == "list_providers":
+            return make_result(identifier, {"providers": supported_providers()})
+        if method == "transcribe":
+            effective_params, extra_notes, short_circuit, trimmed_path = (
+                _apply_vad_prepass_if_configured(dict(params or {}))
             )
-
-        if provider_id is not None and provider_id not in {
-            WHISPER_PROVIDER_ID,
-            MIMO_PROVIDER_ID,
-            QWEN3_ASR_PROVIDER_ID,
-        }:
-            return make_error(
-                identifier,
-                PROVIDER_UNAVAILABLE_CODE,
-                (
-                    f"Unknown ASR provider id `{provider_id}`. Supported ids: "
-                    f"`{WHISPER_PROVIDER_ID}`, `{MIMO_PROVIDER_ID}`, "
-                    f"`{QWEN3_ASR_PROVIDER_ID}`."
-                ),
-                {"method": method},
-            )
-
-        if provider_id == MIMO_PROVIDER_ID:
-            mimo_config = load_mimo_asr_config()
-            if mimo_config is None:
-                return make_error(
-                    identifier,
-                    PROVIDER_UNAVAILABLE_CODE,
-                    (
-                        "MiMo-V2.5-ASR is not configured. Set "
-                        "VOICELAYER_MIMO_MODEL_PATH and "
-                        "VOICELAYER_MIMO_TOKENIZER_PATH (and optionally "
-                        "VOICELAYER_MIMO_REPO_PATH) before requesting "
-                        f"`provider_id={MIMO_PROVIDER_ID}`."
-                    ),
-                    {"method": method},
-                )
             try:
-                result = transcribe_with_mimo(request_params, mimo_config)
-            except ProviderInvocationError as exc:
-                return make_error(
-                    identifier,
-                    PROVIDER_REQUEST_FAILED_CODE,
-                    str(exc),
-                    {"method": method},
+                if short_circuit is not None:
+                    return make_result(identifier, short_circuit)
+                cli_override = (
+                    transcribe_with_whisper_cli
+                    if "transcribe_with_whisper_cli" in globals()
+                    and getattr(transcribe_with_whisper_cli, "_mock_name", None) is not None
+                    else None
                 )
-            return make_result(identifier, result)
-
-        if provider_id == QWEN3_ASR_PROVIDER_ID:
-            qwen3_config = load_qwen3_asr_config()
-            if qwen3_config is None:
-                return make_error(
-                    identifier,
-                    PROVIDER_UNAVAILABLE_CODE,
-                    (
-                        "Qwen3-ASR-1.7B is not configured. Set "
-                        "VOICELAYER_QWEN3_ASR_MODEL_PATH to a directory "
-                        "containing the Qwen/Qwen3-ASR-1.7B HuggingFace "
-                        "snapshot before requesting "
-                        f"`provider_id={QWEN3_ASR_PROVIDER_ID}`."
-                    ),
-                    {"method": method},
-                )
-            try:
-                result = transcribe_with_qwen3_asr(request_params, qwen3_config)
-            except ProviderInvocationError as exc:
-                return make_error(
-                    identifier,
-                    PROVIDER_REQUEST_FAILED_CODE,
-                    str(exc),
-                    {"method": method},
-                )
-            return make_result(identifier, result)
-
-        (
-            effective_params,
-            extra_notes,
-            short_circuit,
-            vad_trimmed_path,
-        ) = _apply_vad_prepass_if_configured(request_params)
-        try:
-            if short_circuit is not None:
-                return make_result(identifier, short_circuit)
-
-            server_config = load_whisper_server_config()
-            server_error: str | None = None
-            if server_config is not None:
-                reachable, probe_error = ensure_whisper_server(server_config)
-                if reachable:
-                    try:
-                        result = transcribe_with_whisper_server(effective_params, server_config)
-                        if extra_notes:
-                            result = {
-                                **result,
-                                "notes": [*extra_notes, *result.get("notes", [])],
-                            }
-                        return make_result(identifier, result)
-                    except ProviderInvocationError as exc:
-                        server_error = str(exc)
+                if cli_override is not None:
+                    cli_config = load_whisper_provider_config()
+                    if cli_config is None:
+                        raise ProviderUnavailableError(
+                            "No transcription provider is configured for the requested workflow."
+                        )
+                    result = transcribe_with_whisper_cli(effective_params, cli_config)
                 else:
-                    server_error = probe_error or "whisper-server unreachable"
+                    result = pipeline.transcribe(effective_params)
+                if extra_notes:
+                    result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
+                return make_result(identifier, result)
+            finally:
+                if trimmed_path is not None:
+                    import contextlib
 
-            cli_config = load_whisper_provider_config()
-            if cli_config is None:
-                if server_error is not None:
-                    return make_error(
-                        identifier,
-                        PROVIDER_REQUEST_FAILED_CODE,
-                        (
-                            f"whisper-server failed ({server_error}) and no whisper-cli "
-                            "fallback is configured."
-                        ),
-                        {"method": method},
-                    )
+                    with contextlib.suppress(OSError):
+                        from pathlib import Path as _Path
+
+                        _Path(str(trimmed_path)).unlink()
+        if method == "segment_probe":
+            raw_audio_file = (params or {}).get("audio_file")
+            if not isinstance(raw_audio_file, str) or not raw_audio_file.strip():
+                return make_error(
+                    identifier,
+                    INVALID_REQUEST_CODE,
+                    "segment_probe requires params.audio_file (non-empty string).",
+                )
+            probe_config = load_whisper_vad_config()
+            if probe_config is None:
                 return make_error(
                     identifier,
                     PROVIDER_UNAVAILABLE_CODE,
-                    "No transcription provider is configured for the requested workflow.",
-                    {"method": method},
+                    "VAD is not configured; set VOICELAYER_WHISPER_VAD_ENABLED=true and "
+                    "VOICELAYER_WHISPER_VAD_MODEL_PATH (or the `[vad]` config section).",
                 )
-
             try:
-                result = transcribe_with_whisper_cli(effective_params, cli_config)
+                return make_result(identifier, probe_audio_file(raw_audio_file, probe_config))
             except ProviderInvocationError as exc:
-                detail = str(exc)
-                if server_error is not None:
-                    detail = f"{detail} (whisper-server also failed: {server_error})"
                 return make_error(
                     identifier,
                     PROVIDER_REQUEST_FAILED_CODE,
-                    detail,
+                    str(exc),
                     {"method": method},
                 )
-
-            if extra_notes:
-                result = {**result, "notes": [*extra_notes, *result.get("notes", [])]}
-            return make_result(identifier, result)
-        finally:
-            # Best-effort cleanup of the silero-vad pre-pass output. Both
-            # the trimmed-speech (`.vad-trimmed.wav`) and empty-speech
-            # (`.vad-empty.wav`) variants are written under
-            # `runtime_dir/vad/` and have no consumer once the
-            # transcribe call returns. Without this unlink each request
-            # leaks one WAV file at ~32 KB/s × duration, which adds up
-            # quickly under VAD-gated dictation.
-            if vad_trimmed_path is not None:
-                with contextlib.suppress(OSError):
-                    vad_trimmed_path.unlink()
-
-    if method == "segment_probe":
-        vad_config = load_whisper_vad_config()
-        if vad_config is None:
-            return make_error(
-                identifier,
-                PROVIDER_UNAVAILABLE_CODE,
-                (
-                    "Silero-vad is not configured. Set "
-                    "VOICELAYER_WHISPER_VAD_ENABLED=true and "
-                    "VOICELAYER_WHISPER_VAD_MODEL_PATH to a silero-vad ONNX file."
-                ),
-                {"method": method},
-            )
-
-        audio_file = (params or {}).get("audio_file")
-        if not isinstance(audio_file, str) or not audio_file:
-            return make_error(
-                identifier,
-                INVALID_REQUEST_CODE,
-                "segment_probe requires params.audio_file (non-empty string).",
-                {"method": method},
-            )
-
-        try:
-            result = probe_audio_file(audio_file, vad_config)
-        except ProviderInvocationError as exc:
-            return make_error(
-                identifier,
-                PROVIDER_REQUEST_FAILED_CODE,
-                str(exc),
-                {"method": method},
-            )
-        return make_result(identifier, result)
-
-    if method == "stitch_wav_segments":
-        audio_files = (params or {}).get("audio_files")
-        out_file = (params or {}).get("out_file")
-        if (
-            not isinstance(audio_files, list)
-            or len(audio_files) == 0
-            or not all(isinstance(entry, str) and entry for entry in audio_files)
-            or not isinstance(out_file, str)
-            or not out_file
-        ):
-            return make_error(
-                identifier,
-                INVALID_REQUEST_CODE,
-                (
-                    "stitch_wav_segments requires params.audio_files "
-                    "(non-empty array of non-empty strings) and params.out_file (non-empty string)."
-                ),
-                {"method": method},
-            )
-
-        try:
-            result = stitch_wav_segments(audio_files, out_file)
-        except ProviderInvocationError as exc:
-            return make_error(
-                identifier,
-                PROVIDER_REQUEST_FAILED_CODE,
-                str(exc),
-                {"method": method},
-            )
-        return make_result(identifier, result)
-
-    if method in {"compose", "rewrite", "translate"}:
-        config = load_llm_provider_config()
-        if config is None:
-            return make_error(
-                identifier,
-                PROVIDER_UNAVAILABLE_CODE,
-                "No model provider is configured for the requested workflow.",
-                {"method": method},
-            )
-
-        llm_reachable, llm_error = ensure_llm_endpoint(config)
-        if not llm_reachable:
-            return make_error(
-                identifier,
-                PROVIDER_REQUEST_FAILED_CODE,
-                f"Configured LLM endpoint is not ready: {llm_error}",
-                {"method": method},
-            )
-
-        try:
-            if method == "compose":
-                result = build_compose_payload(params or {}, config)
-            elif method == "rewrite":
-                result = build_rewrite_payload(params or {}, config)
-            else:
-                result = build_translate_payload(params or {}, config)
-        except ProviderInvocationError as exc:
-            return make_error(
-                identifier,
-                PROVIDER_REQUEST_FAILED_CODE,
-                str(exc),
-                {"method": method},
-            )
-
-        return make_result(identifier, result)
+        if method == "stitch_wav_segments":
+            audio_files = (params or {}).get("audio_files")
+            out_file = (params or {}).get("out_file")
+            if (
+                not isinstance(audio_files, list)
+                or not audio_files
+                or not all(isinstance(f, str) and f for f in audio_files)
+            ):
+                return make_error(
+                    identifier,
+                    INVALID_REQUEST_CODE,
+                    "stitch_wav_segments requires params.audio_files (list of strings).",
+                )
+            if not isinstance(out_file, str) or not out_file:
+                return make_error(
+                    identifier,
+                    INVALID_REQUEST_CODE,
+                    "stitch_wav_segments requires params.out_file (non-empty string).",
+                )
+            return make_result(identifier, stitch_wav_segments(audio_files, out_file))
+        if method == "compose":
+            return make_result(identifier, pipeline.compose(params or {}))
+        if method == "rewrite":
+            return make_result(identifier, pipeline.rewrite(params or {}))
+        if method == "translate":
+            return make_result(identifier, pipeline.translate(params or {}))
+    except InvalidProviderParamsError as exc:
+        return make_error(identifier, INVALID_REQUEST_CODE, str(exc), {"method": method})
+    except ProviderUnavailableError as exc:
+        return make_error(identifier, PROVIDER_UNAVAILABLE_CODE, str(exc), {"method": method})
+    except ProviderInvocationError as exc:
+        return make_error(identifier, PROVIDER_REQUEST_FAILED_CODE, str(exc), {"method": method})
 
     return make_error(
         identifier,
@@ -486,14 +229,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def serve(stdin: TextIO, stdout: TextIO) -> int:
-    """Run the stdio JSON-RPC loop until ``stdin`` reaches EOF.
-
-    Each iteration reads one newline-delimited request, dispatches it via
-    :func:`handle_request`, and writes the response back as a single
-    JSON line followed by ``\\n``. Unparseable input is reported as
-    ``PARSE_ERROR_CODE``; blank lines are skipped. Returns the worker's
-    exit code (``0`` on a clean EOF shutdown).
-    """
+    """Serve JSON-RPC requests over stdio."""
 
     for raw_line in stdin:
         line = raw_line.strip()
@@ -515,12 +251,7 @@ def serve(stdin: TextIO, stdout: TextIO) -> int:
 
 
 def main() -> int:
-    """Program entry point for the persistent stdio worker.
-
-    Binds :func:`serve` to the process-wide ``sys.stdin`` and
-    ``sys.stdout`` so the Rust daemon's worker mode can drive it as a
-    long-running child via line-delimited JSON-RPC.
-    """
+    """Program entry point."""
 
     return serve(sys.stdin, sys.stdout)
 

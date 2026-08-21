@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Mapping
 from typing import Any
+
+import httpx
 
 from voicelayer_orchestrator.config import OpenAICompatibleConfig
 from voicelayer_orchestrator.providers import ProviderInvocationError
@@ -81,6 +80,12 @@ def render_content_text(content: Any) -> str:
     return ""
 
 
+def _auth_headers(config: OpenAICompatibleConfig) -> dict[str, str]:
+    if config.api_key is None:
+        return {}
+    return {"Authorization": f"Bearer {config.api_key}"}
+
+
 def invoke_chat_completion(
     system_prompt: str,
     user_prompt: str,
@@ -97,30 +102,31 @@ def invoke_chat_completion(
         "temperature": 0.2,
         "stream": False,
     }
-    request = urllib.request.Request(
-        resolve_chat_completions_url(config.endpoint),
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            **({"Authorization": f"Bearer {config.api_key}"} if config.api_key is not None else {}),
-        },
-        method="POST",
-    )
 
     try:
-        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
+        response = httpx.post(
+            resolve_chat_completions_url(config.endpoint),
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                **_auth_headers(config),
+            },
+            timeout=config.timeout_seconds,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip()
         raise ProviderInvocationError(
-            f"Configured LLM endpoint returned HTTP {exc.code}: {detail}"
+            f"Configured LLM endpoint returned HTTP {exc.response.status_code}: {detail}"
         ) from exc
-    except urllib.error.URLError as exc:
-        raise ProviderInvocationError(
-            f"Configured LLM endpoint is unreachable: {exc.reason}"
-        ) from exc
-    except TimeoutError as exc:
+    except httpx.TimeoutException as exc:
         raise ProviderInvocationError("Configured LLM endpoint timed out.") from exc
+    except httpx.HTTPError as exc:
+        raise ProviderInvocationError(f"Configured LLM endpoint is unreachable: {exc}") from exc
+    except ValueError as exc:
+        # response.json() raises json.JSONDecodeError (a ValueError).
+        raise ProviderInvocationError("Configured LLM endpoint returned a non-JSON body.") from exc
 
     try:
         content = body["choices"][0]["message"]["content"]
@@ -138,24 +144,23 @@ def invoke_chat_completion(
 def probe_llm_endpoint(config: OpenAICompatibleConfig) -> tuple[bool, str | None]:
     """Probe the configured LLM endpoint for readiness."""
 
-    request = urllib.request.Request(
-        resolve_models_url(config.endpoint),
-        headers=(
-            {"Authorization": f"Bearer {config.api_key}"} if config.api_key is not None else {}
-        ),
-        method="GET",
-    )
-
     try:
-        with urllib.request.urlopen(request, timeout=min(config.timeout_seconds, 10.0)) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
-        return False, f"HTTP {exc.code}: {detail}"
-    except urllib.error.URLError as exc:
-        return False, f"unreachable: {exc.reason}"
-    except TimeoutError:
+        response = httpx.get(
+            resolve_models_url(config.endpoint),
+            headers=_auth_headers(config),
+            timeout=min(config.timeout_seconds, 10.0),
+        )
+        response.raise_for_status()
+        body = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip()
+        return False, f"HTTP {exc.response.status_code}: {detail}"
+    except httpx.TimeoutException:
         return False, "timeout"
+    except httpx.HTTPError as exc:
+        return False, f"unreachable: {exc}"
+    except ValueError:
+        return False, "non-JSON models response"
 
     if isinstance(body, dict) and isinstance(body.get("data"), list):
         return True, None

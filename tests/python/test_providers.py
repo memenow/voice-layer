@@ -12,6 +12,7 @@ PYTHON_ROOT = PROJECT_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
+from voicelayer_orchestrator.config import reset_configuration_for_tests  # noqa: E402
 from voicelayer_orchestrator.providers import (  # noqa: E402
     collapse_nonspeech_transcript,
     provider_runtime_dir,
@@ -25,6 +26,7 @@ class ReclaimStaleLockTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-lock-test-"))
         self.lock_path = self.tmp_dir / "endpoint.lock"
 
@@ -37,9 +39,10 @@ class ReclaimStaleLockTest(unittest.TestCase):
         # and claim its own argv[0] as the expected binary. argv[0] is
         # usually /usr/bin/python or similar; reading /proc/self/cmdline
         # tells us what the file-name comparison should match.
+        import psutil
+
         my_pid = os.getpid()
-        cmdline = pathlib.Path(f"/proc/{my_pid}/cmdline").read_bytes()
-        argv0 = cmdline.split(b"\x00", 1)[0].decode("utf-8")
+        argv0 = psutil.Process(my_pid).cmdline()[0]
         binary_name = pathlib.Path(argv0).name
         self.lock_path.write_text(str(my_pid), encoding="utf-8")
 
@@ -168,6 +171,7 @@ class ProviderRuntimeDirTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         # Each test owns an isolated tempdir to play the role of
         # `XDG_RUNTIME_DIR`. The mapping passed to the helper is a
         # plain dict so we never mutate `os.environ` and dodge the

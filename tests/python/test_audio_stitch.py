@@ -13,6 +13,7 @@ PYTHON_ROOT = PROJECT_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
+from voicelayer_orchestrator.config import reset_configuration_for_tests  # noqa: E402
 from voicelayer_orchestrator.providers import ProviderInvocationError  # noqa: E402
 from voicelayer_orchestrator.providers.audio_stitch import (  # noqa: E402
     stitch_wav_segments,
@@ -43,6 +44,7 @@ def _write_wav(
 class StitchWavSegmentsHelperTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-stitch-"))
 
     def test_rejects_empty_input_list(self) -> None:
@@ -132,6 +134,7 @@ class StitchWavSegmentsDispatchTest(unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         from voicelayer_orchestrator import worker
 
         self.worker = worker

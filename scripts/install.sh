@@ -22,24 +22,40 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 echo ">> Building voice-layer (release) ..."
-(cd "${REPO_ROOT}" && cargo build --release --bin vl --bin vl-desktop)
+(cd "${REPO_ROOT}" && cargo build --release --bin voicelayerd --bin vl --bin vl-desktop)
 
 echo ">> Installing binaries to ${BIN_DIR}"
 install -d "${BIN_DIR}"
+install -m 0755 "${REPO_ROOT}/target/release/voicelayerd" "${BIN_DIR}/voicelayerd"
 install -m 0755 "${REPO_ROOT}/target/release/vl" "${BIN_DIR}/vl"
 install -m 0755 "${REPO_ROOT}/target/release/vl-desktop" "${BIN_DIR}/vl-desktop"
 install -m 0755 "${REPO_ROOT}/scripts/voicelayer-whisper-server-run.sh" \
   "${BIN_DIR}/voicelayer-whisper-server-run.sh"
 
+OS="$(uname -s)"
+if [[ "${OS}" == "Darwin" ]]; then
+  AGENT_DIR="${HOME}/Library/LaunchAgents"
+  echo ">> Installing launchd agent to ${AGENT_DIR}"
+  install -d "${AGENT_DIR}"
+  sed "s|__HOME__|${HOME}|g" \
+    "${REPO_ROOT}/launchd/com.memenow.voicelayerd.plist" \
+    > "${AGENT_DIR}/com.memenow.voicelayerd.plist"
+elif [[ "${OS}" != "Linux" ]]; then
+  echo "error: unsupported OS ${OS} (expected Linux or Darwin)" >&2
+  exit 1
+fi
+
 echo ">> Installing user-level systemd units to ${UNIT_DIR}"
-install -d "${UNIT_DIR}"
-install -m 0644 "${REPO_ROOT}/systemd/voicelayerd.service" "${UNIT_DIR}/voicelayerd.service"
+if [[ "${OS}" == "Linux" ]]; then
+  install -d "${UNIT_DIR}"
+  install -m 0644 "${REPO_ROOT}/systemd/voicelayerd.service" "${UNIT_DIR}/voicelayerd.service"
 # voicelayer-whisper-server.service is installed but not enabled. Enable
 # it explicitly with `systemctl --user enable --now voicelayer-whisper-server`
 # when you want the daemon to reach whisper-server instead of spawning
 # whisper-cli per request. See docs/guides/systemd.html.
-install -m 0644 "${REPO_ROOT}/systemd/voicelayer-whisper-server.service" \
-  "${UNIT_DIR}/voicelayer-whisper-server.service"
+  install -m 0644 "${REPO_ROOT}/systemd/voicelayer-whisper-server.service" \
+    "${UNIT_DIR}/voicelayer-whisper-server.service"
+fi
 
 echo ">> Seeding environment file (existing file is preserved)"
 install -d "${ENV_DIR}"
@@ -50,7 +66,7 @@ else
   echo "   kept ${ENV_DIR}/voicelayerd.env (no overwrite)"
 fi
 
-if command -v systemctl >/dev/null 2>&1; then
+if [[ "${OS}" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
   echo ">> Reloading user-level systemd manager"
   systemctl --user daemon-reload || echo "   (daemon-reload failed; safe to ignore if systemd --user is unavailable)"
   # If either unit was already running before the install, bounce it so

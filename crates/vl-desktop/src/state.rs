@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use voicelayer_core::{
-    DictationCaptureResult, DictationFailureKind, InjectTarget, LanguageProfile, LanguageStrategy,
-    RecorderBackend, SegmentationMode,
+    DictationCaptureResult, InjectTarget, LanguageProfile, LanguageStrategy, SegmentationMode,
 };
 use voicelayer_ui::a11y::Accessibility;
 
@@ -139,27 +138,15 @@ impl Session {
     }
 
     /// Apply a completed capture: store the transcript, detected language, and
-    /// notes, then settle into `Completed` — or `Failed` when the daemon flagged
-    /// a failure kind, in which case the returned string is a user-facing
-    /// explanation to surface.
+    /// notes, then settle into `Completed`. Daemon failures never reach this
+    /// path — they arrive as an error at the call site (RFC 9457 problem).
     pub fn apply_capture(&mut self, result: DictationCaptureResult) -> Option<String> {
         self.id = None;
         self.transcript = Some(result.transcription.text);
         self.detected_language = result.transcription.detected_language;
         self.notes = result.transcription.notes;
-        match result.failure_kind {
-            Some(kind) => {
-                self.stage = SessionStage::Failed;
-                Some(format!(
-                    "[{}] capture did not complete cleanly",
-                    render_failure_kind(kind)
-                ))
-            }
-            None => {
-                self.stage = SessionStage::Completed;
-                None
-            }
-        }
+        self.stage = SessionStage::Completed;
+        None
     }
 }
 
@@ -183,16 +170,6 @@ pub fn render_session_stage(stage: SessionStage) -> &'static str {
         SessionStage::Stopping => "stopping...",
         SessionStage::Completed => "completed",
         SessionStage::Failed => "failed",
-    }
-}
-
-/// The wire-style label for a dictation failure kind, matching the daemon's
-/// OpenAPI vocabulary so an operator sees the same token in the UI and the logs.
-pub fn render_failure_kind(kind: DictationFailureKind) -> &'static str {
-    match kind {
-        DictationFailureKind::RecordingFailed => "recording_failed",
-        DictationFailureKind::AsrFailed => "asr_failed",
-        DictationFailureKind::InjectionFailed => "injection_failed",
     }
 }
 
@@ -226,10 +203,7 @@ impl SegChoice {
     pub fn to_mode(self) -> SegmentationMode {
         match self {
             SegChoice::OneShot => SegmentationMode::OneShot,
-            SegChoice::Fixed => SegmentationMode::Fixed {
-                segment_secs: 15,
-                overlap_secs: 0,
-            },
+            SegChoice::Fixed => SegmentationMode::Fixed { segment_secs: 15 },
             SegChoice::VadGated => SegmentationMode::VadGated {
                 probe_secs: 1,
                 max_segment_secs: 30,
@@ -270,7 +244,6 @@ pub fn language_profile_from_input(input: &str) -> Option<LanguageProfile> {
 pub struct Preferences {
     pub default_output_language: String,
     pub default_inject_target: InjectTarget,
-    pub recorder_backend: RecorderBackend,
     pub capture_seconds: u32,
     /// User glass opacity, `0.0` (clearest) .. `1.0` (frosted). Persisted.
     pub glass_opacity: f32,
@@ -288,7 +261,6 @@ impl Default for Preferences {
         Self {
             default_output_language: String::new(),
             default_inject_target: InjectTarget::GuiAccessible,
-            recorder_backend: RecorderBackend::Auto,
             capture_seconds: 8,
             glass_opacity: DEFAULT_GLASS_OPACITY,
             reduce_transparency: false,
@@ -322,15 +294,14 @@ pub fn resolve_accessibility(prefs: &Preferences, system: SystemA11y) -> Accessi
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonStatus, DictationFailureKind, HotkeyStatus, Preferences, SegChoice, Session,
-        SessionStage, SystemA11y, WorkflowTab, language_profile_from_input, render_daemon_status,
-        render_failure_kind, render_session_stage, resolve_accessibility,
+        DaemonStatus, HotkeyStatus, Preferences, SegChoice, Session, SessionStage, SystemA11y,
+        WorkflowTab, language_profile_from_input, render_daemon_status, render_session_stage,
+        resolve_accessibility,
     };
     use uuid::Uuid;
     use voicelayer_core::{
         CaptureSession, DictationCaptureResult, InjectTarget, LanguageProfile, LanguageStrategy,
-        RecorderBackend, SegmentationMode, SessionMode, SessionState, TranscriptionResult,
-        TriggerKind,
+        SegmentationMode, SessionMode, SessionState, TranscriptionResult, TriggerKind,
     };
 
     /// Adding a `DaemonStatus` variant forces the `render_*` match to fail
@@ -370,22 +341,6 @@ mod tests {
 
     /// The failure-kind labels are shared with the daemon's OpenAPI wire
     /// vocabulary; pin them so a rename can't silently desync UI from logs.
-    #[test]
-    fn render_failure_kind_matches_wire_vocabulary() {
-        assert_eq!(
-            render_failure_kind(DictationFailureKind::RecordingFailed),
-            "recording_failed"
-        );
-        assert_eq!(
-            render_failure_kind(DictationFailureKind::AsrFailed),
-            "asr_failed"
-        );
-        assert_eq!(
-            render_failure_kind(DictationFailureKind::InjectionFailed),
-            "injection_failed"
-        );
-    }
-
     /// The sidebar renders `WorkflowTab::ALL` in order; pin the order and labels
     /// so the shell's information architecture is explicit and a reordering is a
     /// deliberate, reviewed change.
@@ -417,7 +372,6 @@ mod tests {
         let prefs = Preferences::default();
         assert!(prefs.default_output_language.is_empty());
         assert_eq!(prefs.default_inject_target, InjectTarget::GuiAccessible);
-        assert_eq!(prefs.recorder_backend, RecorderBackend::Auto);
         assert_eq!(prefs.capture_seconds, 8);
         assert_eq!(prefs.glass_opacity, 0.5);
         assert!(!prefs.reduce_transparency);
@@ -509,10 +463,7 @@ mod tests {
         assert_eq!(session.id, Some(id));
     }
 
-    fn capture_result(
-        failure_kind: Option<DictationFailureKind>,
-        text: &str,
-    ) -> DictationCaptureResult {
+    fn capture_result(text: &str) -> DictationCaptureResult {
         DictationCaptureResult {
             session: CaptureSession {
                 session_id: Uuid::nil(),
@@ -528,35 +479,18 @@ mod tests {
                 notes: vec!["note".to_owned()],
             },
             audio_file: None,
-            failure_kind,
         }
     }
 
     #[test]
     fn session_apply_capture_success_completes_with_transcript() {
         let mut session = Session::default();
-        let message = session.apply_capture(capture_result(None, "hello world"));
+        let message = session.apply_capture(capture_result("hello world"));
         assert!(message.is_none());
         assert_eq!(session.stage, SessionStage::Completed);
         assert_eq!(session.transcript.as_deref(), Some("hello world"));
         assert_eq!(session.detected_language.as_deref(), Some("en"));
         assert_eq!(session.notes, vec!["note".to_owned()]);
         assert!(session.id.is_none());
-    }
-
-    #[test]
-    fn session_apply_capture_failure_marks_failed_with_message() {
-        let mut session = Session::default();
-        let message = session.apply_capture(capture_result(
-            Some(DictationFailureKind::AsrFailed),
-            "partial",
-        ));
-        assert_eq!(session.stage, SessionStage::Failed);
-        assert_eq!(
-            message.as_deref(),
-            Some("[asr_failed] capture did not complete cleanly"),
-        );
-        // The transcript is still captured even on failure, for inspection.
-        assert_eq!(session.transcript.as_deref(), Some("partial"));
     }
 }

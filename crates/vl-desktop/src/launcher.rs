@@ -1,4 +1,4 @@
-//! Locating and launching the `vl` daemon from the desktop shell.
+//! Locating and launching the `voicelayerd` daemon from the desktop shell.
 //!
 //! Kept apart from the [`crate::app`] controller because it is plain process
 //! supervision — no iced, no UI state — and carries its own env-var resolution
@@ -14,27 +14,26 @@ use std::os::unix::process::CommandExt;
 
 use crate::state::SharedError;
 
-fn resolve_vl_binary() -> PathBuf {
+fn resolve_daemon_binary() -> PathBuf {
     // Prefer an explicit override for development setups, then the install.sh
     // target, then $PATH. Falling back to the bare name lets `Command::spawn`
     // surface the usual "program not found" error with a clear hint.
-    if let Some(explicit) = std::env::var_os("VOICELAYER_VL_BIN") {
+    if let Some(explicit) = std::env::var_os("VOICELAYER_DAEMON_BIN") {
         return PathBuf::from(explicit);
     }
     if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".local/bin/vl");
+        let candidate = PathBuf::from(home).join(".local/bin/voicelayerd");
         if candidate.is_file() {
             return candidate;
         }
     }
-    PathBuf::from("vl")
+    PathBuf::from("voicelayerd")
 }
 
 pub(crate) async fn spawn_daemon() -> Result<(), SharedError> {
-    let binary = resolve_vl_binary();
+    let binary = resolve_daemon_binary();
     let mut command = Command::new(&binary);
     command
-        .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -52,7 +51,7 @@ pub(crate) async fn spawn_daemon() -> Result<(), SharedError> {
             Ok(())
         }
         Err(error) => Err(Arc::new(format!(
-            "could not execute `{}`: {error}. Set VOICELAYER_VL_BIN or add \
+            "could not execute `{}`: {error}. Set VOICELAYER_DAEMON_BIN or add \
              ~/.local/bin to PATH.",
             binary.display(),
         ))),
@@ -64,7 +63,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::Mutex;
 
-    use super::resolve_vl_binary;
+    use super::resolve_daemon_binary;
 
     /// Serializes env mutation across every test in this module; see
     /// `crates/voicelayerd/src/worker.rs` for the rationale.
@@ -114,37 +113,40 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vl_binary_honors_explicit_override() {
+    fn resolve_daemon_binary_honors_explicit_override() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_VL_BIN");
-        set_env("VOICELAYER_VL_BIN", "/custom/vl");
-        assert_eq!(resolve_vl_binary().to_str(), Some("/custom/vl"));
+        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_DAEMON_BIN");
+        set_env("VOICELAYER_DAEMON_BIN", "/custom/voicelayerd");
+        assert_eq!(
+            resolve_daemon_binary().to_str(),
+            Some("/custom/voicelayerd")
+        );
     }
 
     #[test]
-    fn resolve_vl_binary_falls_back_to_local_bin_when_present() {
+    fn resolve_daemon_binary_falls_back_to_local_bin_when_present() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_VL_BIN");
+        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_DAEMON_BIN");
         let _home_guard = EnvGuard::capture("HOME");
         let tmp = tempfile::tempdir().expect("tempdir should be creatable");
         let fake_local = tmp.path().join(".local/bin");
         std::fs::create_dir_all(&fake_local).expect("create fake ~/.local/bin");
-        let vl_path = fake_local.join("vl");
-        std::fs::write(&vl_path, b"#!/bin/sh\n").expect("write fake vl binary");
-        unset_env("VOICELAYER_VL_BIN");
+        let vl_path = fake_local.join("voicelayerd");
+        std::fs::write(&vl_path, b"#!/bin/sh\n").expect("write fake daemon binary");
+        unset_env("VOICELAYER_DAEMON_BIN");
         set_env("HOME", tmp.path());
-        assert_eq!(resolve_vl_binary(), vl_path);
+        assert_eq!(resolve_daemon_binary(), vl_path);
     }
 
     #[test]
-    fn resolve_vl_binary_falls_back_to_path_lookup_as_last_resort() {
+    fn resolve_daemon_binary_falls_back_to_path_lookup_as_last_resort() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_VL_BIN");
+        let _vl_bin_guard = EnvGuard::capture("VOICELAYER_DAEMON_BIN");
         let _home_guard = EnvGuard::capture("HOME");
         let tmp = tempfile::tempdir().expect("tempdir should be creatable");
-        unset_env("VOICELAYER_VL_BIN");
-        // Point HOME at an empty directory so `~/.local/bin/vl` misses.
+        unset_env("VOICELAYER_DAEMON_BIN");
+        // Point HOME at an empty directory so `~/.local/bin/voicelayerd` misses.
         set_env("HOME", tmp.path());
-        assert_eq!(resolve_vl_binary().to_str(), Some("vl"));
+        assert_eq!(resolve_daemon_binary().to_str(), Some("voicelayerd"));
     }
 }

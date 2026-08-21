@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+cpal.workspace = true
+hound.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 serde.workspace = true

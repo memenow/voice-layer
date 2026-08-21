@@ -221,7 +221,7 @@ each transcription input.</p>
 export VOICELAYER_WHISPER_VAD_MODEL_PATH=/abs/path/to/silero_vad.onnx
 # Same VAD tunables as the pre-pass apply.
 
-cargo run -p vl -- daemon run --project-root "$(pwd)"           # in one shell
+cargo run -p voicelayerd                                       # in one shell
 cargo run -p vl -- dictation start \
   --mode vad-gated --probe-secs 2 --max-segment-secs 30 \
   --language auto                                               # in another

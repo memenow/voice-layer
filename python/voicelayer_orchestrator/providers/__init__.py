@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+import psutil
 
 from voicelayer_orchestrator.config import (
     load_llm_provider_config,
@@ -22,33 +23,21 @@ class ProviderInvocationError(RuntimeError):
     """Raised when the configured provider cannot satisfy a request."""
 
 
-# Whisper emits "decorative" annotations for non-speech audio: music,
-# ambient noise, speaker changes, foreign language, inaudible passages,
-# stage directions, and the `[BLANK_AUDIO]` silence token. These are
-# descriptors of what the model heard rather than what was said. When
-# such an annotation is the entire transcript, callers want empty text
-# so default stop actions (copy / save / inject) don't publish garbage
-# into the target pane.
-#
-# Whisper's convention is that square brackets and parentheses are
-# reserved for annotations — real speech is never emitted that way. We
-# therefore collapse on *structure* (the whole line is a single
-# `[...]` or `(...)` block) rather than on a fixed allowlist. The
-# allowlist approach kept missing novel annotations like
-# `(dramatic music)` or `(phone rings)` the model invented from
-# training context, so the filter now treats any standalone bracket /
-# paren block as decorative.
-#
-# Mixed content — a line with both annotation and speech, or a block
-# with some substance and some annotations — is preserved verbatim so
-# we never silently drop real words. Future refinement could prune
-# annotation-only lines from multi-line transcripts, but pinning that
-# behavior under test is out of scope here.
-_ANNOTATION_RE = re.compile(r"^\s*[\[\(][^\[\]\(\)]+[\]\)]\s*$")
+class ProviderUnavailableError(ProviderInvocationError):
+    """Raised when no provider is configured for the requested workflow."""
+
+
+class InvalidProviderParamsError(ProviderInvocationError):
+    """Raised when provider routing parameters are malformed (e.g. a
+    non-string ``provider_id``)."""
 
 
 def _is_decorative_annotation(line: str) -> bool:
-    return _ANNOTATION_RE.fullmatch(line) is not None
+    """True when a transcript line is a whisper decorative annotation."""
+
+    return (line.startswith("(") and line.endswith(")")) or (
+        line.startswith("[") and line.endswith("]")
+    )
 
 
 def collapse_nonspeech_transcript(text: str) -> str:
@@ -104,35 +93,23 @@ def _read_pid_from_lock(lock_path: Path) -> int | None:
 
 
 def _pid_runs_binary(pid: int, expected_binary: str) -> bool:
-    """Best-effort Linux-only check that ``pid`` still runs ``expected_binary``.
+    """Check that ``pid`` still runs ``expected_binary`` (cross-platform).
 
-    Reads ``/proc/<pid>/cmdline`` (NUL-separated argv) and compares the
+    Uses psutil's process table (works on Linux and macOS) and compares the
     basename of argv[0] to the basename of ``expected_binary`` so both
     absolute paths and bare names resolve correctly. Returns False on any
-    failure (process gone, non-Linux platform, binary mismatch).
-
-    TODO(portable): on non-Linux targets ``/proc`` is absent and this
-    function always returns False, so :func:`reclaim_stale_lock` would
-    evict every lock regardless of owner liveness. When VoiceLayer grows
-    a macOS or BSD target, derive the cmdline check from ``ps``,
-    ``sysctl``, or ``psutil`` instead.
+    failure (process gone, unreadable cmdline, binary mismatch).
     """
 
     if pid <= 0:
         return False
-    cmdline_path = Path(f"/proc/{pid}/cmdline")
     try:
-        raw = cmdline_path.read_bytes()
-    except (FileNotFoundError, PermissionError, OSError):
+        cmdline = psutil.Process(pid).cmdline()
+    except (psutil.Error, OSError):
         return False
-    argv0_bytes = raw.split(b"\x00", 1)[0]
-    if not argv0_bytes:
+    if not cmdline or not cmdline[0]:
         return False
-    try:
-        argv0 = argv0_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return Path(argv0).name == Path(expected_binary).name
+    return Path(cmdline[0]).name == Path(expected_binary).name
 
 
 def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
@@ -141,7 +118,7 @@ def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
     Returns True when a stale lock was deleted so the caller can retry
     the ``os.open(..., O_EXCL)`` happy path. Returns False when the lock
     owner is still alive (the caller must wait) or when the state is
-    ambiguous (partially-written PID, /proc unreadable) so we err on the
+    ambiguous (partially-written PID, cmdline unreadable) so we err on the
     safe side and leave the lock intact.
     """
 
@@ -160,23 +137,25 @@ def reclaim_stale_lock(lock_path: Path, expected_binary: str) -> bool:
     return True
 
 
-def supported_providers(
-    environ: Mapping[str, str] | None = None,
-) -> list[dict[str, Any]]:
-    """Return provider descriptors for the Python worker boundary."""
+def supported_providers(environ: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+    """Return provider descriptors for the Python worker boundary.
+
+    ``environ`` is the `VOICELAYER_*` override layer; when omitted the
+    process environment is read (standalone worker / tests).
+    """
 
     from voicelayer_orchestrator.providers.llm_openai_compatible import (
         configured_llm_descriptor,
     )
 
-    whisper_config = load_whisper_provider_config(environ)
-    mimo_config = load_mimo_asr_config(environ)
-    qwen3_config = load_qwen3_asr_config(environ)
+    whisper = load_whisper_provider_config(environ)
+    mimo = load_mimo_asr_config(environ)
+    qwen3 = load_qwen3_asr_config(environ)
     providers: list[dict[str, Any]] = [
         {
             "id": "whisper_cpp",
             "kind": "asr",
-            "transport": "whisper_cli" if whisper_config is not None else "stdio_worker",
+            "transport": "whisper_cli" if whisper is not None else "stdio_worker",
             "local": True,
             "default_enabled": True,
             "experimental": False,
@@ -194,7 +173,7 @@ def supported_providers(
         {
             "id": "mimo_v2_5_asr",
             "kind": "asr",
-            "transport": ("in_process_torch" if mimo_config is not None else "stdio_worker"),
+            "transport": "in_process_torch" if mimo is not None else "stdio_worker",
             "local": True,
             "default_enabled": False,
             "experimental": True,
@@ -203,7 +182,7 @@ def supported_providers(
         {
             "id": "qwen3_asr_1_7b",
             "kind": "asr",
-            "transport": ("in_process_torch" if qwen3_config is not None else "stdio_worker"),
+            "transport": "in_process_torch" if qwen3 is not None else "stdio_worker",
             "local": True,
             "default_enabled": False,
             "experimental": True,

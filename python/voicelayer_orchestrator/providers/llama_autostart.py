@@ -118,9 +118,6 @@ def autostart_llama_server(
     lock_path = runtime_dir / f"{key}.lock"
     log_path = runtime_dir / f"{key}.log"
     state_path = runtime_dir / f"{key}.json"
-    source = dict(os.environ)
-    if environ:
-        source.update(environ)
 
     try:
         command = build_llama_server_command(config, launch)
@@ -149,7 +146,6 @@ def autostart_llama_server(
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=source,
                 start_new_session=True,
             )
         _BACKGROUND_PROCESSES.append(process)

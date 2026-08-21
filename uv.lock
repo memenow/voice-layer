@@ -95,7 +95,7 @@ version = "4.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-23-voicelayer-orchestrator-mimo' and extra == 'extra-23-voicelayer-orchestrator-qwen3-asr')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/19/14/2c5dd9f512b66549ae92767a9c7b330ae88e1932ca57876909410251fe13/anyio-4.13.0.tar.gz", hash = "sha256:334b70e641fd2221c1505b3890c69882fe4a2df910cba14d97019b90b24439dc", size = 231622, upload-time = "2026-03-24T12:59:09.671Z" }
 wheels = [
@@ -2609,8 +2609,12 @@ wheels = [
 
 [[package]]
 name = "voicelayer-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
+dependencies = [
+    { name = "httpx" },
+    { name = "psutil" },
+]
 
 [package.optional-dependencies]
 mimo = [
@@ -2643,9 +2647,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'mimo'", specifier = ">=1.9.0" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "librosa", marker = "extra == 'mimo'", specifier = ">=0.11.0" },
     { name = "numpy", marker = "extra == 'vad'", specifier = ">=2.0" },
     { name = "onnxruntime", marker = "extra == 'vad'", specifier = ">=1.18" },
+    { name = "psutil", specifier = ">=6.0" },
     { name = "qwen-asr", marker = "extra == 'qwen3-asr'", specifier = ">=0.0.6,<1.0" },
     { name = "scipy", marker = "extra == 'mimo'", specifier = ">=1.16.1" },
     { name = "soundfile", marker = "extra == 'mimo'", specifier = ">=0.12" },

@@ -65,6 +65,8 @@ interpreter</li>
 </ul>
 <h2 id="required-methods">Required Methods</h2>
 <ul>
+<li><code>initialize</code> (first frame after spawn; carries the provider
+configuration payload)</li>
 <li><code>health</code></li>
 <li><code>list_providers</code></li>
 <li><code>compose</code></li>
@@ -178,6 +180,7 @@ output. When a configured provider fails at runtime, it returns
 <h2 id="error-policy">Error Policy</h2>
 <ul>
 <li>Invalid JSON-RPC request: <code>-32600</code></li>
+<li>Not initialized (missing <code>initialize</code> handshake): <code>-32002</code></li>
 <li>Method not found: <code>-32601</code></li>
 <li>Parse error: <code>-32700</code></li>
 <li>Provider unavailable: <code>-32004</code></li>

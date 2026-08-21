@@ -23,13 +23,13 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
+use voicelayer_core::default_socket_path;
 use voicelayer_core::{
     CaptureSession, ComposeRequest, CompositionReceipt, DictationCaptureRequest,
     DictationCaptureResult, EventEnvelope, HealthResponse, InjectRequest, InjectionPlan,
     ProviderDescriptor, RewriteRequest, StartDictationRequest, StopDictationRequest,
     TranscribeRequest, TranscriptionResult, TranslateRequest,
 };
-use voicelayerd::default_socket_path;
 
 use crate::state::SharedError;
 
@@ -381,7 +381,7 @@ mod tests {
         }
     }
 
-    const SAMPLE: &str = "{\"event_type\":\"dictation.listening\",\"session_id\":null,\"created_at_millis\":7,\"message\":\"speak now\"}";
+    const SAMPLE: &str = "{\"event_type\":\"dictation_listening\",\"session_id\":\"00000000-0000-0000-0000-000000000000\",\"created_at_millis\":7}";
 
     #[test]
     fn sse_decoder_emits_one_event_per_blank_line_terminated_frame() {
@@ -389,10 +389,8 @@ mod tests {
         let frame = format!("event:dictation.listening\ndata:{SAMPLE}\n\n");
         let events = decoder.push(frame.as_bytes());
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "dictation.listening");
+        assert_eq!(events[0].event.name(), "dictation_listening");
         assert_eq!(events[0].created_at_millis, 7);
-        assert_eq!(events[0].message, "speak now");
-        assert!(events[0].session_id.is_none());
     }
 
     #[test]
@@ -404,7 +402,7 @@ mod tests {
         // The blank line on the next read completes the event.
         let events = decoder.push(b"\n");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "dictation.listening");
+        assert_eq!(events[0].event.name(), "dictation_listening");
     }
 
     #[test]
@@ -416,7 +414,6 @@ mod tests {
         assert!(decoder.push(head).is_empty());
         let events = decoder.push(tail);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].message, "speak now");
     }
 
     #[test]

@@ -12,6 +12,7 @@ PYTHON_ROOT = PROJECT_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
+
 from voicelayer_orchestrator.config import (  # noqa: E402
     LlamaServerLaunchConfig,
     OpenAICompatibleConfig,

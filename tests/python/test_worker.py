@@ -22,6 +22,7 @@ from voicelayer_orchestrator.config import (  # noqa: E402
     load_llm_provider_config,
     load_whisper_provider_config,
     load_whisper_server_config,
+    reset_configuration_for_tests,  # noqa: E402
 )
 from voicelayer_orchestrator.providers import supported_providers  # noqa: E402
 from voicelayer_orchestrator.providers.llm_openai_compatible import (  # noqa: E402
@@ -84,6 +85,7 @@ class FakeOpenAIServerMixin:
 
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAIHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
@@ -762,6 +764,7 @@ class FakeWhisperServerHandler(BaseHTTPRequestHandler):
 class WhisperServerProviderTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
+        reset_configuration_for_tests()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeWhisperServerHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
