@@ -26,6 +26,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install system dependencies for vl-desktop and the recorder probe
+        # apt exists only on the Ubuntu runner; macOS has no system
+        # package step (pkg-config and friends ship with the image).
+        if: matrix.os == 'ubuntu-latest'
         # The Azure apt mirror on hosted runners occasionally stalls on
         # `Ign:` responses and drags `apt-get update` past the job
         # timeout (observed 2026-04-22, run 24774249846). Cap per-request
@@ -67,7 +70,8 @@ jobs:
             libxi-dev \
             libxcursor-dev \
             libxrandr-dev \
-            alsa-utils
+            alsa-utils \
+            libasound2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
