@@ -37,7 +37,7 @@ ashpd = { version = "0.13", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-global-hotkey = "0.6"
+global-hotkey = "0.8"
 
 [features]
 # Optional StatusNotifierItem system tray (pure-Rust `ksni`, no GTK). Off by
@@ -48,8 +48,8 @@ tray = ["dep:ksni"]
 [dev-dependencies]
 # Font selection (Inter static weights resolving under one "Inter" family) is
 # verified offline with the same font db iced uses at runtime.
-fontdb = "0.23"
+fontdb = "0.24"
 # WGSL is validated by naga at runtime; this lets the test suite parse and
 # validate the glass shader offline (the GUI can't be driven headlessly).
-naga = { version = "27", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in"] }
 tempfile.workspace = true

@@ -184,7 +184,7 @@ fn run_capture_stream(
         }
     };
 
-    let device_rate = supported.sample_rate().0;
+    let device_rate = supported.sample_rate();
     let channels = usize::from(supported.channels());
     let config = supported.config();
     let error_callback = |error| {
@@ -193,13 +193,13 @@ fn run_capture_stream(
 
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &config,
+            config,
             move |data: &[f32], _| forward_mono(data, channels, 1.0, &sample_tx, |v| v),
             error_callback,
             None,
         ),
         cpal::SampleFormat::I16 => device.build_input_stream(
-            &config,
+            config,
             move |data: &[i16], _| {
                 forward_mono(data, channels, 1.0 / 32768.0, &sample_tx, f32::from);
             },
