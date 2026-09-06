@@ -43,4 +43,13 @@ ignore = [
     # Re-evaluate when iced/cryoglyph releases a version that accepts
     # lru >= 0.18.2.
     "RUSTSEC-2026-0253",
+    # `ttf-parser 0.25.1` is unmaintained as of 2026-06-28. It reaches
+    # the dependency graph through fontdb 0.23 -> cosmic-text 0.15 ->
+    # iced_graphics/iced_tiny_skia -> iced 0.14 (the GUI shell in
+    # vl-desktop). iced 0.14 is the latest iced release, so no upstream
+    # release compatible with our dependency chain drops the ttf-parser
+    # dependency yet; until one does, VoiceLayer has no upstream path
+    # to swap it out, and the unmaintained status carries no known
+    # soundness or vulnerability impact for our font-parsing usage.
+    "RUSTSEC-2026-0192",
 ]
