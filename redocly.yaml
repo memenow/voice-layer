@@ -25,9 +25,9 @@ rules:
   # The spec declares `info.license` (Apache-2.0). The corresponding
   # `info.license.url` is intentionally omitted: SPDX-identifier
   # licenses are looked up by `license.identifier`, not by URL, and
-  # adding a URL would shadow the SPDX field.
+  # adding a URL would shadow the SPDX field. (Redocly 2.x dropped
+  # the `info-license-url` rule, so there is no key to switch off.)
   info-license: warn
-  info-license-url: off
 
   # `voicelayerd` has no transport-level authentication. The socket
   # file mode is the access boundary. Forcing a `security:` block
