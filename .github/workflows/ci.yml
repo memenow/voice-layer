@@ -76,7 +76,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
           components: rustfmt, clippy
 
       - name: Cache cargo registry and target
@@ -191,7 +191,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2

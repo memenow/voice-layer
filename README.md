@@ -66,7 +66,7 @@ Not yet implemented (documented and scoped):
 
 ### Requirements
 
-- Rust 1.88+
+- Rust 1.89+
 - Python 3.12+
 - `uv` 0.11+
 - Ubuntu with PipeWire, or macOS on Apple Silicon (CoreAudio)
