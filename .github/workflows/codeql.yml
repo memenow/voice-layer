@@ -75,7 +75,7 @@ jobs:
         if: matrix.language == 'rust'
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - name: Cache cargo registry and target
         if: matrix.language == 'rust'

@@ -37,7 +37,7 @@ body:
     attributes:
       label: Rust toolchain
       description: Output of `rustc --version` and active toolchain channel.
-      placeholder: "rustc 1.88.0 (stable)"
+      placeholder: "rustc 1.89.0 (stable)"
     validations:
       required: true
   - type: input

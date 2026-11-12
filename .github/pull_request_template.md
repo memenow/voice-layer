@@ -12,7 +12,7 @@
 
 ## Verification
 
-Confirm the authoritative verification chain ran locally on Ubuntu with Rust 1.88
+Confirm the authoritative verification chain ran locally on Ubuntu with Rust 1.89
 and Python 3.12 via uv. Check each box that applied or strike through with an
 explanation when intentionally skipped.
 
