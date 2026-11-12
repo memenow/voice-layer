@@ -37,7 +37,7 @@ ashpd = { version = "0.13", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-global-hotkey = "0.8"
+global-hotkey = "0.9"
 
 [features]
 # Optional StatusNotifierItem system tray (pure-Rust `ksni`, no GTK). Off by
