@@ -187,10 +187,7 @@ async fn handle_dictation(client: &DaemonClient, command: DictationCommand) -> C
             match duration_seconds {
                 None => print_json(&session),
                 Some(seconds) => {
-                    eprintln!(
-                        "session {} listening; auto-stopping after {seconds}s",
-                        session.session_id
-                    );
+                    eprintln!("dictation listening; auto-stopping after {seconds}s");
                     tokio::time::sleep(std::time::Duration::from_secs(u64::from(seconds))).await;
                     let result: DictationCaptureResult = client
                         .post_json(
