@@ -220,9 +220,7 @@ async fn stream_events(
     )
 }
 
-/// Validate the ASR `provider_id` and request flag combination before any
-/// audio capture starts. Unknown ids and documented-unsupported
-/// combinations fail fast with a 400 instead of wasting a recording.
+/// Validate the requested ASR `provider_id` and `translate_to_english` combination.
 fn check_provider_request(
     provider_id: Option<&str>,
     translate_to_english: bool,
@@ -234,12 +232,10 @@ fn check_provider_request(
             voicelayer_core::SUPPORTED_TRANSCRIBE_PROVIDER_IDS.join(", ")
         )));
     }
-    if matches!(provider_id, Some("mimo_v2_5_asr") | Some("qwen3_asr_1_7b")) && translate_to_english
-    {
+    if translate_to_english && !voicelayer_core::provider_supports_asr_translation(provider_id) {
         return Err(ApiError::BadRequest(
-            "MiMo-V2.5-ASR and Qwen3-ASR-1.7B do not support translate_to_english today; \
-             run translation through the LLM workflow or pick the default \
-             whisper.cpp provider."
+            "MiMo-V2.5-ASR and Qwen3-ASR-1.7B do not support translate_to_english; \
+             use the LLM translation workflow or the default whisper_cpp provider."
                 .to_owned(),
         ));
     }
@@ -323,6 +319,7 @@ async fn create_transcription(
             "audio_file must not be empty".to_owned(),
         ));
     }
+    check_provider_request(request.provider_id.as_deref(), request.translate_to_english)?;
     let result = state.config.worker_command.transcribe(&request).await?;
     state.events.emit(DaemonEvent::TranscriptionCompleted {
         transcript_chars: result.text.chars().count(),

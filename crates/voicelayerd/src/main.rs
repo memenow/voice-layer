@@ -1,6 +1,4 @@
-//! Thin entry point for the `voicelayerd` binary; the daemon's real
-//! lifecycle lives in [`voicelayerd::run_daemon`] inside the library
-//! crate so integration tests can drive it without a process boundary.
+//! Entry point for the `voicelayerd` daemon binary.
 
 use std::path::PathBuf;
 
@@ -26,9 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    // Explicit CLI args win over the config file; both fall back to the
-    // platform defaults resolved inside DaemonConfig.
-    let settings = voicelayer_core::VoiceLayerConfig::load().unwrap_or_default();
+    let settings = voicelayer_core::VoiceLayerConfig::load().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load config.toml; falling back to defaults + env");
+        voicelayer_core::VoiceLayerConfig::default_with_env()
+    });
     run_daemon(DaemonConfig::with_settings(
         args.socket_path,
         args.project_root,

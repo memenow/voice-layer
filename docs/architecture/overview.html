@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Architecture Overview — VoiceLayer Documentation</title>
-<meta name="description" content="Runtime topology, component responsibilities, domain vocabulary, configuration precedence, audio capture, and dictation segmentation modes." />
+<title>Architecture Overview | VoiceLayer Documentation</title>
+<meta name="description" content="Runtime topology, crate boundaries, domain types, configuration precedence, audio capture, and dictation segmentation modes." />
 <link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body>
@@ -15,9 +15,9 @@
     <a href="../index.html">Home</a>
     <a href="../architecture/overview.html" aria-current="page">Architecture</a>
     <a href="../guides/development.html">Development</a>
-    <a href="../guides/systemd.html">Systemd</a>
-    <a href="../guides/local-asr-provider.html">ASR providers</a>
-    <a href="../guides/local-llm-provider.html">LLM provider</a>
+    <a href="../guides/services.html">Services</a>
+    <a href="../guides/asr-providers.html">ASR providers</a>
+    <a href="../guides/llm-provider.html">LLM provider</a>
     <a href="../guides/desktop.html">Desktop</a>
   </nav>
 </header>
@@ -32,266 +32,208 @@
 <li><a href="#runtime-topology">Runtime Topology</a></li>
 <li><a href="#component-responsibilities">Component Responsibilities</a>
 <ul>
-<li><a href="#rust">Rust</a></li>
-<li><a href="#python">Python</a></li>
+<li><a href="#rust">Rust Workspace</a></li>
+<li><a href="#python">Python Worker</a></li>
 </ul></li>
 <li><a href="#domain-objects">Domain Objects</a></li>
-<li><a href="#initial-transport-decisions">Initial Transport Decisions</a></li>
+<li><a href="#transport-boundaries">Transport Boundaries</a></li>
 <li><a href="#configuration-precedence">Configuration Precedence</a></li>
 <li><a href="#audio-capture">Audio Capture</a></li>
-<li><a href="#dictation-segmentation-phase-3b-3d">Dictation Segmentation (Phase 3B, 3D)</a></li>
-<li><a href="#optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</a></li>
-<li><a href="#deferred-work">Deferred Work</a></li>
+<li><a href="#dictation-segmentation">Dictation Segmentation</a></li>
+<li><a href="#silero-vad-pre-pass">Optional Silero VAD Pre-pass</a></li>
+<li><a href="#planned-adapters">Planned Adapters</a></li>
 </ul>
 </nav>
 
 <h2 id="goals">Goals</h2>
-<p>VoiceLayer must support two primary workflows:</p>
+<p>VoiceLayer handles two primary workflows through one shared domain model:</p>
 <ul>
-<li>Dictation: low-latency speech-to-text insertion into the focused
-target</li>
-<li>Composition: convert spoken intent into a structured, polished text
-artifact before insertion</li>
+<li>Dictation: low-latency speech-to-text insertion into the focused GUI or
+terminal target.</li>
+<li>Composition: converting spoken intent or existing text into a structured
+preview before insertion (compose, rewrite, and translate).</li>
 </ul>
-<p>The system must work across GUI applications and terminal/TUI
-surfaces without splitting the domain model.</p>
+
 <h2 id="runtime-topology">Runtime Topology</h2>
-<pre><code>+--------+   +--------------+      JSON over UDS      +------------------+
-|  vl    |   |  vl-desktop  | &lt;---------------------&gt; | voicelayerd      |
-| (CLI)  |   | (iced GUI)   |                         +------------------+
-+--------+   +--------------+                                  |
-                                                               | JSON-RPC over stdio
-                                                               v
-                                                      +----------------------+
-                                                      | Python orchestrator  |
-                                                      +----------------------+</code></pre>
-<p><code>vl</code> and <code>vl-desktop</code> share the same
-<code>/v1</code> socket, session store, and SSE event stream; only the
-operator-facing surface differs (terminal vs. iced window).
-<code>vl-desktop</code> additionally registers
-<code>voicelayer.dictation_toggle</code> through the XDG GlobalShortcuts
-portal so a system-wide hotkey can trigger the same start/stop calls the
-GUI buttons issue.</p>
+<pre><code>+--------+   +--------------+      HTTP/JSON over UDS      +-------------+
+|  vl    |   |  vl-desktop  | &lt;--------------------------&gt; | voicelayerd |
+| (CLI)  |   |  (iced GUI)  |                              +-------------+
++--------+   +--------------+                                     |
+                                                                  | JSON-RPC 2.0 over stdio
+                                                                  v
+                                                         +-------------------+
+                                                         | voicelayer_worker |
+                                                         +-------------------+</code></pre>
+<p><code>vl</code> and <code>vl-desktop</code> share the same <code>/v1</code>
+Unix domain socket, session table, and Server-Sent Events stream.
+<code>vl-desktop</code> also registers the global shortcut
+<code>voicelayer.dictation_toggle</code> (via XDG GlobalShortcuts on Linux or
+Carbon hotkeys on macOS) to trigger the same start/stop API calls as its UI
+controls.</p>
+
 <h2 id="component-responsibilities">Component Responsibilities</h2>
-<h3 id="rust">Rust</h3>
+<h3 id="rust">Rust Workspace</h3>
 <ul>
-<li>Capture session lifecycle</li>
-<li>Local control API</li>
-<li>Host targeting and injection planning</li>
-<li>CLI/TUI entry points</li>
-<li>Daemon reliability, logging, and supervision</li>
+<li><code>voicelayer-core</code>: domain types, typed config parsing, and shared
+UDS HTTP/SSE client.</li>
+<li><code>voicelayerd</code>: long-running daemon, <code>cpal</code> audio
+capture, segmented dictation orchestration, <code>/v1</code> HTTP API, and
+worker process supervision.</li>
+<li><code>voicelayer-cli</code> (<code>vl</code>): operator CLI, config
+management, terminal push-to-talk TUI, and terminal paste adapters.</li>
+<li><code>voicelayer-desktop</code> (<code>vl-desktop</code>): multi-window
+iced GUI, capture HUD overlay, global hotkeys, and optional system tray.</li>
+<li><code>voicelayer-ui</code>: shared color, spacing, and typography tokens.</li>
 </ul>
-<h3 id="python">Python</h3>
+
+<h3 id="python">Python Worker</h3>
 <ul>
-<li>Provider orchestration</li>
-<li>Model-family-specific integration logic</li>
-<li>Rapid experimentation for ASR, LLM, and TTS backends</li>
+<li><code>python/voicelayer_worker</code>: JSON-RPC server, provider registry,
+unified Silero VAD pre-pass, WAV splitting/stitching, and backend drivers for
+<code>whisper.cpp</code>, MiMo-V2.5-ASR, Qwen3-ASR-1.7B, and OpenAI-compatible
+LLMs.</li>
 </ul>
+
 <h2 id="domain-objects">Domain Objects</h2>
-<p>The first-class domain language is:</p>
+<p>The public contract types shared across Rust, Python, and OpenAPI are:</p>
 <ul>
 <li><code>CaptureSession</code></li>
 <li><code>TranscriptChunk</code></li>
-<li><code>CompositionReceipt</code> (carries a
-<code>PreviewArtifact</code>)</li>
+<li><code>CompositionReceipt</code></li>
 <li><code>PreviewArtifact</code></li>
-<li><code>InjectionPlan</code></li>
-<li><code>InjectTarget</code></li>
+<li><code>InjectionPlan</code> and <code>InjectTarget</code></li>
 <li><code>ProviderDescriptor</code></li>
-<li><code>LanguageProfile</code> / <code>LanguageStrategy</code></li>
-<li><code>SegmentationMode</code> (one_shot / fixed / vad_gated)</li>
-<li><code>DictationFailureKind</code></li>
+<li><code>LanguageProfile</code> and <code>LanguageStrategy</code></li>
+<li><code>SegmentationMode</code> (<code>one_shot</code>, <code>fixed</code>,
+<code>vad_gated</code>)</li>
 </ul>
-<p>These names should remain stable across Rust, Python, and OpenAPI
-surfaces. Hotkey bindings are intentionally not part of the public
-domain language: portal-registered shortcuts (in
-<code>vl-desktop</code>) and CLI keybindings (in <code>vl</code>) are
-operator-facing handles, not contract-bearing types.</p>
-<h2 id="initial-transport-decisions">Initial Transport Decisions</h2>
+<p>Global hotkey bindings and CLI keybindings stay client-side rather than
+becoming part of the daemon API schema.</p>
+
+<h2 id="transport-boundaries">Transport Boundaries</h2>
 <ul>
-<li>External control plane: HTTP over Unix domain socket</li>
-<li>Streaming events: Server-Sent Events</li>
-<li>Rust/Python bridge: JSON-RPC 2.0 over stdio</li>
-<li>Worker launch policy: on-demand Python worker invocation through the
-<code>uv</code>-managed project environment</li>
+<li>External control plane: HTTP/1.1 with JSON payloads over a Unix domain
+socket, documented in <code>openapi/voicelayerd.v1.yaml</code>.</li>
+<li>Live event feed: Server-Sent Events at <code>GET /v1/events/stream</code>.</li>
+<li>Rust-to-Python bridge: line-delimited JSON-RPC 2.0 over stdio, launched
+through the repository's <code>uv</code> environment. See
+<a href="./worker-protocol.html">Python Worker Protocol</a>.</li>
 </ul>
+
 <h2 id="configuration-precedence">Configuration Precedence</h2>
-<p>The <code>vl</code> CLI reads foreground-PTT options from three
-sources. Sources higher in the list win when a value is set at multiple
-layers:</p>
-<ol type="1">
-<li><strong>Command-line flag</strong> — every
-<code>vl dictation foreground-ptt</code> option can be set explicitly on
-the command line (for example <code>--language en</code>,
-<code>--key f9</code>, <code>--default-stop-action inject</code>).</li>
-<li><strong>TOML config file</strong> — persisted with
-<code>vl config set &lt;key&gt; &lt;value&gt;</code>. The file lives at
-the path reported by <code>vl config path</code>, typically
-<code>~/.config/voicelayer/config.toml</code> on Linux. Entries under
-<code>[foreground_ptt]</code> populate the same fields the CLI flags
-set.</li>
-<li><strong>Struct defaults</strong> — the values baked into
-<code>ForegroundPttConfig::default</code> (space key, stop action
-<code>none</code>, and so on) apply when neither the file nor the CLI
-provides a value.</li>
+<p>The <code>vl dictation foreground-ptt</code> command resolves options in three
+layers (highest precedence first):</p>
+<ol>
+<li><strong>CLI flags</strong> passed directly on the command line (such as
+<code>--language en</code>, <code>--key f9</code>, or
+<code>--default-stop-action inject</code>).</li>
+<li><strong>TOML config file</strong> managed with
+<code>vl config set &lt;key&gt; &lt;value&gt;</code> at the path printed by
+<code>vl config path</code> (typically
+<code>~/.config/voicelayer/config.toml</code>).</li>
+<li><strong>Struct defaults</strong> from
+<code>ForegroundPttConfig::default</code>.</li>
 </ol>
-<p>Supported keys for <code>vl config set</code> today:</p>
-<pre><code>foreground_ptt.language                    (BCP-47 tag; &quot;none&quot; clears)
+<p>Supported <code>vl config set</code> keys:</p>
+<pre><code>foreground_ptt.language                    (BCP-47 tag; "none" clears)
 foreground_ptt.translate_to_english        bool
 foreground_ptt.keep_audio                  bool
 foreground_ptt.key                         space | enter | tab | f8 | f9 | f10
-foreground_ptt.tmux_target_pane            tmux pane id (%N); &quot;none&quot; clears
-foreground_ptt.wezterm_target_pane_id      wezterm pane id; &quot;none&quot; clears
-foreground_ptt.kitty_match                 kitten match expression; &quot;none&quot; clears
+foreground_ptt.tmux_target_pane            tmux pane id (%N); "none" clears
+foreground_ptt.wezterm_target_pane_id      wezterm pane id; "none" clears
+foreground_ptt.kitty_match                 kitten match expression; "none" clears
 foreground_ptt.copy_on_stop                bool
 foreground_ptt.default_stop_action         none | copy | inject | save
 foreground_ptt.restore_clipboard_on_exit   bool
-foreground_ptt.save_dir                    directory path; &quot;none&quot; clears
-foreground_ptt.provider_id                 whisper_cpp | mimo_v2_5_asr | qwen3_asr_1_7b; &quot;none&quot; clears</code></pre>
-<p>Boolean values accept <code>true</code>/<code>false</code>,
+foreground_ptt.save_dir                    directory path; "none" clears
+foreground_ptt.provider_id                 whisper_cpp | mimo_v2_5_asr | qwen3_asr_1_7b; "none" clears</code></pre>
+<p>Boolean keys accept <code>true</code>/<code>false</code>,
 <code>1</code>/<code>0</code>, <code>yes</code>/<code>no</code>, or
 <code>on</code>/<code>off</code>.</p>
+
 <h2 id="audio-capture">Audio Capture</h2>
-<p>The daemon captures microphone audio in process through
-<code>cpal</code> — CoreAudio on macOS, the PipeWire ALSA shim on
-Linux desktops — so no external recorder binary is spawned. Capture
-runs on a dedicated thread that owns the audio stream, converts the
-input to mono <code>f32</code> samples, and appends them to a
-continuous per-session buffer. WAV files are sliced from that buffer
-and resampled from the device rate to the 16 kHz target rate, which is
-why segmented capture loses no audio at chunk boundaries.</p>
-<p>Live sessions (<code>POST /v1/sessions/dictation</code> and
-<code>POST /v1/sessions/dictation/stop</code>) stop the in-process
-capture and hand the resulting WAV to the Python worker's
-<code>transcribe</code> RPC, which dispatches to
-<code>whisper-server</code> when configured and falls back to one-shot
-<code>whisper-cli</code> otherwise, or to the session's
-<code>provider_id</code> backend (<code>mimo_v2_5_asr</code> or
-<code>qwen3_asr_1_7b</code>) when one is selected.</p>
-<h2 id="dictation-segmentation-phase-3b-3d">Dictation Segmentation (Phase 3B, 3D)</h2>
-<p><code>StartDictationRequest</code> carries a
-<code>segmentation</code> field that controls how audio is captured for
-transcription:</p>
+<p><code>voicelayerd</code> captures microphone audio in process via
+<code>cpal</code> (PipeWire ALSA shim on Linux, CoreAudio on macOS), avoiding
+external recorder subprocesses. A dedicated capture thread converts incoming
+audio to mono <code>f32</code> samples in a continuous per-session buffer. WAV
+segments are sliced directly from that buffer and resampled to 16 kHz mono PCM,
+so segmented capture does not drop audio at chunk boundaries.</p>
+<p>When live dictation stops or a segment flushes, the daemon sends the WAV file
+to the Python worker's <code>transcribe</code> RPC, which routes to the
+requested <code>provider_id</code> (or defaults to <code>whisper-server</code>
+with <code>whisper-cli</code> fallback).</p>
+
+<h2 id="dictation-segmentation">Dictation Segmentation</h2>
+<p><code>StartDictationRequest.segmentation</code> selects how live dictation
+partitions audio:</p>
 <ul>
-<li><code>segmentation: {"mode": "one_shot"}</code> (default) — the
-pre-Phase-3 behavior: a single in-process capture runs from
-<code>create</code> to <code>stop</code> and the full WAV is transcribed
-once.</li>
-<li><code>segmentation: {"mode": "fixed", "segment_secs": N, "overlap_secs": 0}</code>
-— the capture buffer is sliced every <code>N</code> seconds; each
-finalized chunk is transcribed in the background via the configured whisper
-provider while the next chunk records. On stop the daemon waits for all
-in-flight transcription tasks and returns a single concatenated
-transcript. When <code>keep_audio</code> is true,
-<code>DictationCaptureResult.audio_file</code> points at the <em>segment
-directory</em> under
-<code>$XDG_RUNTIME_DIR/voicelayer/dictation/&lt;session_id&gt;/</code>
-(one WAV per segment, sorted by numeric id) rather than a single
-recording; listing the directory reconstructs the capture in order.
-<code>keep_audio=false</code> deletes each segment and removes the
-directory.</li>
-<li><code>segmentation: {"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}</code>
-— probes are cut from the capture buffer at the shorter
-<code>probe_secs</code> cadence;
-each probe runs through the Python worker's <code>segment_probe</code>
-RPC (silero-vad classification). Speech probes accumulate into a pending
-buffer and flush as a single logical speech unit when either
-<code>G</code> consecutive silent probes arrive or the buffered duration
-reaches <code>M</code> seconds. The daemon cuts each flushed unit
-directly from the continuous capture buffer into one WAV and hands it
-to <code>transcribe</code>, so a speaker's natural pauses (not the
-fixed wall-clock) bound each transcription input.
-<code>G</code> defaults to 1 (flush on the first silent probe after
-speech). Requires VAD to be configured
-(<code>VOICELAYER_WHISPER_VAD_ENABLED=true</code>,
-<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code>); when VAD is unreachable
-the orchestrator falls back to a pessimistic "speech" verdict per probe
-so no audio is silently dropped.</li>
+<li><code>{"mode": "one_shot"}</code> (default): captures continuously from
+start to stop and transcribes the full WAV once on stop.</li>
+<li><code>{"mode": "fixed", "segment_secs": N}</code>: slices the capture
+buffer every <code>N</code> seconds and transcribes each finalized chunk in the
+background while recording continues. Stop waits for pending tasks and returns
+the joined transcript. With <code>keep_audio=true</code>,
+<code>DictationCaptureResult.audio_file</code> points at the per-session segment
+directory under
+<code>$XDG_RUNTIME_DIR/voicelayer/dictation/&lt;session_id&gt;/</code>.</li>
+<li><code>{"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}</code>:
+slices short probes every <code>P</code> seconds and classifies each probe via
+the worker's <code>segment_probe</code> RPC (Silero VAD). Speech probes
+accumulate and flush as a single WAV unit when <code>G</code> consecutive silent
+probes arrive (default <code>1</code>) or buffered duration reaches
+<code>M</code> seconds. If VAD is unavailable, probes fall back to a speech
+verdict so audio is never silently dropped.</li>
 </ul>
-<p>While a segmented or VAD-gated session is live the daemon streams
-per-segment events on <code>GET /v1/events/stream</code> in addition to
-the existing session-level events:</p>
+<p>Live sessions emit typed events on <code>GET /v1/events/stream</code>:</p>
 <ul>
-<li><code>dictation.segmented_started</code> /
-<code>dictation.vad_gated_started</code> — emitted once when the
-respective orchestrator task begins.</li>
-<li><code>dictation.segment_recorded</code> — emitted each time a
-fixed-mode segment's recording finalizes successfully.</li>
-<li><code>dictation.segment_transcribed</code> — emitted each time a
-fixed-mode segment's background transcription task completes, carrying
-the character count on success or the worker error on failure.</li>
-<li><code>dictation.probe_analyzed</code> — VAD-gated mode only; emitted
-once per physical probe with the speech/silence classification and
-<code>speech_ratio</code>.</li>
-<li><code>dictation.speech_unit_flushed</code> — VAD-gated mode only;
-emitted when the pending speech buffer is flushed (either on silence or
-on max-segment-duration) and handed to transcribe.</li>
-<li><code>dictation.speech_unit_transcribed</code> — VAD-gated mode
-only; emitted when a flushed speech unit's background transcribe task
-completes.</li>
-<li><code>dictation.completed</code> / <code>dictation.failed</code> —
-unchanged; sent once at session end with the stitched transcript or the
-classified failure. <code>DictationFailureKind::RecordingFailed</code>
-and <code>AsrFailed</code> are populated by the daemon;
-<code>InjectionFailed</code> is only ever set by the client.</li>
+<li><code>dictation.session_created</code>, <code>dictation.listening</code>,
+<code>dictation.transcribing</code>: core lifecycle transitions.</li>
+<li><code>dictation.segmented_started</code> and
+<code>dictation.vad_gated_started</code>: emitted when a segmented task starts.</li>
+<li><code>dictation.segment_recorded</code>,
+<code>dictation.segment_transcribed</code>, and
+<code>dictation.segment_transcribe_failed</code>: fixed-mode and per-unit
+transcription progress and errors.</li>
+<li><code>dictation.probe_analyzed</code>,
+<code>dictation.speech_unit_flushed</code>, and
+<code>dictation.speech_unit_transcribed</code>: VAD-gated probe classification
+and unit flush progress.</li>
+<li><code>dictation.completed</code> and <code>dictation.failed</code>: terminal
+session outcomes.</li>
 </ul>
-<p>Segmentation never applies to <code>POST /v1/dictation/capture</code>
-(one-shot bounded duration) or <code>POST /v1/transcriptions</code>
-(file transcription); those transcribe a single WAV in one
-<code>transcribe</code> call with no live capture running, using the same
-<code>whisper-server</code> / <code>whisper-cli</code> /
-<code>provider_id</code> dispatch as live sessions.</p>
-<h2 id="optional-silero-vad-pre-pass-phase-3d">Optional silero-vad Pre-pass (Phase 3D)</h2>
-<p>A silero-vad pre-pass can run inside the Python worker before any
-<code>transcribe</code> call, regardless of which ASR backend the
-request targets. When enabled it detects speech regions in the captured
-WAV, writes a trimmed 16-bit mono WAV containing only the concatenated
-speech spans, and feeds that file to the selected provider (whisper.cpp,
-MiMo-V2.5-ASR, or Qwen3-ASR-1.7B). The pre-pass applies uniformly to all
-transcribe-bearing endpoints — live dictation (one-shot and segmented),
-<code>POST /v1/dictation/capture</code>, and
-<code>POST /v1/transcriptions</code> — because the VAD layer sits inside
-the <code>transcribe</code> JSON-RPC call and is invisible to the daemon
-and to the OpenAPI contract. The whisper path runs VAD in the dispatcher
-(<code>worker.py</code>) before whisper inference; the MiMo and
-Qwen3-ASR paths run the same VAD inside each provider so the trimmed WAV
-is the input the GPU backend actually sees.</p>
-<p>The pre-pass is gated on
-<code>VOICELAYER_WHISPER_VAD_ENABLED=true</code> plus a valid
-<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code> pointing at a silero-vad
-ONNX export (v4 or v5). Runtime dependencies (<code>numpy</code>,
-<code>onnxruntime</code>) ship as the optional <code>vad</code> extra;
-import failures are caught and downgraded to "transcribe the raw WAV" so
-no request is lost. See <code>docs/guides/local-asr-provider.html</code>
-for the full list of tunables.</p>
-<h2 id="deferred-work">Deferred Work</h2>
-<p>This scaffold deliberately defers:</p>
+<p>Bounded single-clip capture (<code>POST /v1/dictation/capture</code>) and
+direct file transcription (<code>POST /v1/transcriptions</code>) always run a
+single <code>transcribe</code> call using the same provider routing.</p>
+
+<h2 id="silero-vad-pre-pass">Optional Silero VAD Pre-pass</h2>
+<p>When <code>VOICELAYER_WHISPER_VAD_ENABLED=true</code> and
+<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code> points to a Silero VAD v4 or v5
+ONNX model, <code>python/voicelayer_worker/pipeline.py</code> runs one shared
+VAD pre-pass before dispatching to any ASR backend (whisper.cpp, MiMo-V2.5-ASR,
+or Qwen3-ASR-1.7B). Non-speech regions are trimmed into a temporary 16-bit mono
+WAV, and pure-silence clips short-circuit to an empty transcript before model
+inference. Temporary WAV sidecars are removed in a <code>finally</code> block.</p>
+<p>Runtime dependencies (<code>numpy</code>, <code>onnxruntime</code>) live in
+the optional <code>vad</code> extra. If imports or VAD execution fail, the
+worker annotates the result notes and falls back to the original WAV. See
+<a href="../guides/asr-providers.html">ASR Providers</a> for tuning options.</p>
+
+<h2 id="planned-adapters">Planned Adapters</h2>
 <ul>
-<li>AT-SPI writable target discovery (the
-<code>atspi_accessible_text</code> host adapter is registered in the
-catalog but the injection adapter is not yet wired up).</li>
-<li>Native kitty remote-control over its UNIX socket (the existing
-<code>kitten @ send-text</code> path shipped via
-<code>--kitty-match</code> is the only kitty integration today).</li>
+<li>AT-SPI writable target discovery and text insertion (the
+<code>atspi_accessible_text</code> descriptor is registered, while direct
+insertion wiring is pending).</li>
+<li>Direct Kitty UNIX-socket remote control beyond the current
+<code>kitten @ send-text</code> integration used by <code>--kitty-match</code>.</li>
 </ul>
-<p>The GNOME portal hotkey binding (<code>vl-desktop</code> registers
-<code>voicelayer.dictation_toggle</code> through
-<code>org.freedesktop.portal.GlobalShortcuts</code>), the systemd user
-units (one for the daemon, one optional unit for
-<code>whisper-server</code>), and the full <code>vl-desktop</code> GUI
-surface (Compose / Rewrite / Translate workflows with preview and
-injection planning, Settings panel, History, system tray, capture HUD
-overlay, and the Liquid Glass visual language) are no longer deferred;
-see <code>docs/guides/desktop.html</code> and
-<code>docs/guides/systemd.html</code>.</p>
-<p>The repository already defines the seams for the remaining additions
-so the first implementation does not need to redesign the public
-interfaces.</p>
+<p>See <a href="./host-injection.html">Host Injection Strategy</a>,
+<a href="../guides/desktop.html">Desktop Shell</a>, and
+<a href="../guides/services.html">User Services</a> for shipped integrations.</p>
 
 </main>
 
 <footer class="vl-footer">
-  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu and macOS.</span>
+  <span>VoiceLayer: local-first voice composition layer for Ubuntu and macOS.</span>
   <span>Documentation source: HTML files under <code>docs/</code>.</span>
 </footer>
 </body>

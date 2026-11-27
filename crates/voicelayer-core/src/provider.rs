@@ -1,7 +1,8 @@
+//! Static provider and host-adapter catalogs plus ASR dispatch validation.
+
 use serde::{Deserialize, Serialize};
 
-/// Capability category a provider serves: speech recognition, text
-/// generation, speech synthesis, or host automation.
+/// Capability category served by a provider.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -11,45 +12,33 @@ pub enum ProviderKind {
     HostAdapter,
 }
 
-/// Static catalog entry describing one provider to clients and
-/// operators (`vl providers`, `GET /v1/providers`).
+/// Static catalog entry returned by `GET /v1/providers` and `vl providers`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderDescriptor {
-    /// Operator-facing identifier used by `TranscribeRequest.provider_id`
-    /// and the worker's RPC dispatch.
+    /// Identifier accepted by `TranscribeRequest.provider_id` and RPC dispatch.
     pub id: String,
     pub kind: ProviderKind,
-    /// How the daemon or worker reaches the provider (e.g.
-    /// `local_process`, `stdio_worker`, `xdg_portal`).
+    /// Transport mechanism (for example `local_process`, `stdio_worker`, `xdg_portal`).
     pub transport: String,
-    /// Whether the provider runs entirely on-device; `false` marks
-    /// cloud-backed entries.
+    /// `true` when execution stays on the local host.
     pub local: bool,
-    /// Whether the provider is active without an explicit opt-in.
+    /// `true` when active without explicit opt-in.
     pub default_enabled: bool,
-    /// Whether the entry is advertised but not production-hardened.
+    /// `true` for experimental or advertised-only entries.
     pub experimental: bool,
-    /// License of the provider implementation; `system` or `n/a` for
-    /// host-provided surfaces.
+    /// SPDX license identifier, or `system` / `n/a` for host-provided surfaces.
     pub license: String,
 }
 
-/// ASR provider ids the daemon and Python worker can actually dispatch
-/// at runtime. The catalog returned by `default_provider_catalog` may
-/// list additional advertised-only entries (e.g., `voxtral_realtime`)
-/// that lack a transcribe handler today; routing a session to one of
-/// those would surface as a worker-side `provider unavailable` only
-/// after audio capture, so the daemon's pre-flight validation is keyed
-/// off this narrower set instead of the catalog.
+/// ASR provider ids supported by runtime transcription dispatch.
 ///
-/// Keep in sync with `python/voicelayer_orchestrator/worker.py` and the
-/// `provider_id` enum in `openapi/voicelayerd.v1.yaml`.
+/// Keep aligned with `python/voicelayer_worker/pipeline.py` and the `provider_id`
+/// enum in `openapi/voicelayerd.v1.yaml`.
 pub const SUPPORTED_TRANSCRIBE_PROVIDER_IDS: &[&str] =
     &["whisper_cpp", "mimo_v2_5_asr", "qwen3_asr_1_7b"];
 
-/// Return whether `provider_id` is a runtime-dispatchable ASR id.
-/// `None` (the default) is always accepted; the daemon falls back to
-/// the configured whisper.cpp chain.
+/// Returns `true` if `provider_id` is `None` (default whisper.cpp) or listed in
+/// [`SUPPORTED_TRANSCRIBE_PROVIDER_IDS`].
 pub fn is_supported_transcribe_provider_id(provider_id: Option<&str>) -> bool {
     match provider_id {
         None => true,
@@ -57,9 +46,13 @@ pub fn is_supported_transcribe_provider_id(provider_id: Option<&str>) -> bool {
     }
 }
 
-/// Static catalog of ASR and LLM providers. May include advertised-only
-/// experimental entries without a runtime handler; the dispatchable ASR
-/// subset is [`SUPPORTED_TRANSCRIBE_PROVIDER_IDS`].
+/// Returns `true` if the ASR provider supports `translate_to_english`.
+/// Only the default `whisper_cpp` backend implements speech-to-English translation.
+pub fn provider_supports_asr_translation(provider_id: Option<&str>) -> bool {
+    matches!(provider_id, None | Some("whisper_cpp"))
+}
+
+/// Static catalog of ASR and LLM providers.
 pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
     vec![
         ProviderDescriptor {
@@ -110,10 +103,7 @@ pub fn default_provider_catalog() -> Vec<ProviderDescriptor> {
     ]
 }
 
-/// Static catalog of host-side automation surfaces. The leading entry
-/// is platform-specific (`atspi_accessible_text` on Linux,
-/// `macos_clipboard_paste` elsewhere); `global_shortcuts` reports the
-/// XDG GlobalShortcuts portal on Linux and Carbon hotkeys on macOS.
+/// Static catalog of platform host adapters for text insertion and global hotkeys.
 pub fn default_host_adapter_catalog() -> Vec<ProviderDescriptor> {
     let mut catalog = vec![
         ProviderDescriptor {
@@ -174,6 +164,7 @@ mod tests {
     use super::{
         ProviderKind, SUPPORTED_TRANSCRIBE_PROVIDER_IDS, default_host_adapter_catalog,
         default_provider_catalog, is_supported_transcribe_provider_id,
+        provider_supports_asr_translation,
     };
 
     #[test]
@@ -192,38 +183,26 @@ mod tests {
         );
     }
 
-    /// `mimo_v2_5_asr` is the optional GPU-only ASR provider (Xiaomi
-    /// MiMo-V2.5-ASR via the Python worker). It must be advertised in
-    /// the catalog so `vl providers` lists it, but with
-    /// `default_enabled: false` and `experimental: true` so the
-    /// whisper.cpp chain stays the default and operators have to
-    /// explicitly opt in via `TranscribeRequest.provider_id`.
     #[test]
     fn catalog_contains_mimo_v2_5_asr_descriptor_as_optional_experimental() {
         let catalog = default_provider_catalog();
         let mimo = catalog
             .iter()
             .find(|provider| provider.id == "mimo_v2_5_asr")
-            .expect("mimo_v2_5_asr must be present in the default provider catalog");
+            .expect("mimo_v2_5_asr descriptor missing");
         assert_eq!(mimo.kind, ProviderKind::Asr);
         assert!(!mimo.default_enabled);
         assert!(mimo.experimental);
         assert_eq!(mimo.license, "MIT");
     }
 
-    /// `qwen3_asr_1_7b` is the optional Apache-2.0 ASR provider
-    /// (Alibaba Qwen/Qwen3-ASR-1.7B via the Python worker's `qwen-asr`
-    /// wrapper). Must advertise in the catalog so `vl providers` lists
-    /// it, but stay `default_enabled: false` / `experimental: true` so
-    /// the whisper.cpp chain remains the default and operators opt in
-    /// explicitly via `TranscribeRequest.provider_id`.
     #[test]
     fn catalog_contains_qwen3_asr_1_7b_descriptor_as_optional_experimental() {
         let catalog = default_provider_catalog();
         let qwen3 = catalog
             .iter()
             .find(|provider| provider.id == "qwen3_asr_1_7b")
-            .expect("qwen3_asr_1_7b must be present in the default provider catalog");
+            .expect("qwen3_asr_1_7b descriptor missing");
         assert_eq!(qwen3.kind, ProviderKind::Asr);
         assert!(!qwen3.default_enabled);
         assert!(qwen3.experimental);
@@ -240,39 +219,18 @@ mod tests {
         );
     }
 
-    /// Every entry in either catalog must have a non-empty `id`,
-    /// `transport`, and `license`. Empty strings would silently pass
-    /// the existing `id == "..."` checks but break the `vl providers`
-    /// listing (empty rows) and the OpenAPI contract's
-    /// `ProviderDescriptor` schema (`required: [id, kind, transport,
-    /// ...]` doesn't constrain string emptiness).
     #[test]
     fn provider_catalog_entries_have_non_empty_required_string_fields() {
         for provider in default_provider_catalog()
             .iter()
             .chain(default_host_adapter_catalog().iter())
         {
-            assert!(
-                !provider.id.is_empty(),
-                "every catalog entry must have a non-empty id; got: {provider:?}",
-            );
-            assert!(
-                !provider.transport.is_empty(),
-                "every catalog entry must have a non-empty transport; got: {provider:?}",
-            );
-            assert!(
-                !provider.license.is_empty(),
-                "every catalog entry must have a non-empty license; got: {provider:?}",
-            );
+            assert!(!provider.id.is_empty());
+            assert!(!provider.transport.is_empty());
+            assert!(!provider.license.is_empty());
         }
     }
 
-    /// `id` is the operator-facing handle used by `vl providers`,
-    /// `vl doctor`, and the worker's RPC dispatch. A duplicate id
-    /// would silently route every selection to whichever entry
-    /// happens to be enumerated first; the cross-catalog check
-    /// catches duplicates introduced by accidentally reusing a host
-    /// adapter id under the regular provider catalog.
     #[test]
     fn provider_catalog_ids_are_unique_across_both_catalogs() {
         let mut seen = std::collections::HashSet::new();
@@ -282,51 +240,26 @@ mod tests {
         {
             assert!(
                 seen.insert(provider.id.clone()),
-                "duplicate id `{}` across catalogs; ids must be globally unique",
+                "duplicate provider id `{}`",
                 provider.id,
             );
         }
     }
 
-    /// The host adapter catalog is reserved for `HostAdapter`-kind
-    /// entries; mixing in an `Asr`/`Llm`/`Tts` entry would mislead
-    /// the desktop integration about which providers are
-    /// host-side automation surfaces.
     #[test]
     fn host_adapter_catalog_entries_are_all_host_adapter_kind() {
         for provider in default_host_adapter_catalog() {
-            assert_eq!(
-                provider.kind,
-                ProviderKind::HostAdapter,
-                "host_adapter_catalog entry `{}` has kind {:?}; expected HostAdapter",
-                provider.id,
-                provider.kind,
-            );
+            assert_eq!(provider.kind, ProviderKind::HostAdapter);
         }
     }
 
-    /// Symmetric invariant: the regular provider catalog must not
-    /// include `HostAdapter`-kind entries; those belong in
-    /// `default_host_adapter_catalog()`. Catches the inverse drift
-    /// of the previous test.
     #[test]
     fn regular_provider_catalog_does_not_include_host_adapter_kind() {
         for provider in default_provider_catalog() {
-            assert_ne!(
-                provider.kind,
-                ProviderKind::HostAdapter,
-                "default_provider_catalog entry `{}` is HostAdapter-kind; \
-                 move it to default_host_adapter_catalog",
-                provider.id,
-            );
+            assert_ne!(provider.kind, ProviderKind::HostAdapter);
         }
     }
 
-    /// `SUPPORTED_TRANSCRIBE_PROVIDER_IDS` is the runtime-dispatchable
-    /// subset of the catalog's ASR entries. Any id added to it must
-    /// show up in the catalog as an `Asr` provider so `vl providers`
-    /// stays in sync with what `transcribe` will actually route to;
-    /// catches a typo'd entry that would always fail validation.
     #[test]
     fn every_supported_transcribe_provider_id_appears_in_catalog_as_asr() {
         let catalog = default_provider_catalog();
@@ -334,45 +267,27 @@ mod tests {
             let descriptor = catalog
                 .iter()
                 .find(|provider| provider.id == *id)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "SUPPORTED_TRANSCRIBE_PROVIDER_IDS lists `{id}` but the catalog \
-                         does not advertise it; add the descriptor to \
-                         default_provider_catalog or remove the id"
-                    )
-                });
-            assert_eq!(
-                descriptor.kind,
-                ProviderKind::Asr,
-                "SUPPORTED_TRANSCRIBE_PROVIDER_IDS lists `{id}` but the catalog kind is \
-                 {:?}; only Asr providers belong in the transcribe whitelist",
-                descriptor.kind,
-            );
+                .unwrap_or_else(|| panic!("missing catalog entry for `{id}`"));
+            assert_eq!(descriptor.kind, ProviderKind::Asr);
         }
     }
 
-    /// `is_supported_transcribe_provider_id` is the validation helper
-    /// the daemon's dictation entry points call to reject typos before
-    /// recording starts. Pin both directions: every supported id is
-    /// accepted, an unknown id is rejected, and `None` is accepted as
-    /// the documented "let the daemon fall back to whisper" default.
     #[test]
     fn is_supported_transcribe_provider_id_accepts_listed_ids_and_none() {
         assert!(is_supported_transcribe_provider_id(None));
         for id in SUPPORTED_TRANSCRIBE_PROVIDER_IDS {
-            assert!(
-                is_supported_transcribe_provider_id(Some(*id)),
-                "supported id `{id}` must be accepted",
-            );
+            assert!(is_supported_transcribe_provider_id(Some(*id)));
         }
         assert!(!is_supported_transcribe_provider_id(Some("not_a_provider")));
-        assert!(
-            !is_supported_transcribe_provider_id(Some("mimo_v2_5")),
-            "typo-style id (missing `_asr`) must be rejected",
-        );
-        assert!(
-            !is_supported_transcribe_provider_id(Some("qwen3_asr")),
-            "typo-style id (missing `_1_7b`) must be rejected",
-        );
+        assert!(!is_supported_transcribe_provider_id(Some("mimo_v2_5")));
+        assert!(!is_supported_transcribe_provider_id(Some("qwen3_asr")));
+    }
+
+    #[test]
+    fn translation_support_is_limited_to_whisper_cpp() {
+        assert!(provider_supports_asr_translation(None));
+        assert!(provider_supports_asr_translation(Some("whisper_cpp")));
+        assert!(!provider_supports_asr_translation(Some("mimo_v2_5_asr")));
+        assert!(!provider_supports_asr_translation(Some("qwen3_asr_1_7b")));
     }
 }

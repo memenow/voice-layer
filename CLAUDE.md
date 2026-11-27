@@ -1,56 +1,53 @@
 # VoiceLayer Contributor Instructions
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-`AGENTS.md` is a symbolic link to this file — only edit `CLAUDE.md`.
+This file provides contributor and agent instructions for this repository.
+`AGENTS.md` is a symbolic link to this file; edit `CLAUDE.md` only.
 
 ## Product Focus
 
 VoiceLayer is a local-first voice composition layer for Ubuntu and macOS (Apple Silicon) desktop workflows; Ubuntu GNOME Wayland is the primary target.
-It is not a traditional input method editor. The product must support:
+It is not a traditional input method editor. The product supports:
 
 - Low-latency dictation into the focused application.
 - Structured composition workflows for longer text such as email, issue descriptions, prompts, and technical notes.
 - Text rewrite and translation workflows.
-- GUI and terminal/TUI targets with the same domain model.
+- GUI and terminal/TUI targets sharing the same domain model.
 
 ## Engineering Rules
 
 - Research dependencies and prior art before adding new code paths or third-party packages.
-- Prefer readable, direct implementations over clever abstractions.
+- Prefer readable, direct implementations over unnecessary abstractions.
 - Default to Google-style API design and OpenAPI documentation for public interfaces.
 - Use inclusive language in code, docs, and user-visible text.
-- Keep the core repository Apache-2.0 friendly. Any restrictive or copyleft component must stay outside the required runtime path.
-- Treat local execution as the default. Cloud providers are optional enhancements.
+- Keep the core repository Apache-2.0 compatible. Restrictive or copyleft components must stay outside the required runtime path.
+- Keep local execution as the default. Cloud providers are optional enhancements.
 
 ## Architecture Defaults
 
-- Rust owns the long-running daemon, CLI/TUI, desktop integration, process supervision, and host adapters.
-- Python owns model orchestration, experimentation, and provider-specific worker implementations.
-- Inter-process communication between Rust and Python uses JSON-RPC over stdio.
-- The daemon exposes a local `/v1` API over a Unix domain socket and documents it with OpenAPI 3.1.
+- Rust owns the daemon, CLI/TUI, desktop UI, process supervision, audio capture, and host adapters.
+- Python (`python/voicelayer_worker`) owns model orchestration and provider-specific worker adapters.
+- Inter-process communication between Rust and Python uses line-delimited JSON-RPC 2.0 over stdio.
+- The daemon exposes a local `/v1` HTTP API over a Unix domain socket, documented in `openapi/voicelayerd.v1.yaml`.
 
 ## Host Strategy
 
-- Ubuntu GNOME Wayland is the primary desktop target.
-- Global shortcuts should prefer the XDG Global Shortcuts portal.
-- GUI text injection should prefer AT-SPI editable text operations.
-- Terminal injection should prefer bracketed paste and must not auto-submit by default.
-- Keyboard simulation tools such as `ydotool` or `wtype` are fallbacks, not the primary strategy.
+- Ubuntu GNOME Wayland is the primary desktop target; macOS Apple Silicon is supported.
+- Global shortcuts prefer the XDG Global Shortcuts portal on Linux and Carbon `RegisterEventHotKey` on macOS.
+- GUI text injection prefers AT-SPI editable text operations, then clipboard paste with restoration.
+- Terminal injection prefers bracketed paste and never auto-submits by default.
+- Keyboard simulation tools (`ydotool`, `wtype`) remain fallbacks.
 
 ## Workflow
 
-- Before large feature work, complete the Discovery Gate in Serena memories under `features/<feature>/`.
-- If implementation diverges from `docs/`, update the docs before or alongside the code change.
-- Use `uv` for Python commands and isolated environments. Do not rely on the system interpreter for project tasks.
+- Keep README, OpenAPI, and HTML documentation aligned with shipped behavior.
+- Use `uv` for all Python commands and isolated environments; do not depend on the system interpreter.
+- Standalone docs under `docs/` are maintained directly as HTML. Guard tests scan `docs/**/*.html` (excluding `docs/assets/`), `README.md`, `CLAUDE.md`, `openapi/voicelayerd.v1.yaml`, and `systemd/voicelayerd.env.example`.
 - Before closing a task, run the verification chain in the Commands section below.
-- Keep README, OpenAPI, and architecture docs aligned with shipped behavior.
-- Documentation layout: standalone pages under `docs/` are maintained directly as HTML. The guard tests scan `docs/**/*.html` (excluding `docs/assets/`).
-  They also scan the repo-root `README.md`; update the HTML page directly whenever shipped behavior changes.
 - Use GitHub flow: feature branch per change, open PRs with `gh pr create`, and follow conventional commits.
 
 ## Commands
 
-- Verify before closing a task (authoritative chain):
+- Authoritative verification chain:
 
   ```bash
   cargo fmt --all \
@@ -63,9 +60,8 @@ It is not a traditional input method editor. The product must support:
 
 - Sync Python dev environment: `uv sync --group dev`
 - Run the daemon from source: `cargo run -p voicelayerd` (add `--project-root "$(pwd)"` or set `VOICELAYER_PROJECT_ROOT` when starting outside the repo root)
-- Inspect runtime environment and provider reachability: `cargo run -p vl -- doctor`
-- List host adapters and worker providers: `cargo run -p vl -- providers`
-- If the daemon is launched outside the repo root, set `VOICELAYER_PROJECT_ROOT` so the Python worker resolves.
+- Inspect runtime environment and provider reachability: `cargo run -p voicelayer-cli -- doctor`
+- List host adapters and worker providers: `cargo run -p voicelayer-cli -- providers`
 
 ## Domain Vocabulary
 

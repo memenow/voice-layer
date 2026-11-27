@@ -1,15 +1,8 @@
-//! Liquid Glass design tokens (2026 baseline).
-//!
-//! Numbers marked `calibrated` are NOT Apple spec — Apple ships the material as
-//! opaque system rendering and publishes almost no quantities. The only
-//! Apple-published number here is [`CLEAR_DIM`] (the clear-variant 35% dimming
-//! layer). Treat everything else as our own calibration against the published
-//! qualitative model (translucency, lensed edge, concentric corners, two-layer
-//! separation, monochrome adaptive content color).
+//! Shared spacing, typography, radius, motion, palette, and translucent surface tokens.
 
 use crate::color::Rgba;
 
-/// 8pt spacing scale.
+/// 4pt-base spacing scale.
 pub mod space {
     pub const XS: f32 = 4.0;
     pub const SM: f32 = 8.0;
@@ -19,26 +12,20 @@ pub mod space {
     pub const XXL: f32 = 32.0;
 }
 
-/// Continuous (squircle) corner radii. Nested shapes are concentric:
-/// `inner = outer - padding` (Apple's `ConcentricRectangle` rule).
+/// Corner radii for pills, cards, and panels.
 pub mod radius {
-    /// Capsule default control shape (a large radius the renderer clamps to
-    /// half the height).
+    /// Large radius clamped by the renderer to half the control height.
     pub const PILL: f32 = 999.0;
-    /// Card / small floating surface. calibrated.
     pub const CARD: f32 = 20.0;
-    /// Large panel / sidebar / sheet. calibrated.
     pub const PANEL: f32 = 28.0;
 
-    /// Concentric inner radius for content padded inside an `outer`-radius
-    /// surface; never negative.
+    /// Concentric inner radius for content inset by `padding` inside `outer`.
     pub fn concentric_inner(outer: f32, padding: f32) -> f32 {
         (outer - padding).max(0.0)
     }
 }
 
-/// Type weight ramp. SF Pro is proprietary; map these onto Inter / the system
-/// font at the rendering edge.
+/// Font weight tokens mapped onto Inter static faces by the desktop frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Weight {
     Regular,
@@ -47,7 +34,7 @@ pub enum Weight {
     Bold,
 }
 
-/// Point sizes for the type ramp. calibrated to a desktop dictation tool.
+/// Point sizes for the type scale.
 pub mod text {
     pub const CAPTION: f32 = 12.0;
     pub const BODY: f32 = 14.0;
@@ -55,11 +42,8 @@ pub mod text {
     pub const LARGE_TITLE: f32 = 28.0;
 }
 
-/// Motion tokens. The concrete easing curves live in the GUI crate (mapped to
-/// `iced::animation::Easing`); here we expose the design intent and durations.
+/// Transition curves and durations in milliseconds.
 pub mod motion {
-    /// Animation intent. Liquid Glass favors elastic/springy transitions; a
-    /// pointer-driven desktop app uses the subdued amplitude.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Curve {
         Standard,
@@ -73,41 +57,33 @@ pub mod motion {
     pub const SLOW_MS: u64 = 420;
 }
 
-/// Color palette for one appearance (dark or light).
+/// Color palette for a light or dark appearance.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
-    /// App-drawn window background (deepest layer). On GNOME Wayland this — not
-    /// the real desktop — is what shows through translucent glass.
     pub bg_base: Rgba,
     pub bg_elevated: Rgba,
     pub text_primary: Rgba,
     pub text_secondary: Rgba,
-    /// Accent used only to emphasize primary actions (tint-as-emphasis).
     pub accent: Rgba,
-    /// Semantic status colors for badges and feedback. calibrated to the same
-    /// GitHub Primer family the accent is drawn from, so the docs, GUI, and TUI
-    /// agree on what "healthy / attention / error" looks like.
     pub success: Rgba,
     pub warning: Rgba,
     pub danger: Rgba,
-    /// Base glass film drawn atop the background. Alpha is the small-element
-    /// baseline; large surfaces scale up via [`glass`].
+    /// Base translucent fill drawn above the window backdrop.
     pub glass_tint: Rgba,
-    /// Top / inner specular stroke (the lensed highlight edge).
+    /// Inner top specular highlight stroke.
     pub glass_highlight: Rgba,
-    /// 2026 darkened outer edge for depth and separation.
+    /// Outer darkened edge for depth separation.
     pub glass_dark_edge: Rgba,
 }
 
-/// Dark or light appearance selector consumed by [`palette`].
+/// Light or dark color scheme selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appearance {
     Dark,
     Light,
 }
 
-/// Resolve the palette for an appearance. Dark is the primary target — glass
-/// reads best on deep backgrounds and a dictation tool is commonly dark.
+/// Resolve the palette for `appearance`.
 pub fn palette(appearance: Appearance) -> Palette {
     match appearance {
         Appearance::Dark => dark(),
@@ -121,14 +97,10 @@ fn dark() -> Palette {
         bg_elevated: Rgba::rgb8(0x12, 0x15, 0x1c),
         text_primary: Rgba::rgb8(0xf5, 0xf7, 0xfa),
         text_secondary: Rgba::rgb8(0xaa, 0xb2, 0xc0),
-        // docs dark accent (#58a6ff), kept in sync with the documentation theme.
         accent: Rgba::rgb8(0x58, 0xa6, 0xff),
-        // Primer dark status colors (success/attention/danger). calibrated.
         success: Rgba::rgb8(0x3f, 0xb9, 0x50),
         warning: Rgba::rgb8(0xd2, 0x99, 0x22),
         danger: Rgba::rgb8(0xf8, 0x51, 0x49),
-        // A light film lifts the glass off a dark base; the glass identity comes
-        // from this film + the highlight edge + the app-drawn background.
         glass_tint: Rgba::rgb8(0xff, 0xff, 0xff).with_alpha(0.10),
         glass_highlight: Rgba::rgb8(0xff, 0xff, 0xff).with_alpha(0.18),
         glass_dark_edge: Rgba::rgb8(0x00, 0x00, 0x00).with_alpha(0.28),
@@ -141,9 +113,7 @@ fn light() -> Palette {
         bg_elevated: Rgba::rgb8(0xff, 0xff, 0xff),
         text_primary: Rgba::rgb8(0x1c, 0x1e, 0x22),
         text_secondary: Rgba::rgb8(0x5b, 0x63, 0x70),
-        // docs light accent (#1f6feb).
         accent: Rgba::rgb8(0x1f, 0x6f, 0xeb),
-        // Primer light status colors. calibrated.
         success: Rgba::rgb8(0x1a, 0x7f, 0x37),
         warning: Rgba::rgb8(0x9a, 0x67, 0x00),
         danger: Rgba::rgb8(0xcf, 0x22, 0x2e),
@@ -153,43 +123,33 @@ fn light() -> Palette {
     }
 }
 
-/// Apple-published: the clear glass variant adds a 35% black dimming layer over
-/// bright content to preserve legibility.
+/// Dimming factor applied over bright content under clear translucent surfaces.
 pub const CLEAR_DIM: f32 = 0.35;
 
-/// Surface size class. Larger surfaces are more opaque to preserve legibility
-/// over complex backgrounds (HIG → Color).
+/// Surface size class. Larger surfaces use higher opacity for text legibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
-    /// Pills, toolbars, badges.
+    /// Pills, toolbars, and badges.
     Small,
-    /// Sidebars, sheets, cards.
+    /// Sidebars, sheets, and cards.
     Large,
 }
 
-/// Glass material parameters resolved for a given surface size, before the
-/// accessibility contract is applied (see [`crate::a11y::resolve_glass`]).
+/// Resolved translucent surface parameters prior to accessibility overrides.
 #[derive(Debug, Clone, Copy)]
 pub struct Glass {
     pub tint: Rgba,
     pub highlight: Rgba,
     pub dark_edge: Rgba,
-    /// Backdrop blur radius in px. Used by the shader; in styling-only mode it
-    /// is a semantic hint for how "frosted" the film looks.
     pub blur_radius: f32,
-    /// Backdrop saturation boost approximating vibrancy.
     pub saturation: f32,
     pub corner_radius: f32,
-    /// Normally 0; raised to a hard hairline by Increase Contrast.
     pub border_width: f32,
-    /// Border color; transparent unless Increase Contrast sets a contrasting
-    /// hairline.
     pub border_color: Rgba,
 }
 
-/// Build the base glass material for a surface size from a palette.
+/// Build the base surface parameters for `surface` from `palette`.
 pub fn glass(palette: &Palette, surface: Surface) -> Glass {
-    // Large surfaces bump alpha up (more opaque) and blur more. calibrated.
     let (alpha_bump, blur, corner) = match surface {
         Surface::Small => (0.0, 22.0, radius::CARD),
         Surface::Large => (0.06, 34.0, radius::PANEL),
@@ -201,7 +161,7 @@ pub fn glass(palette: &Palette, surface: Surface) -> Glass {
         highlight: palette.glass_highlight,
         dark_edge: palette.glass_dark_edge,
         blur_radius: blur,
-        saturation: 1.7, // calibrated vibrancy approximation
+        saturation: 1.7,
         corner_radius: corner,
         border_width: 0.0,
         border_color: Rgba::TRANSPARENT,
@@ -225,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_dim_is_the_apple_published_value() {
+    fn clear_dim_matches_expected_factor() {
         assert_eq!(CLEAR_DIM, 0.35);
     }
 
@@ -240,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn base_glass_has_no_border_until_a11y_adds_one() {
+    fn base_glass_has_no_border_until_accessibility_adds_one() {
         let g = glass(&palette(Appearance::Dark), Surface::Small);
         assert_eq!(g.border_width, 0.0);
         assert_eq!(g.border_color, Rgba::TRANSPARENT);

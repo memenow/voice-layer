@@ -1,14 +1,15 @@
+//! Injection payload construction for GUI and terminal targets.
+
 use crate::domain::{
     BRACKETED_PASTE_END, BRACKETED_PASTE_START, InjectRequest, InjectTarget, InjectionPlan,
 };
 
 impl InjectionPlan {
-    /// Derive the host-ready payload from `request`.
+    /// Build a host-ready injection payload from `request`.
     ///
-    /// GUI targets carry the text verbatim. `TerminalBracketedPaste`
-    /// wraps it in the bracketed-paste pair, appending `\n` only when
-    /// `auto_submit` is set; `TerminalKittyRemote` passes the text
-    /// through bare, again appending `\n` only on explicit submission.
+    /// GUI targets pass text verbatim. `TerminalBracketedPaste` wraps text in
+    /// bracketed-paste delimiters and appends `\n` only when `auto_submit` is set.
+    /// `TerminalKittyRemote` passes text bare and appends `\n` only on `auto_submit`.
     pub fn from_request(request: &InjectRequest) -> Self {
         let payload = match request.target {
             InjectTarget::GuiAccessible | InjectTarget::GuiClipboard => request.text.clone(),
@@ -92,11 +93,6 @@ mod tests {
 
     #[test]
     fn gui_clipboard_and_gui_accessible_share_verbatim_payload_arm() {
-        // `InjectionPlan::from_request` merges these two targets into a
-        // single match arm that clones `request.text` as the payload.
-        // Pin the shared behavior so a future split of the arm is
-        // caught here rather than downstream in the daemon's injection
-        // path.
         let text = "Inject into the focused editable surface.".to_owned();
 
         let accessible_plan = InjectionPlan::from_request(&InjectRequest {
@@ -112,14 +108,8 @@ mod tests {
 
         assert_eq!(accessible_plan.payload, text);
         assert_eq!(clipboard_plan.payload, text);
-        assert_eq!(accessible_plan.payload, clipboard_plan.payload);
     }
 
-    /// Empty input under `TerminalBracketedPaste` must still emit the
-    /// open/close bracketed-paste pair so terminals stay in their
-    /// expected paste-mode state even when the user dictation produced
-    /// no text. A future regression that special-cased empty text into
-    /// a bare `""` payload would leave the receiving shell mid-paste.
     #[test]
     fn terminal_bracketed_paste_wraps_empty_text_with_both_control_sequences() {
         let plan = InjectionPlan::from_request(&InjectRequest {

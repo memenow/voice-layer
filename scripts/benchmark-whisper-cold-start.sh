@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Measure `whisper-cli` cold-start latency to drive the Phase 3 segmentation decision.
+# Measure `whisper-cli` cold-start latency to choose between whisper-cli and whisper-server.
 #
 # Requirements:
 #   - whisper-cli on PATH (or VOICELAYER_WHISPER_BIN set to an absolute path)
 #   - VOICELAYER_WHISPER_MODEL_PATH set to an absolute path to a ggml whisper model
-#   - tests/fixtures/small.wav (create with `python3 scripts/generate_silent_fixture.py`)
+#   - tests/fixtures/small.wav (create with `uv run python scripts/generate-silent-fixture.py`)
 #
 # Usage:
 #   VOICELAYER_WHISPER_MODEL_PATH=/abs/path/to/ggml-base.en.bin \
 #     scripts/benchmark-whisper-cold-start.sh
 #
 # Optional environment overrides:
-#   RUNS=5               Number of timed runs (default: 5)
-#   FIXTURE=path.wav     Input audio (default: tests/fixtures/small.wav)
-#   VOICELAYER_WHISPER_BIN=/path/to/whisper-cli
-#   VOICELAYER_WHISPER_NO_GPU=true   Pass -ng to exclude GPU for a pure cold-start measurement
-#
-# The script reports per-run wall-clock seconds and the arithmetic mean, then
-# recommends one of two paths from the VoiceLayer roadmap:
-#   - mean < 0.25s: Phase 3B can proceed with fixed-duration segment transcription.
-#   - mean >= 0.25s: introduce providers/whisper_server.py (persistent whisper-server)
-#     before Phase 3B, otherwise segmentation is slower than one-shot transcription.
+#   RUNS=5                           Number of timed runs (default: 5)
+#   FIXTURE=path.wav                 Input audio (default: tests/fixtures/small.wav)
+#   VOICELAYER_WHISPER_BIN=...       Path to whisper-cli
+#   VOICELAYER_WHISPER_NO_GPU=true   Pass -ng to measure CPU cold-start only
+#   THRESHOLD_SECONDS=0.25           Latency threshold for recommending whisper-server
 
 set -euo pipefail
 
@@ -43,7 +38,7 @@ fi
 
 if [[ ! -f "$FIXTURE" ]]; then
   echo "error: fixture not found at $FIXTURE" >&2
-  echo "       generate one with: python3 scripts/generate_silent_fixture.py" >&2
+  echo "       generate one with: uv run python scripts/generate-silent-fixture.py" >&2
   exit 64
 fi
 
@@ -67,7 +62,7 @@ printf 'runs    : %d\n' "$RUNS"
 printf 'args    : %s\n' "${extra_args[*]:-(none)}"
 printf -- '---\n'
 
-# Measure one invocation and echo wall-clock seconds to stdout.
+# Measure one invocation and print wall-clock seconds to stdout.
 time_one() {
   local out_stem="$tmp_out/out-$1"
   local start_ns end_ns
@@ -81,10 +76,8 @@ time_one() {
 total_ms=0
 min_s=""
 max_s=""
-declare -a samples=()
 for i in $(seq 1 "$RUNS"); do
   seconds="$(time_one "$i")"
-  samples+=("$seconds")
   printf 'run %d: %s s\n' "$i" "$seconds"
   total_ms=$(awk -v t="$total_ms" -v s="$seconds" 'BEGIN { printf "%.0f", t + s * 1000 }')
   if [[ -z "$min_s" ]]; then
@@ -106,12 +99,11 @@ printf 'max  : %s s\n' "$max_s"
 decision=$(awk -v m="$mean_s" -v t="$THRESHOLD_SECONDS" 'BEGIN { print (m < t ? "below" : "above") }')
 if [[ "$decision" == "below" ]]; then
   echo ""
-  echo "decision: mean cold-start ($mean_s s) < threshold ($THRESHOLD_SECONDS s)"
-  echo "          → Phase 3B (fixed segment recording) can proceed."
+  echo "recommendation: mean cold-start ($mean_s s) < threshold ($THRESHOLD_SECONDS s)"
+  echo "                one-shot whisper-cli is fast enough for segmented dictation."
 else
   echo ""
-  echo "decision: mean cold-start ($mean_s s) >= threshold ($THRESHOLD_SECONDS s)"
-  echo "          → Introduce providers/whisper_server.py (persistent whisper-server)"
-  echo "            before Phase 3B; fixed-segment transcription would be slower"
-  echo "            than today's one-shot path otherwise."
+  echo "recommendation: mean cold-start ($mean_s s) >= threshold ($THRESHOLD_SECONDS s)"
+  echo "                prefer persistent whisper-server (see docs/guides/asr-providers.html)"
+  echo "                to avoid paying model load latency on every segment."
 fi

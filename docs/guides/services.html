@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>User Services Guide | VoiceLayer Documentation</title>
+<meta name="description" content="Install VoiceLayer binaries and run voicelayerd as a systemd user service on Linux or a LaunchAgent on macOS, plus optional persistent whisper-server configuration." />
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<a class="vl-skip-link" href="#main">Skip to main content</a>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/services.html" aria-current="page">Services</a>
+    <a href="../guides/asr-providers.html">ASR providers</a>
+    <a href="../guides/llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+
+<main id="main">
+
+<h1 id="user-services">User Services (Linux &amp; macOS)</h1>
+
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#installer">One-Shot Installer</a></li>
+<li><a href="#linux-systemd">Linux (systemd User Units)</a></li>
+<li><a href="#macos-launchd">macOS (LaunchAgent)</a></li>
+<li><a href="#environment-variables">Environment Variables</a>
+<ul>
+<li><a href="#core">Core</a></li>
+<li><a href="#whisper-asr">whisper.cpp (ASR)</a></li>
+<li><a href="#optional-gpu-asr">Optional GPU ASR Providers</a></li>
+<li><a href="#openai-compatible-llm">OpenAI-Compatible LLM</a></li>
+<li><a href="#client-only-vars">Client-Side Only (vl-desktop)</a></li>
+</ul></li>
+<li><a href="#persistent-whisper-server">Persistent whisper-server (Linux)</a>
+<ul>
+<li><a href="#enable-whisper-unit">Enable the Dedicated Unit</a></li>
+<li><a href="#docker-alternative">Docker Drop-In Override</a></li>
+</ul></li>
+<li><a href="#manual-install">Manual Install (Linux)</a></li>
+<li><a href="#uninstall">Uninstall</a></li>
+</ul>
+</nav>
+
+<p>Running <code>voicelayerd</code> as a user service keeps its Unix socket
+ready whenever <code>vl</code>, <code>vl-desktop</code>, or a global shortcut
+triggers dictation or composition.</p>
+
+<h2 id="installer">One-Shot Installer</h2>
+<pre><code>scripts/install.sh</code></pre>
+<p>The script runs these steps:</p>
+<ol>
+<li>Builds release binaries with
+<code>cargo build --release --bin voicelayerd --bin vl --bin vl-desktop</code>.</li>
+<li>Installs <code>voicelayerd</code>, <code>vl</code>,
+<code>vl-desktop</code>, and <code>voicelayer-whisper-server-run.sh</code>
+into <code>~/.local/bin</code> (override with
+<code>VOICELAYER_INSTALL_BIN_DIR</code>).</li>
+<li>On Linux, copies <code>systemd/voicelayerd.service</code> and
+<code>systemd/voicelayer-whisper-server.service</code> into
+<code>~/.config/systemd/user/</code> (override with
+<code>VOICELAYER_INSTALL_UNIT_DIR</code>), reloads systemd, and restarts active
+units. On macOS, renders <code>launchd/com.memenow.voicelayerd.plist</code>
+into <code>~/Library/LaunchAgents/com.memenow.voicelayerd.plist</code>.</li>
+<li>Seeds <code>~/.config/voicelayer/voicelayerd.env</code> from
+<code>systemd/voicelayerd.env.example</code> if not already present (override
+directory with <code>VOICELAYER_INSTALL_ENV_DIR</code>).</li>
+<li>Runs <code>vl doctor</code> to check provider and host status.</li>
+</ol>
+
+<h2 id="linux-systemd">Linux (systemd User Units)</h2>
+<p>Edit <code>~/.config/voicelayer/voicelayerd.env</code> with your model paths,
+then enable and start the daemon:</p>
+<pre><code>systemctl --user enable --now voicelayerd
+systemctl --user status voicelayerd
+journalctl --user -u voicelayerd</code></pre>
+
+<h2 id="macos-launchd">macOS (LaunchAgent)</h2>
+<p><code>scripts/install.sh</code> installs
+<code>~/Library/LaunchAgents/com.memenow.voicelayerd.plist</code> with
+<code>__HOME__</code> expanded to your home directory. Load, inspect, or unload
+the agent with <code>launchctl</code>:</p>
+<pre><code>launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.memenow.voicelayerd.plist
+launchctl print "gui/$(id -u)/com.memenow.voicelayerd"
+tail -f ~/Library/Logs/voicelayerd.log
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.memenow.voicelayerd.plist</code></pre>
+<p>Note that <code>launchd</code> does not load systemd
+<code>EnvironmentFile</code> files automatically. Export required
+<code>VOICELAYER_*</code> variables via <code>EnvironmentVariables</code> in the
+plist (or a wrapper script) when starting <code>voicelayerd</code> through
+<code>launchd</code>.</p>
+
+<h2 id="environment-variables">Environment Variables</h2>
+<p><code>~/.config/voicelayer/voicelayerd.env</code> configures the daemon under
+systemd. Use absolute paths; systemd <code>EnvironmentFile</code> does not
+expand <code>%h</code>, <code>%t</code>, or shell variables inside values.</p>
+
+<h3 id="core">Core</h3>
+<ul>
+<li><code>VOICELAYER_PROJECT_ROOT</code>: repository root used to locate
+<code>python/voicelayer_worker</code>. Required when starting outside the
+repository directory.</li>
+<li><code>VOICELAYER_SOCKET_PATH</code>: optional override for the daemon Unix
+socket path. Defaults to <code>$XDG_RUNTIME_DIR/voicelayer/daemon.sock</code>
+(or <code>$TMPDIR/voicelayer/daemon.sock</code> when
+<code>XDG_RUNTIME_DIR</code> is unset). Both <code>voicelayerd</code> and
+<code>vl</code> / <code>vl-desktop</code> honor this variable.</li>
+<li><code>VOICELAYER_WORKER_TIMEOUT_SECONDS</code>: timeout in seconds for
+worker inference RPCs (<code>transcribe</code>, <code>compose</code>,
+<code>rewrite</code>, <code>translate</code>). Probe RPCs use a fixed 15 s
+timeout. Defaults to <code>600</code>.</li>
+</ul>
+
+<h3 id="whisper-asr">whisper.cpp (ASR)</h3>
+<ul>
+<li><code>VOICELAYER_WHISPER_BIN</code>,
+<code>VOICELAYER_WHISPER_MODEL_PATH</code>,
+<code>VOICELAYER_WHISPER_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_WHISPER_NO_GPU</code>,
+<code>VOICELAYER_WHISPER_ARGS</code>: one-shot <code>whisper-cli</code>
+settings.</li>
+<li><code>VOICELAYER_WHISPER_SERVER_HOST</code>,
+<code>VOICELAYER_WHISPER_SERVER_PORT</code>,
+<code>VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS</code>: persistent
+<a href="./asr-providers.html">whisper-server</a> endpoint settings.</li>
+<li><code>VOICELAYER_WHISPER_SERVER_AUTO_START</code>,
+<code>VOICELAYER_WHISPER_SERVER_BIN</code>,
+<code>VOICELAYER_WHISPER_SERVER_ARGS</code>,
+<code>VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS</code>: worker-managed
+<code>whisper-server</code> autostart.</li>
+<li><code>VOICELAYER_WHISPER_VAD_ENABLED</code>,
+<code>VOICELAYER_WHISPER_VAD_MODEL_PATH</code>,
+<code>VOICELAYER_WHISPER_VAD_THRESHOLD</code>,
+<code>VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS</code>,
+<code>VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS</code>,
+<code>VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS</code>,
+<code>VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS</code>,
+<code>VOICELAYER_WHISPER_VAD_SAMPLE_RATE</code>: optional Silero VAD
+pre-pass.</li>
+</ul>
+
+<h3 id="optional-gpu-asr">Optional GPU ASR Providers</h3>
+<ul>
+<li>MiMo-V2.5-ASR: <code>VOICELAYER_MIMO_MODEL_PATH</code>,
+<code>VOICELAYER_MIMO_TOKENIZER_PATH</code>,
+<code>VOICELAYER_MIMO_REPO_PATH</code>, <code>VOICELAYER_MIMO_DEVICE</code>,
+<code>VOICELAYER_MIMO_AUDIO_TAG</code>,
+<code>VOICELAYER_MIMO_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS</code>,
+<code>VOICELAYER_MIMO_ARGS</code>.</li>
+<li>Qwen3-ASR-1.7B: <code>VOICELAYER_QWEN3_ASR_MODEL_PATH</code>,
+<code>VOICELAYER_QWEN3_ASR_DEVICE</code>,
+<code>VOICELAYER_QWEN3_ASR_TORCH_DTYPE</code> (or legacy alias
+<code>VOICELAYER_QWEN3_ASR_DTYPE</code>),
+<code>VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS</code>,
+<code>VOICELAYER_QWEN3_ASR_ARGS</code>.</li>
+</ul>
+
+<h3 id="openai-compatible-llm">OpenAI-Compatible LLM</h3>
+<ul>
+<li><code>VOICELAYER_LLM_ENDPOINT</code>,
+<code>VOICELAYER_LLM_MODEL</code>, <code>VOICELAYER_LLM_API_KEY</code>,
+<code>VOICELAYER_LLM_TIMEOUT_SECONDS</code>.</li>
+<li><code>VOICELAYER_LLM_AUTO_START</code>,
+<code>VOICELAYER_LLAMA_SERVER_BIN</code>,
+<code>VOICELAYER_LLAMA_MODEL_PATH</code>,
+<code>VOICELAYER_LLAMA_HF_REPO</code>,
+<code>VOICELAYER_LLAMA_SERVER_ARGS</code>,
+<code>VOICELAYER_LLAMA_LAUNCH_TIMEOUT_SECONDS</code>,
+<code>VOICELAYER_LLAMA_POLL_INTERVAL_SECONDS</code>.</li>
+</ul>
+
+<h3 id="client-only-vars">Client-Side Only (vl-desktop)</h3>
+<p><code>VOICELAYER_DAEMON_BIN</code> and <code>VOICELAYER_LOG</code> are read
+by <code>vl-desktop</code> rather than <code>voicelayerd</code> and are excluded
+from <code>voicelayerd.env</code>. See <a href="./desktop.html">Desktop Shell</a>.</p>
+
+<h2 id="persistent-whisper-server">Persistent whisper-server (Linux)</h2>
+<p>Running <code>whisper-server</code> persistently keeps the ggml model mapped
+across requests instead of reloading on every capture. Pick one management mode:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>When to use it</th>
+<th>Managed by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>VOICELAYER_WHISPER_SERVER_AUTO_START=true</code> in
+<code>voicelayerd.env</code></td>
+<td>Lazy startup on the first transcription call, tied to the worker.</td>
+<td><code>voicelayerd</code></td>
+</tr>
+<tr>
+<td><code>systemctl --user enable --now voicelayer-whisper-server</code></td>
+<td>Always running on login with separate journald logs and restart policy.</td>
+<td>systemd unit</td>
+</tr>
+</tbody>
+</table>
+<p>Do not enable both simultaneously or both will contend for the same port.
+Leave <code>VOICELAYER_WHISPER_SERVER_AUTO_START</code> unset or
+<code>false</code> when using the dedicated unit.</p>
+
+<h3 id="enable-whisper-unit">Enable the Dedicated Unit</h3>
+<pre><code># Required in ~/.config/voicelayer/voicelayerd.env:
+#   VOICELAYER_WHISPER_SERVER_BIN=/absolute/path/to/whisper-server
+#   VOICELAYER_WHISPER_MODEL_PATH=/absolute/path/to/ggml-base.en.bin
+#   VOICELAYER_WHISPER_SERVER_PORT=8188
+systemctl --user enable --now voicelayer-whisper-server
+systemctl --user status voicelayer-whisper-server
+journalctl --user -u voicelayer-whisper-server</code></pre>
+<p>The unit runs <code>voicelayer-whisper-server-run.sh</code>, which validates
+environment variables, tokenizes <code>VOICELAYER_WHISPER_SERVER_ARGS</code>
+with Python's <code>shlex.split</code>, and calls <code>exec</code> so systemd
+tracks the server PID directly. Check <code>vl doctor</code> for
+<code>whisper_mode: "server"</code>.</p>
+
+<h3 id="docker-alternative">Docker Drop-In Override</h3>
+<p>To run the container image <code>ghcr.io/ggml-org/whisper.cpp:main</code>
+instead of a host binary, create a systemd drop-in:</p>
+<pre><code>mkdir -p ~/.config/systemd/user/voicelayer-whisper-server.service.d
+cat &gt; ~/.config/systemd/user/voicelayer-whisper-server.service.d/docker.conf &lt;&lt;'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/docker run --rm --name voicelayer-whisper-server \
+  -p 127.0.0.1:8188:8188 \
+  -v %h/.cache/voicelayer/models:/models:ro \
+  --entrypoint whisper-server \
+  ghcr.io/ggml-org/whisper.cpp:main \
+  -m /models/ggml-base.en.bin \
+  --host 0.0.0.0 --port 8188 -ng
+ExecStop=/usr/bin/docker stop voicelayer-whisper-server
+EOF
+systemctl --user daemon-reload
+systemctl --user restart voicelayer-whisper-server</code></pre>
+
+<h2 id="manual-install">Manual Install (Linux)</h2>
+<pre><code>cargo build --release --bin voicelayerd --bin vl --bin vl-desktop
+install -m 0755 target/release/voicelayerd ~/.local/bin/voicelayerd
+install -m 0755 target/release/vl ~/.local/bin/vl
+install -m 0755 target/release/vl-desktop ~/.local/bin/vl-desktop
+install -m 0755 scripts/voicelayer-whisper-server-run.sh \
+  ~/.local/bin/voicelayer-whisper-server-run.sh
+install -d ~/.config/systemd/user ~/.config/voicelayer
+install -m 0644 systemd/voicelayerd.service ~/.config/systemd/user/voicelayerd.service
+install -m 0644 systemd/voicelayer-whisper-server.service \
+  ~/.config/systemd/user/voicelayer-whisper-server.service
+[[ -f ~/.config/voicelayer/voicelayerd.env ]] || \
+  install -m 0600 systemd/voicelayerd.env.example ~/.config/voicelayer/voicelayerd.env
+systemctl --user daemon-reload
+systemctl --user enable --now voicelayerd</code></pre>
+
+<h2 id="uninstall">Uninstall</h2>
+<p>Linux:</p>
+<pre><code>systemctl --user disable --now voicelayerd voicelayer-whisper-server
+rm -f ~/.config/systemd/user/voicelayerd.service \
+      ~/.config/systemd/user/voicelayer-whisper-server.service
+rm -f ~/.local/bin/voicelayerd \
+      ~/.local/bin/vl \
+      ~/.local/bin/vl-desktop \
+      ~/.local/bin/voicelayer-whisper-server-run.sh
+systemctl --user daemon-reload</code></pre>
+<p>macOS:</p>
+<pre><code>launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.memenow.voicelayerd.plist
+rm -f ~/Library/LaunchAgents/com.memenow.voicelayerd.plist
+rm -f ~/.local/bin/voicelayerd \
+      ~/.local/bin/vl \
+      ~/.local/bin/vl-desktop \
+      ~/.local/bin/voicelayer-whisper-server-run.sh</code></pre>
+<p>Files under <code>~/.config/voicelayer/</code> are preserved for future
+reinstalls.</p>
+
+</main>
+
+<footer class="vl-footer">
+  <span>VoiceLayer: local-first voice composition layer for Ubuntu and macOS.</span>
+  <span>Documentation source: HTML files under <code>docs/</code>.</span>
+</footer>
+</body>
+</html>

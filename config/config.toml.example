@@ -1,10 +1,10 @@
 # VoiceLayer unified configuration.
 #
-# Linux:   ~/.config/voicelayer/config.toml
-# macOS:   ~/Library/Application Support/com.memenow.voicelayer/config.toml
+# Linux: ~/.config/voicelayer/config.toml
+# macOS: ~/Library/Application Support/com.memenow.voicelayer/config.toml
 #
-# Every setting can also be overridden with a VOICELAYER_* environment
-# variable (see docs/guides/local-asr-provider.md and local-llm-provider.md).
+# Settings can also be overridden with VOICELAYER_* environment variables.
+# See docs/guides/asr-providers.html and docs/guides/llm-provider.html.
 
 [daemon]
 # socket_path = "/run/user/1000/voicelayer/daemon.sock"
@@ -51,6 +51,24 @@
 # max_segment_secs = 30
 # sample_rate = 16000
 
+[mimo_asr]
+# model_path = "/models/mimo-v2.5-asr"
+# tokenizer_path = "/models/mimo-audio-tokenizer"
+# repo_path = "/sources/MiMo-V2.5-ASR"
+# device = "cuda:0"
+# audio_tag = ""
+# timeout_seconds = 600
+# long_audio_split_seconds = 180
+# extra_args = ""
+
+[qwen3_asr]
+# model_path = "/models/qwen3-asr-1.7b"
+# device = "cuda:0"
+# torch_dtype = "bfloat16"
+# timeout_seconds = 600
+# long_audio_split_seconds = 0
+# extra_args = ""
+
 [foreground_ptt]
 # language = "en"
 # translate_to_english = false
@@ -63,3 +81,4 @@
 # default_stop_action = "none"   # none | copy | inject | save
 # restore_clipboard_on_exit = false
 # save_dir = "~/Documents/voice-layer"
+# provider_id = "whisper_cpp"    # whisper_cpp | mimo_v2_5_asr | qwen3_asr_1_7b

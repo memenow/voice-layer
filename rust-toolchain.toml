@@ -1,7 +1,5 @@
 [toolchain]
-# Keep in sync with `rust-version` in the workspace Cargo.toml and with the
-# `toolchain:` pins in .github/workflows/ci.yml and codeql.yml. uuid 1.29
-# requires >= 1.89, so local builds and CI must use the same floor.
-channel = "1.89"
+# Keep aligned with workspace `rust-version` in Cargo.toml and CI workflows.
+channel = "1.100"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

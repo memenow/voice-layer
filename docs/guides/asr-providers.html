@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASR Providers Guide | VoiceLayer Documentation</title>
+<meta name="description" content="Setup for whisper-cli, persistent whisper-server, Silero VAD pre-pass and VAD-gated dictation, plus opt-in MiMo-V2.5-ASR and Qwen3-ASR-1.7B providers." />
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<a class="vl-skip-link" href="#main">Skip to main content</a>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/services.html">Services</a>
+    <a href="../guides/asr-providers.html" aria-current="page">ASR providers</a>
+    <a href="../guides/llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+
+<main id="main">
+
+<h1 id="asr-providers-guide">ASR Providers Guide</h1>
+
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#whisper-baseline">Default Backend: whisper.cpp</a></li>
+<li><a href="#whisper-env-vars">whisper.cpp Environment Variables</a>
+<ul>
+<li><a href="#persistent-whisper-server">Persistent whisper-server</a></li>
+</ul></li>
+<li><a href="#example-workflow">Example Source Workflow</a></li>
+<li><a href="#audio-capture-and-vad">Audio Capture and Silero VAD</a>
+<ul>
+<li><a href="#silero-vad-pre-pass">Optional Silero VAD Pre-pass</a></li>
+<li><a href="#vad-gated-dictation">VAD-Gated Live Dictation</a></li>
+</ul></li>
+<li><a href="#mimo-asr">MiMo-V2.5-ASR (Optional CUDA Provider)</a>
+<ul>
+<li><a href="#mimo-characteristics">Characteristics and Constraints</a></li>
+<li><a href="#mimo-setup">Setup</a></li>
+<li><a href="#mimo-env-vars">Environment Variables</a></li>
+<li><a href="#mimo-usage">Selecting MiMo Per Request or Session</a></li>
+</ul></li>
+<li><a href="#qwen3-asr">Qwen3-ASR-1.7B (Optional Apache-2.0 Provider)</a>
+<ul>
+<li><a href="#qwen3-characteristics">Characteristics and Constraints</a></li>
+<li><a href="#qwen3-setup">Setup</a></li>
+<li><a href="#qwen3-env-vars">Environment Variables</a></li>
+<li><a href="#qwen3-usage">Selecting Qwen3-ASR Per Request or Session</a></li>
+</ul></li>
+<li><a href="#provider-comparison">Provider Comparison</a></li>
+<li><a href="#latency-benchmarks">Whisper Latency Benchmarks</a></li>
+</ul>
+</nav>
+
+<h2 id="whisper-baseline">Default Backend: whisper.cpp</h2>
+<p>The default ASR backend targets <code>whisper.cpp</code>, supporting both
+one-shot <code>whisper-cli</code> invocations and persistent
+<code>whisper-server</code> HTTP endpoints. <code>whisper-cli</code> accepts
+<code>flac</code>, <code>mp3</code>, <code>ogg</code>, and <code>wav</code>
+files.</p>
+<p>Build <code>whisper.cpp</code> locally:</p>
+<pre><code>git clone https://github.com/ggml-org/whisper.cpp.git
+cd whisper.cpp
+cmake -B build
+cmake --build build -j --config Release
+./build/bin/whisper-cli -m models/ggml-base.en.bin -f samples/jfk.wav</code></pre>
+
+<h2 id="whisper-env-vars">whisper.cpp Environment Variables</h2>
+<p>One-shot <code>whisper-cli</code> configuration:</p>
+<pre><code>VOICELAYER_WHISPER_BIN=whisper-cli
+VOICELAYER_WHISPER_MODEL_PATH=/absolute/path/to/ggml-base.en.bin
+VOICELAYER_WHISPER_TIMEOUT_SECONDS=300
+VOICELAYER_WHISPER_NO_GPU=false
+VOICELAYER_WHISPER_ARGS=</code></pre>
+<p><code>VOICELAYER_WHISPER_MODEL_PATH</code> is required for the
+<code>whisper-cli</code> path.</p>
+
+<h3 id="persistent-whisper-server">Persistent whisper-server</h3>
+<p>Spawning <code>whisper-cli</code> pays model initialization latency on every
+transcription call. A persistent <code>whisper-server</code> keeps the ggml
+model memory-mapped across calls, which cuts per-segment latency during
+segmented dictation. When configured and reachable, the worker selects
+<code>whisper-server</code> first and falls back to <code>whisper-cli</code>
+otherwise.</p>
+<pre><code>VOICELAYER_WHISPER_SERVER_HOST=127.0.0.1
+VOICELAYER_WHISPER_SERVER_PORT=8188
+VOICELAYER_WHISPER_SERVER_TIMEOUT_SECONDS=60
+VOICELAYER_WHISPER_SERVER_AUTO_START=false
+VOICELAYER_WHISPER_SERVER_BIN=/abs/path/to/whisper-server
+VOICELAYER_WHISPER_SERVER_ARGS=-t 4
+VOICELAYER_WHISPER_SERVER_LAUNCH_TIMEOUT_SECONDS=30
+VOICELAYER_WHISPER_SERVER_POLL_INTERVAL_SECONDS=0.5</code></pre>
+<p>When <code>VOICELAYER_WHISPER_SERVER_AUTO_START=true</code>, the worker
+launches <code>whisper-server</code> against
+<code>VOICELAYER_WHISPER_MODEL_PATH</code> and polls <code>GET /</code> until
+ready (writing PID and log state under
+<code>$XDG_RUNTIME_DIR/voicelayer/providers/</code>). You can also run
+<code>whisper-server</code> directly or in Docker:</p>
+<pre><code># Host binary:
+whisper-server -m /path/to/ggml-base.en.bin --host 127.0.0.1 --port 8188 -t 4
+
+# Docker:
+docker run -d --name voicelayer-whisper-server \
+  -v /path/to/ggml-base.en.bin:/model.bin:ro \
+  -p 127.0.0.1:8188:8080 \
+  --entrypoint whisper-server \
+  ghcr.io/ggml-org/whisper.cpp:main \
+  -m /model.bin --host 0.0.0.0 --port 8080 -t 4</code></pre>
+<p>Point VoiceLayer at the running server:</p>
+<pre><code>export VOICELAYER_WHISPER_SERVER_HOST=127.0.0.1
+export VOICELAYER_WHISPER_SERVER_PORT=8188</code></pre>
+<p>The worker sends multipart <code>POST /inference</code> requests with
+<code>file</code>, <code>language</code>, <code>translate</code>, and
+<code>response_format=json</code>.</p>
+
+<h2 id="example-workflow">Example Source Workflow</h2>
+<pre><code>export VOICELAYER_PROJECT_ROOT="$(pwd)"
+export VOICELAYER_WHISPER_BIN="/path/to/whisper-cli"
+export VOICELAYER_WHISPER_MODEL_PATH="/path/to/ggml-base.en.bin"
+
+cargo run -p voicelayer-cli -- doctor
+cargo run -p voicelayer-cli -- transcribe-file /path/to/sample.wav --language auto
+cargo run -p voicelayer-cli -- record-transcribe --duration-seconds 8 --language auto</code></pre>
+
+<h2 id="audio-capture-and-vad">Audio Capture and Silero VAD</h2>
+<p>Microphone capture runs in process inside <code>voicelayerd</code> via
+<code>cpal</code> (PipeWire ALSA shim on Linux, CoreAudio on macOS). Finished
+WAV clips are sent to the worker's <code>transcribe</code> RPC.</p>
+
+<h3 id="silero-vad-pre-pass">Optional Silero VAD Pre-pass</h3>
+<p><code>python/voicelayer_worker/pipeline.py</code> can run a single Silero VAD
+pre-pass before dispatching to any ASR backend (whisper.cpp, MiMo-V2.5-ASR, or
+Qwen3-ASR-1.7B). When enabled, non-speech spans are stripped into a temporary
+16-bit mono WAV, and clips with no detected speech short-circuit to an empty
+transcript without invoking the ASR model. That avoids wasting inference time
+and prevents causal LM backends from hallucinating text on silence.</p>
+<p>Install the optional <code>vad</code> extra (<code>numpy</code> and
+<code>onnxruntime</code>) and download a Silero VAD v4 or v5 ONNX model:</p>
+<pre><code>uv sync --extra vad
+curl -L -o /abs/path/to/silero_vad.onnx \
+  https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx</code></pre>
+<p>Environment variables (the <code>WHISPER_VAD_</code> prefix applies to all
+ASR backends):</p>
+<pre><code>VOICELAYER_WHISPER_VAD_ENABLED=true
+VOICELAYER_WHISPER_VAD_MODEL_PATH=/abs/path/to/silero_vad.onnx
+VOICELAYER_WHISPER_VAD_THRESHOLD=0.5
+VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS=250
+VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS=100
+VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS=30
+VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS=30
+VOICELAYER_WHISPER_VAD_SAMPLE_RATE=16000</code></pre>
+<p>Supported sample rates are <code>16000</code> Hz and <code>8000</code> Hz. If
+<code>onnxruntime</code> or <code>numpy</code> cannot be imported at runtime,
+the worker records a note and falls back to transcribing the raw WAV.</p>
+
+<h3 id="vad-gated-dictation">VAD-Gated Live Dictation</h3>
+<p>In <code>vad_gated</code> mode, <code>voicelayerd</code> slices short probes
+every <code>probe_secs</code> seconds and classifies each probe through the
+worker's <code>segment_probe</code> RPC. Speech probes accumulate until
+<code>silence_gap_probes</code> consecutive silent probes arrive (default
+<code>1</code>) or buffered audio reaches <code>max_segment_secs</code>, then
+flush as one speech unit to <code>transcribe</code>.</p>
+<pre><code>export VOICELAYER_WHISPER_VAD_ENABLED=true
+export VOICELAYER_WHISPER_VAD_MODEL_PATH=/abs/path/to/silero_vad.onnx
+
+cargo run -p voicelayerd
+cargo run -p voicelayer-cli -- dictation start \
+  --mode vad-gated --probe-secs 2 --max-segment-secs 30 \
+  --language auto
+cargo run -p voicelayer-cli -- dictation stop &lt;session-id&gt;</code></pre>
+<p>For unattended smoke tests, add <code>--duration-seconds N</code> so the CLI
+auto-stops and prints the final <code>DictationCaptureResult</code>:</p>
+<pre><code>cargo run -p voicelayer-cli -- dictation start \
+  --mode vad-gated --probe-secs 2 --max-segment-secs 30 \
+  --duration-seconds 12 --language auto</code></pre>
+<p>If <code>segment_probe</code> fails or VAD is unconfigured, each probe falls
+back to a speech verdict so audio is never silently discarded (making
+<code>max_segment_secs</code> the sole flush boundary).</p>
+
+<h2 id="mimo-asr">MiMo-V2.5-ASR (Optional CUDA Provider)</h2>
+<p>VoiceLayer supports <a href="https://github.com/XiaomiMiMo/MiMo-V2.5-ASR">Xiaomi
+MiMo-V2.5-ASR</a> as an opt-in backend selected via
+<code>provider_id = "mimo_v2_5_asr"</code>.</p>
+
+<h3 id="mimo-characteristics">Characteristics and Constraints</h3>
+<ul>
+<li>Multilingual coverage: Mandarin, Cantonese, Wu, Minnan, Sichuanese, English,
+and Chinese-English code-switching.</li>
+<li>CUDA-only runtime: upstream audio tokenizer imports
+<code>flash_attn.flash_attn_varlen_func</code> unconditionally.</li>
+<li>Requires ~16 GB VRAM at bf16 (~15 GB weights on disk).</li>
+<li>No streaming, partial hypotheses, or word timestamps.</li>
+<li>Inputs longer than <code>VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS</code>
+(default 180 s) are split into WAV chunks in
+<code>python/voicelayer_worker/audio.py</code> to avoid upstream decoder
+repetition on long audio.</li>
+<li>Cold model load takes tens of seconds once per worker lifetime; subsequent
+calls reuse the cached instance inside
+<code>python/voicelayer_worker/providers/mimo_asr.py</code>.</li>
+</ul>
+
+<h3 id="mimo-setup">Setup</h3>
+<pre><code># 1. Install PyTorch matching your CUDA toolkit (cu128 for Blackwell, cu126/cu124 for Hopper/Ada).
+#    Pin torch 2.10 while prebuilt flash-attn wheels target torch 2.10 + cp312.
+uv sync --group dev
+uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+  "torch==2.10.0" "torchaudio==2.10.0"
+
+# 2. Install the mimo extra dependencies.
+uv pip install -e ".[mimo]"
+
+# 3. Install the matching prebuilt flash-attn wheel (avoids a long nvcc source build).
+uv pip install \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+
+# 4. Download both the LM weights and mandatory audio tokenizer.
+hf download XiaomiMiMo/MiMo-V2.5-ASR \
+  --local-dir ~/.cache/voicelayer/models/mimo-v2.5-asr
+hf download XiaomiMiMo/MiMo-Audio-Tokenizer \
+  --local-dir ~/.cache/voicelayer/models/mimo-audio-tokenizer
+
+# 5. Clone the upstream repository for the MimoAudio wrapper.
+git clone https://github.com/XiaomiMiMo/MiMo-V2.5-ASR.git \
+  ~/.cache/voicelayer/sources/MiMo-V2.5-ASR</code></pre>
+
+<h3 id="mimo-env-vars">Environment Variables</h3>
+<pre><code>VOICELAYER_MIMO_MODEL_PATH=/abs/path/to/MiMo-V2.5-ASR
+VOICELAYER_MIMO_TOKENIZER_PATH=/abs/path/to/MiMo-Audio-Tokenizer
+VOICELAYER_MIMO_REPO_PATH=/abs/path/to/MiMo-V2.5-ASR-source-checkout
+VOICELAYER_MIMO_DEVICE=cuda:0
+VOICELAYER_MIMO_AUDIO_TAG=
+VOICELAYER_MIMO_TIMEOUT_SECONDS=600
+VOICELAYER_MIMO_LONG_AUDIO_SPLIT_SECONDS=180
+VOICELAYER_MIMO_ARGS=</code></pre>
+<p><code>VOICELAYER_MIMO_MODEL_PATH</code> and
+<code>VOICELAYER_MIMO_TOKENIZER_PATH</code> are required. Leave
+<code>VOICELAYER_MIMO_AUDIO_TAG</code> empty for automatic language detection or
+set <code>&lt;chinese&gt;</code> / <code>&lt;english&gt;</code>; request
+language tags (<code>zh</code>, <code>yue</code>, <code>en</code>, etc.) are
+mapped automatically.</p>
+
+<h3 id="mimo-usage">Selecting MiMo Per Request or Session</h3>
+<pre><code>SOCKET="${XDG_RUNTIME_DIR:-/run/user/$UID}/voicelayer/daemon.sock"
+curl --unix-socket "$SOCKET" -s -X POST http://d/v1/transcriptions \
+  -H 'content-type: application/json' \
+  -d '{"audio_file":"/abs/path/sample-zh.wav","provider_id":"mimo_v2_5_asr","language":"zh"}'
+
+cargo run -p voicelayer-cli -- dictation start --mode fixed --segment-secs 8 --provider-id mimo_v2_5_asr
+cargo run -p voicelayer-cli -- record-transcribe --duration-seconds 8 --provider-id mimo_v2_5_asr
+cargo run -p voicelayer-cli -- dictation foreground-ptt --provider-id mimo_v2_5_asr
+vl config set foreground_ptt.provider_id mimo_v2_5_asr</code></pre>
+<p>Unrecognized <code>provider_id</code> values fail explicitly with
+<code>provider_unavailable</code> rather than falling back to whisper.</p>
+
+<h2 id="qwen3-asr">Qwen3-ASR-1.7B (Optional Apache-2.0 Provider)</h2>
+<p>VoiceLayer supports <a href="https://huggingface.co/Qwen/Qwen3-ASR-1.7B">Alibaba
+Qwen3-ASR-1.7B</a> as an opt-in Apache-2.0 backend selected via
+<code>provider_id = "qwen3_asr_1_7b"</code>.</p>
+
+<h3 id="qwen3-characteristics">Characteristics and Constraints</h3>
+<ul>
+<li>Covers 30 languages including Mandarin, Cantonese, English, Japanese,
+Korean, European, and Southeast Asian languages.</li>
+<li>Apache-2.0 weights (~4.7 GB on disk, ~6 GB VRAM at bf16) with no
+<code>flash-attn</code> dependency.</li>
+<li>Transcription only: no streaming, no word timestamps, and
+<code>translate_to_english=true</code> is rejected by the daemon.</li>
+<li>CPU inference works but runs roughly 10-30x slower than real time.</li>
+</ul>
+
+<h3 id="qwen3-setup">Setup</h3>
+<pre><code>uv sync --group dev
+uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+  "torch&gt;=2.7,&lt;3.0" "torchaudio&gt;=2.7,&lt;3.0"
+uv pip install -e ".[qwen3-asr]"
+hf download Qwen/Qwen3-ASR-1.7B \
+  --local-dir ~/.cache/voicelayer/models/qwen3-asr-1.7b</code></pre>
+<p>The <code>qwen3-asr</code> and <code>mimo</code> extras pin different
+<code>transformers</code> versions. Install only one extra per virtual
+environment.</p>
+
+<h3 id="qwen3-env-vars">Environment Variables</h3>
+<pre><code>VOICELAYER_QWEN3_ASR_MODEL_PATH=/abs/path/to/qwen3-asr-1.7b
+VOICELAYER_QWEN3_ASR_DEVICE=cuda:0
+VOICELAYER_QWEN3_ASR_TORCH_DTYPE=bfloat16
+VOICELAYER_QWEN3_ASR_TIMEOUT_SECONDS=600
+VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS=0
+VOICELAYER_QWEN3_ASR_ARGS=</code></pre>
+<p><code>VOICELAYER_QWEN3_ASR_MODEL_PATH</code> is required.
+<code>VOICELAYER_QWEN3_ASR_DTYPE</code> is accepted as a legacy alias for
+<code>VOICELAYER_QWEN3_ASR_TORCH_DTYPE</code> (use <code>float16</code> on
+pre-Ampere GPUs or <code>float32</code> for debugging).
+<code>VOICELAYER_QWEN3_ASR_LONG_AUDIO_SPLIT_SECONDS</code> defaults to
+<code>0</code> because <code>qwen-asr</code> chunks long audio internally; set a
+positive value to enforce worker-side WAV chunking.
+<code>VOICELAYER_QWEN3_ASR_ARGS</code> is reserved for future upstream
+arguments.</p>
+
+<h3 id="qwen3-usage">Selecting Qwen3-ASR Per Request or Session</h3>
+<pre><code>SOCKET="${XDG_RUNTIME_DIR:-/run/user/$UID}/voicelayer/daemon.sock"
+curl --unix-socket "$SOCKET" -s -X POST http://d/v1/transcriptions \
+  -H 'content-type: application/json' \
+  -d '{"audio_file":"/abs/path/sample-zh.wav","provider_id":"qwen3_asr_1_7b","language":"zh"}'
+
+cargo run -p voicelayer-cli -- dictation start --mode fixed --segment-secs 8 --provider-id qwen3_asr_1_7b
+cargo run -p voicelayer-cli -- record-transcribe --duration-seconds 8 --provider-id qwen3_asr_1_7b
+cargo run -p voicelayer-cli -- dictation foreground-ptt --provider-id qwen3_asr_1_7b
+vl config set foreground_ptt.provider_id qwen3_asr_1_7b</code></pre>
+<p>Implementation lives in
+<code>python/voicelayer_worker/providers/qwen3_asr.py</code>.</p>
+
+<h2 id="provider-comparison">Provider Comparison</h2>
+<table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>Cold Load</th>
+<th>Warm Latency</th>
+<th>Languages</th>
+<th>Hardware</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>whisper_cpp</code> (server)</td>
+<td>Seconds (mmapped ggml)</td>
+<td>~0.65 s / call (base.en, CPU)</td>
+<td>English or multilingual (model dependent)</td>
+<td>CPU or GPU</td>
+</tr>
+<tr>
+<td><code>mimo_v2_5_asr</code></td>
+<td>~30 s into VRAM</td>
+<td>~0.27 s / 3 s clip (RTX 5090, cu128)</td>
+<td>zh, en, yue, wuu, nan, Sichuanese, mixed</td>
+<td>CUDA, ~16 GB VRAM</td>
+</tr>
+<tr>
+<td><code>qwen3_asr_1_7b</code></td>
+<td>Seconds (4.7 GB into VRAM)</td>
+<td>Sub-second / &le;15 s clip (CUDA bf16)</td>
+<td>30 languages including Mandarin and Cantonese</td>
+<td>CUDA (~6 GB VRAM); CPU supported</td>
+</tr>
+</tbody>
+</table>
+<p>Because <code>crates/voicelayerd/src/worker/mod.rs</code> keeps one
+persistent Python worker alive across requests, cold load for MiMo or Qwen3-ASR
+occurs only once per daemon lifetime unless the worker crashes or is restarted.
+Note that <code>/v1/providers</code> can also list experimental catalog entries
+such as <code>voxtral_realtime</code> that are not yet dispatchable; selecting
+one fails pre-flight validation.</p>
+
+<h2 id="latency-benchmarks">Whisper Latency Benchmarks</h2>
+<p>Use the bundled benchmark scripts to compare one-shot
+<code>whisper-cli</code> cold-start latency against a warm
+<code>whisper-server</code> on your hardware:</p>
+<pre><code># 1. Generate a deterministic 3-second silent WAV fixture (16 kHz mono PCM).
+uv run python scripts/generate-silent-fixture.py
+
+# 2a. Measure host whisper-cli cold start:
+export VOICELAYER_WHISPER_MODEL_PATH=/abs/path/to/ggml-base.en.bin
+RUNS=5 scripts/benchmark-whisper-cold-start.sh
+
+# 2b. Or measure via Docker without installing whisper.cpp locally:
+RUNS=5 scripts/benchmark-whisper-cold-start-docker.sh
+
+# 3. Measure a running whisper-server and compare against the cold-start baseline:
+COLD_START_SECONDS=0.8446 HOST=127.0.0.1 PORT=8188 \
+  RUNS=10 WARMUP_RUNS=2 scripts/benchmark-whisper-warm-server.sh</code></pre>
+<p>On a CPU-only Ubuntu 24 reference host with <code>ggml-base.en.bin</code>,
+<code>whisper-cli</code> averaged ~0.84 s cold start (including Docker exec
+overhead), while a warm <code>whisper-server</code> saved ~0.26 s per call on
+real captures. Re-run the scripts for your own CPU/GPU and model size.</p>
+
+</main>
+
+<footer class="vl-footer">
+  <span>VoiceLayer: local-first voice composition layer for Ubuntu and macOS.</span>
+  <span>Documentation source: HTML files under <code>docs/</code>.</span>
+</footer>
+</body>
+</html>
