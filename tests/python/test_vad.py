@@ -1,29 +1,21 @@
+"""Tests for Silero VAD region extraction, speech probing, and single-pass pre-pass."""
+
 from __future__ import annotations
 
 import importlib.util
 import pathlib
-import shutil
-import sys
 import tempfile
 import unittest
 import wave
 from unittest.mock import patch
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-PYTHON_ROOT = PROJECT_ROOT / "python"
-
-if str(PYTHON_ROOT) not in sys.path:
-    sys.path.insert(0, str(PYTHON_ROOT))
-
-from voicelayer_orchestrator.config import (  # noqa: E402
-    WhisperVadConfig,
-    load_whisper_vad_config,
-    reset_configuration_for_tests,  # noqa: E402
-)
-from voicelayer_orchestrator.providers.vad_segmenter import (  # noqa: E402
-    _frames_to_regions,
-    _window_size_for,
-    probe_audio_file,
+from voicelayer_worker import pipeline, vad, worker
+from voicelayer_worker.config import WhisperVadConfig, configure, reset_configuration_for_tests
+from voicelayer_worker.errors import (
+    INVALID_REQUEST_CODE,
+    PROVIDER_REQUEST_FAILED_CODE,
+    PROVIDER_UNAVAILABLE_CODE,
+    ProviderInvocationError,
 )
 
 
@@ -48,655 +40,168 @@ def _vad_config(
     )
 
 
-class WhisperVadConfigTest(unittest.TestCase):
-    def test_returns_none_when_not_enabled(self) -> None:
-        self.assertIsNone(load_whisper_vad_config({}))
-        self.assertIsNone(
-            load_whisper_vad_config(
-                {"VOICELAYER_WHISPER_VAD_MODEL_PATH": "/tmp/silero.onnx"},
-            )
-        )
-
-    def test_returns_none_when_model_path_missing(self) -> None:
-        self.assertIsNone(
-            load_whisper_vad_config({"VOICELAYER_WHISPER_VAD_ENABLED": "true"}),
-        )
-
-    def test_reads_all_tunables(self) -> None:
-        config = load_whisper_vad_config(
-            {
-                "VOICELAYER_WHISPER_VAD_ENABLED": "1",
-                "VOICELAYER_WHISPER_VAD_MODEL_PATH": "/tmp/silero.onnx",
-                "VOICELAYER_WHISPER_VAD_THRESHOLD": "0.42",
-                "VOICELAYER_WHISPER_VAD_MIN_SPEECH_MS": "200",
-                "VOICELAYER_WHISPER_VAD_MIN_SILENCE_MS": "150",
-                "VOICELAYER_WHISPER_VAD_SPEECH_PAD_MS": "50",
-                "VOICELAYER_WHISPER_VAD_MAX_SEGMENT_SECS": "15",
-                "VOICELAYER_WHISPER_VAD_SAMPLE_RATE": "16000",
-            }
-        )
-        assert config is not None
-        self.assertEqual(config.model_path, "/tmp/silero.onnx")
-        self.assertAlmostEqual(config.threshold, 0.42)
-        self.assertEqual(config.min_speech_ms, 200)
-        self.assertEqual(config.min_silence_ms, 150)
-        self.assertEqual(config.speech_pad_ms, 50)
-        self.assertAlmostEqual(config.max_segment_secs, 15.0)
-        self.assertEqual(config.sample_rate, 16000)
-
-
-class WindowSizeTest(unittest.TestCase):
-    def test_16khz_returns_512(self) -> None:
-        self.assertEqual(_window_size_for(16000), 512)
-
-    def test_8khz_returns_256(self) -> None:
-        self.assertEqual(_window_size_for(8000), 256)
-
-    def test_unsupported_rate_raises(self) -> None:
-        with self.assertRaises(Exception):  # noqa: B017
-            _window_size_for(44100)
-
-
-class FramesToRegionsTest(unittest.TestCase):
-    FRAME_SEC = 0.032  # 512 samples at 16kHz
-
-    def test_empty_probs_returns_no_regions(self) -> None:
-        regions = _frames_to_regions([], _vad_config(), self.FRAME_SEC)
-        self.assertEqual(regions, [])
-
-    def test_all_silence_returns_no_regions(self) -> None:
-        probs = [0.1] * 100
-        regions = _frames_to_regions(probs, _vad_config(), self.FRAME_SEC)
-        self.assertEqual(regions, [])
-
-    def test_contiguous_speech_produces_single_region_with_padding(self) -> None:
-        # 20 speech frames in the middle of 40 total; min_speech_ms=250ms ~ 8 frames
-        probs = [0.1] * 10 + [0.9] * 20 + [0.1] * 10
-        config = _vad_config(min_speech_ms=100, min_silence_ms=50, speech_pad_ms=0)
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(10, 30)])
-
-    def test_short_speech_below_min_length_is_dropped(self) -> None:
-        # Only 3 speech frames, min_speech_ms=250ms ~ 8 frames
-        probs = [0.1] * 10 + [0.9] * 3 + [0.1] * 10
-        regions = _frames_to_regions(probs, _vad_config(speech_pad_ms=0), self.FRAME_SEC)
-        self.assertEqual(regions, [])
-
-    def test_small_gap_merges_neighboring_speech(self) -> None:
-        # Two speech blocks separated by 2 silent frames (~64ms)
-        # min_silence_ms=200ms ~ 6 frames, so the gap must merge.
-        probs = [0.9] * 10 + [0.1] * 2 + [0.9] * 10
-        config = _vad_config(min_silence_ms=200, min_speech_ms=100, speech_pad_ms=0)
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(0, 22)])
-
-    def test_large_gap_keeps_regions_separate(self) -> None:
-        # Two speech blocks separated by 20 silent frames (~640ms).
-        # min_silence_ms=100ms ~ 3 frames, so the gap stays.
-        probs = [0.9] * 10 + [0.1] * 20 + [0.9] * 10
-        config = _vad_config(min_silence_ms=100, min_speech_ms=100, speech_pad_ms=0)
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(0, 10), (30, 40)])
-
-    def test_padding_extends_regions_and_merges_overlapping_pads(self) -> None:
-        probs = [0.1] * 5 + [0.9] * 10 + [0.1] * 2 + [0.9] * 10 + [0.1] * 5
-        config = _vad_config(
-            min_silence_ms=100,  # ~3 frames; the 2-frame gap must merge.
-            min_speech_ms=100,
-            speech_pad_ms=64,  # ~2 frames on each side.
-        )
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        # Merged region (5, 27) then padded by 2 frames on each side.
-        self.assertEqual(regions, [(3, 29)])
-
-    def test_max_segment_hard_cuts_long_speech(self) -> None:
-        # 100 speech frames, max_segment_secs forces splits every 32 frames.
-        probs = [0.9] * 100
-        config = _vad_config(
-            min_silence_ms=10,
-            min_speech_ms=50,
-            speech_pad_ms=0,
-            max_segment_secs=32 * self.FRAME_SEC,
-        )
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(0, 32), (32, 64), (64, 96), (96, 100)])
-
-    def test_hysteresis_holds_speech_through_borderline_dips(self) -> None:
-        # With enter=0.5 and hysteresis=0.15, leave threshold is 0.35.
-        # A 0.40 probability in the middle of an active speech span must
-        # not close the region (it only exits when the prob drops below
-        # leave_threshold for at least one frame).
-        probs = [0.9] * 10 + [0.40] * 5 + [0.9] * 10
-        config = _vad_config(
-            threshold=0.5,
-            min_silence_ms=10,
-            min_speech_ms=100,
-            speech_pad_ms=0,
-        )
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(0, 25)])
-
-    def test_hysteresis_closes_on_true_silence(self) -> None:
-        # A dip all the way below leave_threshold does close the region.
-        probs = [0.9] * 10 + [0.1] * 20 + [0.9] * 10
-        config = _vad_config(
-            threshold=0.5,
-            min_silence_ms=10,
-            min_speech_ms=100,
-            speech_pad_ms=0,
-        )
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(0, 10), (30, 40)])
-
-    def test_low_threshold_still_exits_speech_through_silence(self) -> None:
-        # With a very low enter threshold (0.1) the fixed 0.15 margin
-        # would pin leave_threshold to 0; the scaling cap keeps it
-        # effective, so a 0.02 dip still closes the region.
-        probs = [0.5] * 10 + [0.02] * 10 + [0.5] * 10
-        config = _vad_config(
-            threshold=0.1,
-            min_silence_ms=10,
-            min_speech_ms=100,
-            speech_pad_ms=0,
-        )
-        regions = _frames_to_regions(probs, config, self.FRAME_SEC)
-        self.assertEqual(regions, [(0, 10), (20, 30)])
-
-
-class VadWorkerIntegrationTest(unittest.TestCase):
-    """VAD integration into the transcribe dispatch, using monkey-patched apply_vad_prepass."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        reset_configuration_for_tests()
-        # Lazy import to keep the module reference fresh after patches.
-        from voicelayer_orchestrator import worker
-
-        self.worker = worker
-        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-worker-"))
-
-    def tearDown(self) -> None:
-        # `tempfile.mkdtemp` does not auto-clean; remove the per-test
-        # directory so repeated runs of the suite do not leave
-        # `voicelayer-vad-worker-*` debris in `/tmp`.
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        super().tearDown()
-
-    def _write_silent_wav(self, path: pathlib.Path, duration_sec: float = 1.0) -> None:
-        sample_rate = 16000
-        frames = int(sample_rate * duration_sec)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(path), "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(sample_rate)
-            handle.writeframes(b"\x00\x00" * frames)
-
-    def test_vad_disabled_does_not_invoke_prepass(self) -> None:
-        audio_file = self.tmp_dir / "raw.wav"
-        self._write_silent_wav(audio_file)
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=None),
-            patch.object(self.worker, "apply_vad_prepass") as prepass,
-        ):
-            params, notes, short, trimmed = self.worker._apply_vad_prepass_if_configured(
-                {"audio_file": str(audio_file)},
-            )
-
-        prepass.assert_not_called()
-        self.assertEqual(params, {"audio_file": str(audio_file)})
-        self.assertEqual(notes, [])
-        self.assertIsNone(short)
-        # VAD did not run — there is nothing for the dispatcher to clean up.
-        self.assertIsNone(trimmed)
-
-    def test_vad_short_circuits_when_no_speech_found(self) -> None:
-        audio_file = self.tmp_dir / "silence.wav"
-        self._write_silent_wav(audio_file)
-
-        vad_config = _vad_config()
-        trimmed = self.tmp_dir / "silence.vad-empty.wav"
-        trimmed.write_bytes(b"")
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=vad_config),
-            patch.object(
-                self.worker,
-                "apply_vad_prepass",
-                return_value=(str(trimmed), []),
-            ),
-        ):
-            _, _, short, trimmed_path = self.worker._apply_vad_prepass_if_configured(
-                {"audio_file": str(audio_file)},
-            )
-
-        assert short is not None
-        self.assertEqual(short["text"], "")
-        self.assertIn(
-            "VAD detected no speech; whisper inference was skipped.",
-            short["notes"],
-        )
-        # `apply_vad_prepass` writes a `.vad-empty.wav` even on the
-        # no-speech path; the dispatcher must receive that path so the
-        # finally block can unlink it.
-        self.assertEqual(trimmed_path, trimmed)
-
-    def test_vad_replaces_audio_and_annotates_notes(self) -> None:
-        audio_file = self.tmp_dir / "raw.wav"
-        self._write_silent_wav(audio_file, duration_sec=2.0)
-
-        vad_config = _vad_config()
-        trimmed = self.tmp_dir / "raw.vad-trimmed.wav"
-        trimmed.write_bytes(b"")
-        regions = [(0.5, 1.0), (1.2, 1.7)]
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=vad_config),
-            patch.object(
-                self.worker,
-                "apply_vad_prepass",
-                return_value=(str(trimmed), regions),
-            ),
-        ):
-            params, notes, short, trimmed_path = self.worker._apply_vad_prepass_if_configured(
-                {"audio_file": str(audio_file)},
-            )
-
-        self.assertIsNone(short)
-        self.assertEqual(params["audio_file"], str(trimmed))
-        self.assertEqual(len(notes), 1)
-        self.assertIn("2 speech region(s)", notes[0])
-        self.assertIn("1.00s total", notes[0])
-        # The trimmed WAV is the worker-owned cleanup target on success.
-        self.assertEqual(trimmed_path, trimmed)
-
-    def test_vad_prepass_error_falls_back_to_raw_audio(self) -> None:
-        from voicelayer_orchestrator.providers import ProviderInvocationError
-
-        audio_file = self.tmp_dir / "raw.wav"
-        self._write_silent_wav(audio_file)
-        vad_config = _vad_config()
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=vad_config),
-            patch.object(
-                self.worker,
-                "apply_vad_prepass",
-                side_effect=ProviderInvocationError("onnxruntime missing"),
-            ),
-        ):
-            params, notes, short, trimmed = self.worker._apply_vad_prepass_if_configured(
-                {"audio_file": str(audio_file)},
-            )
-
-        self.assertIsNone(short)
-        self.assertEqual(params["audio_file"], str(audio_file))
-        self.assertEqual(len(notes), 1)
-        self.assertIn("VAD pre-pass failed", notes[0])
-        self.assertIn("onnxruntime missing", notes[0])
-        # VAD raised before writing anything — no cleanup target.
-        self.assertIsNone(trimmed)
-
-
-class VadDispatcherCleanupTest(unittest.TestCase):
-    """End-to-end pin: the transcribe dispatcher unlinks the trimmed WAV.
-
-    These tests drive the full ``handle_request("transcribe", ...)``
-    path with ``apply_vad_prepass`` stubbed to return a real on-disk
-    sidecar file, and then assert that the file is gone after the
-    request returns. Without the dispatcher's finally block, every
-    VAD-enabled call would leak one WAV under ``runtime_dir/vad/``.
-    """
-
-    def setUp(self) -> None:
-        super().setUp()
-        reset_configuration_for_tests()
-        from voicelayer_orchestrator import worker
-
-        self.worker = worker
-        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-cleanup-"))
-
-    def tearDown(self) -> None:
-        # Same cleanup discipline as `VadWorkerIntegrationTest` — keep
-        # `/tmp` from accumulating `voicelayer-vad-cleanup-*` dirs
-        # across test runs.
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        super().tearDown()
-
-    def _write_silent_wav(self, path: pathlib.Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        sample_rate = 16000
-        with wave.open(str(path), "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(sample_rate)
-            handle.writeframes(b"\x00\x00" * sample_rate)
-
-    def test_trimmed_wav_is_unlinked_after_whisper_dispatch_succeeds(self) -> None:
-        audio = self.tmp_dir / "raw.wav"
-        self._write_silent_wav(audio)
-        trimmed = self.tmp_dir / "raw.vad-trimmed.wav"
-        self._write_silent_wav(trimmed)
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
-            patch.object(
-                self.worker,
-                "apply_vad_prepass",
-                return_value=(str(trimmed), [(0.0, 1.0)]),
-            ),
-            patch.object(self.worker, "load_whisper_server_config", return_value=None),
-            # Stub the cli-config loader to a truthy sentinel so the
-            # dispatcher reaches the cli call site without needing the
-            # binary or model path on disk.
-            patch.object(
-                self.worker,
-                "load_whisper_provider_config",
-                return_value=object(),
-            ),
-            patch.object(
-                self.worker,
-                "transcribe_with_whisper_cli",
-                return_value={"text": "ok", "detected_language": None, "notes": []},
-            ),
-        ):
-            response = self.worker.handle_request(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 901,
-                    "method": "transcribe",
-                    "params": {"audio_file": str(audio)},
-                }
-            )
-
-        assert response is not None
-        self.assertEqual(response["result"]["text"], "ok")
-        # Trimmed sidecar is worker-owned; must not survive the call.
-        self.assertFalse(trimmed.exists())
-        # Caller-supplied capture is untouched.
-        self.assertTrue(audio.exists())
-
-    def test_empty_speech_wav_is_unlinked_after_short_circuit(self) -> None:
-        audio = self.tmp_dir / "silent.wav"
-        self._write_silent_wav(audio)
-        trimmed = self.tmp_dir / "silent.vad-empty.wav"
-        # `apply_vad_prepass` writes a `.vad-empty.wav` even when no
-        # regions were found; pre-create one so we can observe its
-        # deletion.
-        trimmed.write_bytes(b"")
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
-            patch.object(
-                self.worker,
-                "apply_vad_prepass",
-                return_value=(str(trimmed), []),
-            ),
-        ):
-            response = self.worker.handle_request(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 902,
-                    "method": "transcribe",
-                    "params": {"audio_file": str(audio)},
-                }
-            )
-
-        assert response is not None
-        self.assertEqual(response["result"]["text"], "")
-        self.assertFalse(trimmed.exists())
-        self.assertTrue(audio.exists())
-
-    def test_trimmed_wav_is_unlinked_when_whisper_cli_raises(self) -> None:
-        from voicelayer_orchestrator.providers import ProviderInvocationError
-
-        audio = self.tmp_dir / "raw.wav"
-        self._write_silent_wav(audio)
-        trimmed = self.tmp_dir / "raw.vad-trimmed.wav"
-        self._write_silent_wav(trimmed)
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
-            patch.object(
-                self.worker,
-                "apply_vad_prepass",
-                return_value=(str(trimmed), [(0.0, 1.0)]),
-            ),
-            patch.object(self.worker, "load_whisper_server_config", return_value=None),
-            patch.object(
-                self.worker,
-                "load_whisper_provider_config",
-                return_value=object(),
-            ),
-            patch.object(
-                self.worker,
-                "transcribe_with_whisper_cli",
-                side_effect=ProviderInvocationError("simulated whisper-cli crash"),
-            ),
-        ):
-            response = self.worker.handle_request(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 903,
-                    "method": "transcribe",
-                    "params": {"audio_file": str(audio)},
-                }
-            )
-
-        assert response is not None
-        self.assertIn("simulated whisper-cli crash", response["error"]["message"])
-        # Failure must not turn into a slow disk leak.
-        self.assertFalse(trimmed.exists())
-        self.assertTrue(audio.exists())
+def _write_silent_wav(path: pathlib.Path, duration_sec: float = 1.0) -> pathlib.Path:
+    sample_rate = 16000
+    frames = int(sample_rate * duration_sec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(b"\x00\x00" * frames)
+    return path
 
 
 class _FakeSamples:
-    """Duck-typed stand-in for a numpy array so ``probe_audio_file`` can run
-    without the optional ``vad`` extra installed. The helper only touches
-    ``.size`` and ``.shape[0]``.
-    """
-
     def __init__(self, n: int) -> None:
         self.size = n
         self.shape = (n,)
 
 
-class ProbeAudioFileTest(unittest.TestCase):
-    """Direct tests for ``probe_audio_file`` covering its transformation
-    layer: missing files raise, silent inputs short-circuit, region seconds
-    derive from frame indices, and ``speech_ratio`` falls in ``[0.0, 1.0]``.
+class VadRegionLogicTest(unittest.TestCase):
+    FRAME_SEC = 0.032
 
-    Mocks the numpy-dependent I/O layer (`_load_wav_as_float32_mono`,
-    `_load_vad_session`, `_speech_probabilities`) so these tests run
-    without the ``vad`` extra, matching the pattern in
-    :class:`VadWorkerIntegrationTest` above.
-    """
+    def test_window_sizes(self) -> None:
+        self.assertEqual(vad._window_size_for(16000), 512)
+        self.assertEqual(vad._window_size_for(8000), 256)
+        with self.assertRaises(ProviderInvocationError):
+            vad._window_size_for(44100)
 
-    FRAME_SEC = 0.032  # 512 samples at 16 kHz, matches _window_size_for(16000)
+    def test_frames_to_regions_merging_padding_hysteresis_and_split(self) -> None:
+        self.assertEqual(vad._frames_to_regions([], _vad_config(), self.FRAME_SEC), [])
+        self.assertEqual(vad._frames_to_regions([0.1] * 100, _vad_config(), self.FRAME_SEC), [])
 
+        # Short speech dropped.
+        self.assertEqual(
+            vad._frames_to_regions(
+                [0.1] * 10 + [0.9] * 3 + [0.1] * 10,
+                _vad_config(speech_pad_ms=0),
+                self.FRAME_SEC,
+            ),
+            [],
+        )
+
+        # Small gap merges; large gap stays split.
+        self.assertEqual(
+            vad._frames_to_regions(
+                [0.9] * 10 + [0.1] * 2 + [0.9] * 10,
+                _vad_config(min_silence_ms=200, min_speech_ms=100, speech_pad_ms=0),
+                self.FRAME_SEC,
+            ),
+            [(0, 22)],
+        )
+        self.assertEqual(
+            vad._frames_to_regions(
+                [0.9] * 10 + [0.1] * 20 + [0.9] * 10,
+                _vad_config(min_silence_ms=100, min_speech_ms=100, speech_pad_ms=0),
+                self.FRAME_SEC,
+            ),
+            [(0, 10), (30, 40)],
+        )
+
+        # Hysteresis holds borderline dip (0.40 >= 0.35) and exits on low-threshold silence.
+        self.assertEqual(
+            vad._frames_to_regions(
+                [0.9] * 10 + [0.40] * 5 + [0.9] * 10,
+                _vad_config(threshold=0.5, min_silence_ms=10, min_speech_ms=100, speech_pad_ms=0),
+                self.FRAME_SEC,
+            ),
+            [(0, 25)],
+        )
+        self.assertEqual(
+            vad._frames_to_regions(
+                [0.5] * 10 + [0.02] * 10 + [0.5] * 10,
+                _vad_config(threshold=0.1, min_silence_ms=10, min_speech_ms=100, speech_pad_ms=0),
+                self.FRAME_SEC,
+            ),
+            [(0, 10), (20, 30)],
+        )
+
+        # Hard split by max_segment_secs.
+        self.assertEqual(
+            vad._frames_to_regions(
+                [0.9] * 100,
+                _vad_config(
+                    min_silence_ms=10,
+                    min_speech_ms=50,
+                    speech_pad_ms=0,
+                    max_segment_secs=32 * self.FRAME_SEC,
+                ),
+                self.FRAME_SEC,
+            ),
+            [(0, 32), (32, 64), (64, 96), (96, 100)],
+        )
+
+
+class ProbeAudioAndDispatchTest(unittest.TestCase):
     def setUp(self) -> None:
-        super().setUp()
         reset_configuration_for_tests()
-        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-probe-helper-"))
+        self.tmp = tempfile.TemporaryDirectory(prefix="voicelayer-probe-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
 
-    def test_raises_when_audio_file_missing(self) -> None:
-        from voicelayer_orchestrator.providers import ProviderInvocationError
+    def test_probe_audio_file_empty_speech_and_clamping(self) -> None:
+        with self.assertRaises(ProviderInvocationError):
+            vad.probe_audio_file(str(self.root / "missing.wav"), _vad_config())
 
-        missing = self.tmp_dir / "does-not-exist.wav"
-        with self.assertRaises(ProviderInvocationError) as ctx:
-            probe_audio_file(str(missing), _vad_config())
-        self.assertIn(str(missing), str(ctx.exception))
-
-    def test_returns_empty_result_when_sample_loader_yields_zero_samples(self) -> None:
-        # Simulate a 0-frame WAV: loader returns an empty samples array, so
-        # the helper short-circuits before any VAD inference runs.
-        from voicelayer_orchestrator.providers import vad_segmenter
-
-        audio = self.tmp_dir / "empty.wav"
+        audio = self.root / "clip.wav"
         audio.touch()
+
+        with patch.object(vad, "_load_wav_as_float32_mono", return_value=(_FakeSamples(0), 16000)):
+            empty = vad.probe_audio_file(str(audio), _vad_config())
+        self.assertFalse(empty["has_speech"])
+        self.assertEqual(empty["speech_ratio"], 0.0)
+
+        with (
+            patch.object(
+                vad, "_load_wav_as_float32_mono", return_value=(_FakeSamples(4000), 16000)
+            ),
+            patch.object(vad, "_load_vad_session", return_value=object()),
+            patch.object(vad, "_speech_probabilities", return_value=[0.9] * 8),
+            patch.object(vad, "_frames_to_regions", return_value=[(0, 100)]),
+        ):
+            clamped = vad.probe_audio_file(str(audio), _vad_config(sample_rate=16000))
+        self.assertTrue(clamped["has_speech"])
+        self.assertEqual(clamped["speech_ratio"], 1.0)
+
+    def test_segment_probe_rpc_dispatch(self) -> None:
+        configure({})
+        resp = worker.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "segment_probe",
+                "params": {"audio_file": "/tmp/a.wav"},
+            }
+        )
+        assert resp is not None
+        self.assertEqual(resp["error"]["code"], PROVIDER_UNAVAILABLE_CODE)
+
+        configure({"vad": {"enabled": True, "model_path": "/tmp/silero.onnx"}})
+        for bad in ({}, {"audio_file": 42}):
+            err = worker.handle_request(
+                {"jsonrpc": "2.0", "id": 2, "method": "segment_probe", "params": bad}
+            )
+            assert err is not None
+            self.assertEqual(err["error"]["code"], INVALID_REQUEST_CODE)
 
         with patch.object(
-            vad_segmenter,
-            "_load_wav_as_float32_mono",
-            return_value=(_FakeSamples(0), 16000),
-        ) as loader:
-            result = probe_audio_file(str(audio), _vad_config())
-
-        loader.assert_called_once()
-        self.assertFalse(result["has_speech"])
-        self.assertEqual(result["speech_ratio"], 0.0)
-        self.assertEqual(result["regions"], [])
-        self.assertEqual(result["notes"], [])
-
-    def test_forwards_speech_regions_and_clamps_ratio(self) -> None:
-        # 16 kHz / 512 = 31.25 → 31 frames over 1.0 s.
-        # A speech block covering frames 0..14 produces one region that
-        # maps to seconds 0.0 .. 15 * FRAME_SEC.
-        from voicelayer_orchestrator.providers import vad_segmenter
-
-        audio = self.tmp_dir / "fake.wav"
-        audio.touch()
-        sample_rate = 16000
-        samples = _FakeSamples(sample_rate)  # 1.0 s at 16 kHz
-        speech_frames = [0.9] * 15 + [0.1] * 16
-
-        with (
-            patch.object(
-                vad_segmenter,
-                "_load_wav_as_float32_mono",
-                return_value=(samples, sample_rate),
-            ),
-            patch.object(vad_segmenter, "_load_vad_session", return_value=object()),
-            patch.object(vad_segmenter, "_speech_probabilities", return_value=speech_frames),
+            pipeline, "probe_audio_file", side_effect=ProviderInvocationError("boom")
         ):
-            config = _vad_config(
-                threshold=0.5,
-                min_speech_ms=100,
-                min_silence_ms=50,
-                speech_pad_ms=0,
-                sample_rate=sample_rate,
-            )
-            result = probe_audio_file(str(audio), config)
-
-        self.assertTrue(result["has_speech"])
-        self.assertEqual(len(result["regions"]), 1)
-        region = result["regions"][0]
-        self.assertAlmostEqual(region["start_secs"], 0.0, places=5)
-        self.assertAlmostEqual(region["end_secs"], 15 * self.FRAME_SEC, places=5)
-        # Ratio = region length / audio duration; always in [0, 1].
-        self.assertGreaterEqual(result["speech_ratio"], 0.0)
-        self.assertLessEqual(result["speech_ratio"], 1.0)
-
-    def test_clamps_ratio_when_padding_would_overshoot_duration(self) -> None:
-        # `_frames_to_regions` can emit regions whose padded end extends
-        # past the audio duration (padding is applied in frame units and
-        # not clamped to the file length). The helper must cap
-        # ``speech_ratio`` at 1.0 so callers never see a ratio > 1.
-        from voicelayer_orchestrator.providers import vad_segmenter
-
-        audio = self.tmp_dir / "fake.wav"
-        audio.touch()
-        sample_rate = 16000
-        samples = _FakeSamples(sample_rate // 4)  # 0.25 s
-
-        # Fake `_frames_to_regions` to return a single region that
-        # obviously exceeds the clip duration (end index > frame count).
-        with (
-            patch.object(
-                vad_segmenter,
-                "_load_wav_as_float32_mono",
-                return_value=(samples, sample_rate),
-            ),
-            patch.object(vad_segmenter, "_load_vad_session", return_value=object()),
-            patch.object(vad_segmenter, "_speech_probabilities", return_value=[0.9] * 8),
-            patch.object(
-                vad_segmenter,
-                "_frames_to_regions",
-                return_value=[(0, 100)],  # 100 * 32 ms = 3.2 s, audio is 0.25 s
-            ),
-        ):
-            result = probe_audio_file(str(audio), _vad_config(sample_rate=sample_rate))
-
-        self.assertTrue(result["has_speech"])
-        self.assertEqual(result["speech_ratio"], 1.0)
-
-
-class SegmentProbeDispatchTest(unittest.TestCase):
-    """Dispatch-level tests for the JSON-RPC ``segment_probe`` method.
-
-    The method is a thin wrapper around
-    :func:`vad_segmenter.probe_audio_file`; these tests pin the wire-level
-    error classification (provider-unavailable, invalid-request,
-    request-failed) and that the happy path forwards the helper's result
-    verbatim.
-    """
-
-    def setUp(self) -> None:
-        super().setUp()
-        reset_configuration_for_tests()
-        from voicelayer_orchestrator import worker
-
-        self.worker = worker
-        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-segment-probe-"))
-
-    def test_returns_provider_unavailable_when_vad_not_configured(self) -> None:
-        with patch.object(self.worker, "load_whisper_vad_config", return_value=None):
-            response = self.worker.handle_request(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "segment_probe",
-                    "params": {"audio_file": "/tmp/anything.wav"},
-                }
-            )
-
-        assert response is not None
-        self.assertIn("error", response)
-        self.assertEqual(response["error"]["code"], self.worker.PROVIDER_UNAVAILABLE_CODE)
-        self.assertIn("VOICELAYER_WHISPER_VAD_ENABLED", response["error"]["message"])
-
-    def test_returns_invalid_request_when_audio_file_missing(self) -> None:
-        with patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()):
-            response = self.worker.handle_request(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "segment_probe",
-                    "params": {},
-                }
-            )
-
-        assert response is not None
-        self.assertEqual(response["error"]["code"], self.worker.INVALID_REQUEST_CODE)
-        self.assertIn("audio_file", response["error"]["message"])
-
-    def test_returns_invalid_request_when_audio_file_is_not_string(self) -> None:
-        with patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()):
-            response = self.worker.handle_request(
+            fail = worker.handle_request(
                 {
                     "jsonrpc": "2.0",
                     "id": 3,
                     "method": "segment_probe",
-                    "params": {"audio_file": 42},
+                    "params": {"audio_file": "/tmp/x.wav"},
                 }
             )
+            assert fail is not None
+            self.assertEqual(fail["error"]["code"], PROVIDER_REQUEST_FAILED_CODE)
 
-        assert response is not None
-        self.assertEqual(response["error"]["code"], self.worker.INVALID_REQUEST_CODE)
-
-    def test_returns_provider_request_failed_when_probe_raises(self) -> None:
-        from voicelayer_orchestrator.providers import ProviderInvocationError
-
-        with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
-            patch.object(
-                self.worker,
-                "probe_audio_file",
-                side_effect=ProviderInvocationError("probe input does not exist: /tmp/x.wav"),
-            ),
-        ):
-            response = self.worker.handle_request(
+        verdict = {"has_speech": True, "speech_ratio": 0.5, "regions": [], "notes": []}
+        with patch.object(pipeline, "probe_audio_file", return_value=verdict):
+            ok = worker.handle_request(
                 {
                     "jsonrpc": "2.0",
                     "id": 4,
@@ -704,107 +209,163 @@ class SegmentProbeDispatchTest(unittest.TestCase):
                     "params": {"audio_file": "/tmp/x.wav"},
                 }
             )
+            assert ok is not None
+            self.assertEqual(ok["result"], verdict)
 
-        assert response is not None
-        self.assertEqual(response["error"]["code"], self.worker.PROVIDER_REQUEST_FAILED_CODE)
-        self.assertIn("probe input does not exist", response["error"]["message"])
 
-    def test_forwards_probe_audio_file_result_verbatim(self) -> None:
-        probe_payload = {
-            "has_speech": True,
-            "speech_ratio": 0.63,
-            "regions": [
-                {"start_secs": 0.25, "end_secs": 0.75},
-                {"start_secs": 1.10, "end_secs": 1.40},
-            ],
-            "notes": [],
-        }
+class SinglePassVadPrepassTest(unittest.TestCase):
+    """Verify VAD runs exactly once in ``pipeline.transcribe`` and cleans up sidecar WAVs."""
+
+    def setUp(self) -> None:
+        reset_configuration_for_tests()
+        self.tmp = tempfile.TemporaryDirectory(prefix="voicelayer-vad-pipeline-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+
+    def test_vad_runs_once_and_unlinks_trimmed_wav_on_success(self) -> None:
+        audio = _write_silent_wav(self.root / "raw.wav")
+        trimmed = _write_silent_wav(self.root / "raw.vad-trimmed.wav")
+        configure(
+            {
+                "whisper": {"model_path": "/models/base.bin"},
+                "vad": {"enabled": True, "model_path": "/tmp/silero.onnx"},
+            }
+        )
+
         with (
-            patch.object(self.worker, "load_whisper_vad_config", return_value=_vad_config()),
-            patch.object(self.worker, "probe_audio_file", return_value=probe_payload) as probe,
+            patch.object(
+                pipeline, "apply_vad_prepass", return_value=(str(trimmed), [(0.0, 1.0)])
+            ) as vad_call,
+            patch.object(
+                pipeline,
+                "transcribe_with_whisper_cli",
+                return_value={"text": "hello", "detected_language": "en", "notes": []},
+            ) as cli_call,
         ):
-            response = self.worker.handle_request(
+            resp = worker.handle_request(
                 {
                     "jsonrpc": "2.0",
-                    "id": 5,
-                    "method": "segment_probe",
-                    "params": {"audio_file": "/tmp/probe.wav"},
+                    "id": 10,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
                 }
             )
 
-        assert response is not None
-        self.assertNotIn("error", response)
-        self.assertEqual(response["result"], probe_payload)
-        probe.assert_called_once()
-        call_args = probe.call_args
-        self.assertEqual(call_args.args[0], "/tmp/probe.wav")
+        assert resp is not None
+        self.assertEqual(resp["result"]["text"], "hello")
+        vad_call.assert_called_once()
+        self.assertEqual(cli_call.call_args.args[0]["audio_file"], str(trimmed))
+        self.assertFalse(trimmed.exists())
+        self.assertTrue(audio.exists())
+
+    def test_vad_short_circuits_and_cleans_up_on_empty_speech(self) -> None:
+        audio = _write_silent_wav(self.root / "silent.wav")
+        trimmed = self.root / "silent.vad-empty.wav"
+        trimmed.write_bytes(b"")
+        configure(
+            {
+                "whisper": {"model_path": "/models/base.bin"},
+                "vad": {"enabled": True, "model_path": "/tmp/silero.onnx"},
+            }
+        )
+
+        with (
+            patch.object(pipeline, "apply_vad_prepass", return_value=(str(trimmed), [])),
+            patch.object(pipeline, "transcribe_with_whisper_cli") as cli_call,
+        ):
+            resp = worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
+                }
+            )
+
+        assert resp is not None
+        self.assertEqual(resp["result"]["text"], "")
+        cli_call.assert_not_called()
+        self.assertFalse(trimmed.exists())
+        self.assertTrue(audio.exists())
+
+    def test_vad_unlinks_trimmed_wav_when_provider_raises_and_falls_back_on_vad_error(self) -> None:
+        audio = _write_silent_wav(self.root / "raw.wav")
+        trimmed = _write_silent_wav(self.root / "raw.vad-trimmed.wav")
+        configure(
+            {
+                "whisper": {"model_path": "/models/base.bin"},
+                "vad": {"enabled": True, "model_path": "/tmp/silero.onnx"},
+            }
+        )
+
+        with (
+            patch.object(pipeline, "apply_vad_prepass", return_value=(str(trimmed), [(0.0, 1.0)])),
+            patch.object(
+                pipeline,
+                "transcribe_with_whisper_cli",
+                side_effect=ProviderInvocationError("whisper failed"),
+            ),
+        ):
+            err = worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
+                }
+            )
+        assert err is not None
+        self.assertIn("whisper failed", err["error"]["message"])
+        self.assertFalse(trimmed.exists())
+
+        with (
+            patch.object(
+                pipeline, "apply_vad_prepass", side_effect=ProviderInvocationError("ort missing")
+            ),
+            patch.object(
+                pipeline,
+                "transcribe_with_whisper_cli",
+                return_value={"text": "raw ok", "detected_language": None, "notes": []},
+            ) as cli_call,
+        ):
+            ok = worker.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 13,
+                    "method": "transcribe",
+                    "params": {"audio_file": str(audio)},
+                }
+            )
+        assert ok is not None
+        self.assertEqual(ok["result"]["text"], "raw ok")
+        self.assertEqual(cli_call.call_args.args[0]["audio_file"], str(audio))
+        self.assertTrue(any("VAD pre-pass failed" in note for note in ok["result"]["notes"]))
 
 
-@unittest.skipUnless(
-    importlib.util.find_spec("numpy") is not None,
-    "numpy (vad extra) is not installed",
-)
-class VadWavHelpersTest(unittest.TestCase):
-    """Exercise helpers that require numpy. Skipped when the vad extra is absent."""
-
+@unittest.skipUnless(importlib.util.find_spec("numpy") is not None, "numpy extra not installed")
+class VadNumpyHelpersTest(unittest.TestCase):
     def setUp(self) -> None:
-        super().setUp()
-        reset_configuration_for_tests()
-        self.tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="voicelayer-vad-wav-"))
+        self.tmp = tempfile.TemporaryDirectory(prefix="voicelayer-vad-np-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
 
-    def _write_wav(self, path: pathlib.Path, samples: object, sample_rate: int = 16000) -> None:
+    def test_resample_and_extract_speech_wav(self) -> None:
         import numpy as np  # noqa: PLC0415
 
-        pcm = np.clip(np.asarray(samples) * 32768.0, -32768.0, 32767.0).astype(np.int16)
+        path = self.root / "tone.wav"
+        sr = 22050
+        t = np.linspace(0.0, 1.0, sr, endpoint=False, dtype=np.float32)
+        pcm = np.clip(np.sin(2 * np.pi * 440 * t) * 32768.0, -32768.0, 32767.0).astype(np.int16)
         with wave.open(str(path), "wb") as handle:
             handle.setnchannels(1)
             handle.setsampwidth(2)
-            handle.setframerate(sample_rate)
+            handle.setframerate(sr)
             handle.writeframes(pcm.tobytes())
 
-    def test_load_wav_resamples_to_target_rate(self) -> None:
-        import numpy as np  # noqa: PLC0415
-
-        from voicelayer_orchestrator.providers.vad_segmenter import (  # noqa: PLC0415
-            _load_wav_as_float32_mono,
-        )
-
-        path = self.tmp_dir / "sine-22050.wav"
-        sample_rate = 22050
-        t = np.linspace(0.0, 1.0, sample_rate, endpoint=False, dtype=np.float32)
-        self._write_wav(path, np.sin(2 * np.pi * 440 * t), sample_rate=sample_rate)
-
-        samples, original_sr = _load_wav_as_float32_mono(path, target_sample_rate=16000)
-        self.assertEqual(original_sr, sample_rate)
-        self.assertEqual(samples.dtype, np.float32)
-        # Linear resampling keeps the proportion of samples within one unit.
+        samples, orig_sr = vad._load_wav_as_float32_mono(path, target_sample_rate=16000)
+        self.assertEqual(orig_sr, sr)
         self.assertAlmostEqual(samples.shape[0], 16000, delta=2)
 
-    def test_extract_speech_wav_writes_only_selected_regions(self) -> None:
-        import numpy as np  # noqa: PLC0415
-
-        from voicelayer_orchestrator.providers.vad_segmenter import (  # noqa: PLC0415
-            extract_speech_wav,
-        )
-
-        path = self.tmp_dir / "source.wav"
-        sample_rate = 16000
-        duration = 3.0
-        t = np.linspace(0.0, duration, int(sample_rate * duration), endpoint=False)
-        tone = np.sin(2 * np.pi * 200 * t).astype(np.float32)
-        self._write_wav(path, tone, sample_rate=sample_rate)
-
-        config = _vad_config(sample_rate=sample_rate)
-        out_dir = self.tmp_dir / "out"
-        trimmed = extract_speech_wav(path, [(0.0, 0.5), (1.0, 1.5)], out_dir, config)
+        trimmed = vad.extract_speech_wav(path, [(0.0, 0.5)], self.root / "out", _vad_config())
         with wave.open(str(trimmed), "rb") as handle:
-            frames = handle.getnframes()
-            self.assertEqual(handle.getframerate(), sample_rate)
-            self.assertEqual(handle.getnchannels(), 1)
-            self.assertEqual(handle.getsampwidth(), 2)
-        # Two regions of 0.5s each = 1.0s = 16000 frames (+/- rounding).
-        self.assertAlmostEqual(frames, sample_rate, delta=8)
-
-
-if __name__ == "__main__":
-    unittest.main()
+            self.assertAlmostEqual(handle.getnframes(), 8000, delta=8)

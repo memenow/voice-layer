@@ -1,0 +1,46 @@
+[package]
+name = "voicelayer-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vl-desktop"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck.workspace = true
+directories.workspace = true
+futures-util.workspace = true
+iced = { version = "0.14.0", features = ["tokio", "wgpu", "advanced"] }
+ksni = { version = "0.3.8", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+voicelayer-core = { workspace = true, features = ["client"] }
+voicelayer-ui.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.14.3", default-features = false, features = [
+    "tokio",
+    "global_shortcuts",
+    "settings",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+global-hotkey = "0.10.0"
+
+[features]
+# Optional StatusNotifierItem system tray using pure-Rust ksni (no GTK).
+tray = ["dep:ksni"]
+
+[dev-dependencies]
+fontdb = "0.24.0"
+naga = { version = "30.0.2", features = ["wgsl-in"] }
+tempfile.workspace = true
+voicelayer-testkit.workspace = true

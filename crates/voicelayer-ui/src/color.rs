@@ -1,11 +1,6 @@
-//! Backend-agnostic sRGBA color primitive.
-//!
-//! Channels are straight (non-premultiplied) alpha in `0.0..=1.0`. Both
-//! `iced::Color` (GUI) and terminal colors (TUI) are derived from this type at
-//! the edge so the design tokens never pull a rendering backend into this
-//! crate.
+//! Backend-agnostic sRGBA color primitive with straight alpha channels in `0.0..=1.0`.
 
-/// An sRGB color with straight alpha. Channels are `0.0..=1.0`.
+/// An sRGB color with straight (non-premultiplied) alpha in `0.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgba {
     pub r: f32,
@@ -15,19 +10,19 @@ pub struct Rgba {
 }
 
 impl Rgba {
-    /// Fully transparent — the default "no border" color for glass.
+    /// Fully transparent color used for disabled borders and overlays.
     pub const TRANSPARENT: Rgba = Rgba::new(0.0, 0.0, 0.0, 0.0);
 
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { r, g, b, a }
     }
 
-    /// Opaque color from 8-bit channels — the ergonomic way to transcribe hex.
+    /// Construct an opaque color from 8-bit RGB channels.
     pub fn rgb8(r: u8, g: u8, b: u8) -> Self {
         Self::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
     }
 
-    /// The same color at a new alpha.
+    /// Return this color with a replaced alpha channel.
     pub const fn with_alpha(self, a: f32) -> Self {
         Self {
             r: self.r,
@@ -37,7 +32,7 @@ impl Rgba {
         }
     }
 
-    /// Channel-wise linear interpolation (`t` clamped to `0..=1`).
+    /// Channel-wise linear interpolation with `t` clamped to `0.0..=1.0`.
     pub fn lerp(self, other: Rgba, t: f32) -> Rgba {
         let t = t.clamp(0.0, 1.0);
         Rgba {
@@ -48,9 +43,7 @@ impl Rgba {
         }
     }
 
-    /// Straight-alpha → premultiplied. Wayland surfaces on Mesa require
-    /// `CompositeAlphaMode::PreMultiplied`, so the transparent-window path must
-    /// pre-multiply RGB by alpha before handing colors to wgpu.
+    /// Convert straight alpha to premultiplied alpha for Mesa/Wayland wgpu surfaces.
     pub fn premultiplied(self) -> Rgba {
         Rgba {
             r: self.r * self.a,
@@ -60,10 +53,10 @@ impl Rgba {
         }
     }
 
-    /// Quantize to opaque 8-bit RGB (alpha dropped). Used by the TUI edge.
+    /// Quantize RGB channels to opaque 8-bit values, dropping alpha.
     pub fn to_rgb8(self) -> (u8, u8, u8) {
-        let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-        (q(self.r), q(self.g), q(self.b))
+        let quantize = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        (quantize(self.r), quantize(self.g), quantize(self.b))
     }
 }
 

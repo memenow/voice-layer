@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Host Injection Strategy | VoiceLayer Documentation</title>
+<meta name="description" content="GUI and terminal insertion priority for VoiceLayer on Ubuntu GNOME Wayland and macOS: AT-SPI first, clipboard second, keyboard simulation last." />
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+<a class="vl-skip-link" href="#main">Skip to main content</a>
+<header class="vl-header">
+  <a class="vl-brand" href="../index.html">VoiceLayer Docs</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../architecture/overview.html" aria-current="page">Architecture</a>
+    <a href="../guides/development.html">Development</a>
+    <a href="../guides/services.html">Services</a>
+    <a href="../guides/asr-providers.html">ASR providers</a>
+    <a href="../guides/llm-provider.html">LLM provider</a>
+    <a href="../guides/desktop.html">Desktop</a>
+  </nav>
+</header>
+
+<main id="main">
+
+<h1 id="host-injection-strategy">Host Injection Strategy</h1>
+
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#principles">Principles</a></li>
+<li><a href="#gui-targets">GUI Targets</a>
+<ul>
+<li><a href="#at-spi-first">AT-SPI First</a></li>
+<li><a href="#clipboard-second">Clipboard Second</a></li>
+<li><a href="#keyboard-simulation-last">Keyboard Simulation Last</a></li>
+</ul></li>
+<li><a href="#terminal-and-tui-targets">Terminal and TUI Targets</a>
+<ul>
+<li><a href="#default-safety-rule">Default Safety Rule</a></li>
+</ul></li>
+<li><a href="#adapter-extensions">Adapter Extensions</a></li>
+</ul>
+</nav>
+
+<h2 id="principles">Principles</h2>
+<ul>
+<li>Use the least invasive insertion mechanism that delivers exact text.</li>
+<li>Prefer semantic text APIs over synthetic key events.</li>
+<li>Keep terminal submission explicit: never append Enter by default.</li>
+</ul>
+
+<h2 id="gui-targets">GUI Targets</h2>
+<p>Preferred insertion order for GUI targets on Ubuntu GNOME Wayland:</p>
+<ol>
+<li>AT-SPI editable text insertion or replacement</li>
+<li>Clipboard-assisted paste with clipboard restoration</li>
+<li>Keyboard simulation fallback</li>
+</ol>
+
+<h3 id="at-spi-first">AT-SPI First</h3>
+<p>AT-SPI exposes direct editable text operations without the focus and timing
+races of synthetic keystrokes. It is the preferred target for browser editors,
+GTK apps, Electron apps, and IDEs that expose accessibility trees.</p>
+
+<h3 id="clipboard-second">Clipboard Second</h3>
+<p>Clipboard paste works across most GUI applications and avoids keyboard
+layout issues. Implementations must snapshot and restore prior clipboard text
+when requested.</p>
+
+<h3 id="keyboard-simulation-last">Keyboard Simulation Last</h3>
+<p>Wayland intentionally restricts unrestricted input event injection. Tools
+such as <code>ydotool</code> and <code>wtype</code> remain fallbacks rather than
+the primary contract.</p>
+
+<h2 id="terminal-and-tui-targets">Terminal and TUI Targets</h2>
+<p>Preferred insertion order for terminal and TUI targets:</p>
+<ol>
+<li>Bracketed paste payloads (<code>\x1b[200~...\x1b[201~</code>)</li>
+<li>Terminal-specific send-text adapters (tmux, WezTerm, Kitty)</li>
+<li>Clipboard paste fallback when explicitly requested</li>
+</ol>
+
+<h3 id="default-safety-rule">Default Safety Rule</h3>
+<p>Terminal injection must not execute commands automatically. Post-insert
+submission requires an explicit opt-in flag (<code>auto_submit=true</code>) on
+the request.</p>
+
+<h2 id="adapter-extensions">Adapter Extensions</h2>
+<p>Additional host adapters (direct Kitty socket remote control, Neovim RPC, or
+native AT-SPI text writers) plug into the same <code>InjectionPlan</code>
+contract rather than introducing parallel target types.</p>
+
+</main>
+
+<footer class="vl-footer">
+  <span>VoiceLayer: local-first voice composition layer for Ubuntu and macOS.</span>
+  <span>Documentation source: HTML files under <code>docs/</code>.</span>
+</footer>
+</body>
+</html>

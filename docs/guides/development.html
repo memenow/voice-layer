@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Development Guide — VoiceLayer Documentation</title>
-<meta name="description" content="Repository layout, the authoritative verification chain (cargo and uv), worker discovery, daemon socket, and live dictation runtime commands." />
+<title>Development Guide | VoiceLayer Documentation</title>
+<meta name="description" content="Repository layout, verification chain, worker discovery, daemon socket, and CLI runtime commands." />
 <link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body>
@@ -15,9 +15,9 @@
     <a href="../index.html">Home</a>
     <a href="../architecture/overview.html">Architecture</a>
     <a href="../guides/development.html" aria-current="page">Development</a>
-    <a href="../guides/systemd.html">Systemd</a>
-    <a href="../guides/local-asr-provider.html">ASR providers</a>
-    <a href="../guides/local-llm-provider.html">LLM provider</a>
+    <a href="../guides/services.html">Services</a>
+    <a href="../guides/asr-providers.html">ASR providers</a>
+    <a href="../guides/llm-provider.html">LLM provider</a>
     <a href="../guides/desktop.html">Desktop</a>
   </nav>
 </header>
@@ -30,7 +30,7 @@
 <ul>
 <li><a href="#repository-layout">Repository Layout</a></li>
 <li><a href="#verification-chain">Verification Chain</a></li>
-<li><a href="#useful-runtime-commands">Useful Runtime Commands</a></li>
+<li><a href="#runtime-commands">Runtime Commands</a></li>
 <li><a href="#daemon-socket">Daemon Socket</a></li>
 <li><a href="#worker-project-root">Worker Project Root</a></li>
 <li><a href="#operational-notes">Operational Notes</a></li>
@@ -39,26 +39,31 @@
 
 <h2 id="repository-layout">Repository Layout</h2>
 <ul>
-<li><code>crates/voicelayer-core</code>: shared domain and
-contracts</li>
-<li><code>crates/voicelayerd</code>: daemon and local HTTP API over a
-Unix domain socket</li>
-<li><code>crates/vl</code>: operator CLI and TUI entry point</li>
-<li><code>crates/vl-desktop</code>: interactive GUI shell that shares
-the daemon socket</li>
-<li><code>python/voicelayer_orchestrator</code>: worker protocol and
-provider runtime (<code>providers/</code> holds one file per provider
-surface — whisper-cli, whisper-server, silero-vad, llama autostart,
-OpenAI-compatible LLM)</li>
-<li><code>openapi/</code>: local API contract</li>
-<li><code>systemd/</code>: user service templates for the daemon and the
-optional persistent <code>whisper-server</code></li>
-<li><code>scripts/</code>: installer, whisper-server wrapper, and
-cold-start benchmark helpers</li>
+<li><code>crates/voicelayer-core</code>: shared domain types, config loading,
+and UDS HTTP/SSE client</li>
+<li><code>crates/voicelayerd</code>: daemon, <code>cpal</code> audio capture,
+dictation orchestrators, and <code>/v1</code> HTTP API</li>
+<li><code>crates/voicelayer-cli</code>: operator CLI and foreground push-to-talk
+TUI (binary: <code>vl</code>)</li>
+<li><code>crates/voicelayer-desktop</code>: multi-window iced GUI shell
+(binary: <code>vl-desktop</code>)</li>
+<li><code>crates/voicelayer-ui</code>: shared UI theme tokens and typography
+constants</li>
+<li><code>crates/voicelayer-testkit</code>: shared doc-parsing utilities for
+integration guard tests</li>
+<li><code>python/voicelayer_worker</code>: stdio JSON-RPC worker, Silero VAD
+pre-pass, and ASR/LLM provider drivers</li>
+<li><code>openapi/voicelayerd.v1.yaml</code>: OpenAPI 3.1 contract for the
+daemon control plane</li>
+<li><code>systemd/</code> and <code>launchd/</code>: Linux systemd user units,
+environment template, and macOS LaunchAgent plist</li>
+<li><code>scripts/</code>: installer, <code>whisper-server</code> wrapper, and
+whisper latency benchmark scripts</li>
 </ul>
+
 <h2 id="verification-chain">Verification Chain</h2>
-<p>The authoritative list every change must pass before merge (also
-mirrored in <code>README.md</code> and <code>CLAUDE.md</code>):</p>
+<p>Run the full verification sequence before opening or merging a pull request
+(also mirrored in <code>README.md</code>, <code>CLAUDE.md</code>, and CI):</p>
 <pre><code>cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
@@ -66,199 +71,104 @@ uv sync --group dev
 uv run ruff check python tests/python
 uv run ruff format --check python tests/python
 uv run pytest -q tests/python</code></pre>
-<h2 id="useful-runtime-commands">Useful Runtime Commands</h2>
-<pre><code>cargo run -p vl -- providers
-cargo run -p vl -- preview compose "Write a concise technical summary."
-cargo run -p vl -- transcribe-file /path/to/sample.wav --language auto
-cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto
-cargo run -p vl -- dictation start --language auto
-cargo run -p vl -- dictation start --mode fixed --segment-secs 8 --language auto
-cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
-cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --duration-seconds 10 --language auto
-cargo run -p vl -- dictation stop &lt;session-id&gt;
-cargo run -p vl -- dictation list
-cargo run -p vl -- dictation foreground-ptt --language auto
-cargo run -p vl -- hotkeys portal-status
-cargo run -p vl-desktop</code></pre>
+
+<h2 id="runtime-commands">Runtime Commands</h2>
+<pre><code>cargo run -p voicelayer-cli -- doctor
+cargo run -p voicelayer-cli -- providers
+cargo run -p voicelayer-cli -- preview compose "Write a concise technical summary."
+cargo run -p voicelayer-cli -- transcribe-file /path/to/sample.wav --language auto
+cargo run -p voicelayer-cli -- record-transcribe --duration-seconds 8 --language auto
+cargo run -p voicelayer-cli -- dictation start --language auto
+cargo run -p voicelayer-cli -- dictation start --mode fixed --segment-secs 8 --language auto
+cargo run -p voicelayer-cli -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
+cargo run -p voicelayer-cli -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --duration-seconds 10 --language auto
+cargo run -p voicelayer-cli -- dictation stop &lt;session-id&gt;
+cargo run -p voicelayer-cli -- dictation list
+cargo run -p voicelayer-cli -- dictation foreground-ptt --language auto
+cargo run -p voicelayer-cli -- hotkeys portal-status
+cargo run -p voicelayer-desktop</code></pre>
+
 <h2 id="daemon-socket">Daemon Socket</h2>
-<p>The default socket path is:</p>
+<p>Default socket location:</p>
 <pre><code>$XDG_RUNTIME_DIR/voicelayer/daemon.sock</code></pre>
+<p>When <code>XDG_RUNTIME_DIR</code> is unset (for example on macOS), the daemon
+and clients fall back to <code>$TMPDIR/voicelayer/daemon.sock</code>. Override
+with <code>VOICELAYER_SOCKET_PATH</code>.</p>
+
 <h2 id="worker-project-root">Worker Project Root</h2>
-<p>The Rust control plane discovers the Python worker from
-<code>VOICELAYER_PROJECT_ROOT</code>. If the variable is unset, the
-daemon falls back to the current working directory.</p>
-<p>For source-based development, start the daemon from the repository
-root or pass:</p>
+<p><code>voicelayerd</code> locates <code>python/voicelayer_worker</code> using
+<code>VOICELAYER_PROJECT_ROOT</code>, falling back to the current working
+directory when unset. From the repository root:</p>
 <pre><code>cargo run -p voicelayerd</code></pre>
-<p>For real composition / rewrite / translation, configure
-<code>VOICELAYER_LLM_ENDPOINT</code> and
-<code>VOICELAYER_LLM_MODEL</code> as described in
-<code>docs/guides/local-llm-provider.html</code>. When the endpoint is
-unset or unreachable, the worker returns a
-<code>provider-unavailable</code> JSON-RPC error instead of fabricating
-output. If you also set <code>VOICELAYER_LLM_AUTO_START=true</code>,
-VoiceLayer can auto-launch <code>llama-server</code> for a local
-endpoint. For file-based ASR, configure
-<code>VOICELAYER_WHISPER_BIN</code> and
-<code>VOICELAYER_WHISPER_MODEL_PATH</code> as described in
-<code>docs/guides/local-asr-provider.html</code>. For warm-model reuse
-across transcribe calls, point at a persistent
-<code>VOICELAYER_WHISPER_SERVER_*</code> endpoint (see the same
-guide).</p>
+<p>To enable composition, rewrite, and translation, configure
+<code>VOICELAYER_LLM_ENDPOINT</code> and <code>VOICELAYER_LLM_MODEL</code> (see
+<a href="./llm-provider.html">LLM Provider</a>). To enable ASR, configure
+<code>whisper.cpp</code> or an optional GPU backend (see
+<a href="./asr-providers.html">ASR Providers</a>).</p>
+
 <h2 id="operational-notes">Operational Notes</h2>
 <ul>
-<li>The daemon exposes a <code>/v1</code> API over a Unix domain socket
-with Server-Sent Events at <code>/v1/events/stream</code>. The
-<code>#[cfg(test)]</code> modules in
-<code>crates/voicelayerd/src/lib.rs</code> guard doc and route
-alignment (<code>openapi_route_alignment_tests</code>,
-<code>doc_v1_endpoint_alignment_tests</code>,
-<code>sse_event_doc_alignment_tests</code>); runtime behavior is
-exercised by the worker integration tests in
-<code>crates/voicelayerd/src/worker.rs</code> and the Python suite in
-<code>tests/python/</code>.</li>
-<li><code>compose</code>, <code>rewrite</code>, and
-<code>translate</code> call the configured OpenAI-compatible chat
-completion endpoint through the Python worker's
-<code>providers/llm_openai_compatible.py</code>. When no endpoint is
-configured they surface JSON-RPC <code>-32004</code> (provider
-unavailable); when the endpoint fails they surface <code>-32005</code>
-(provider request failed).</li>
-<li><code>transcribe</code> prefers a persistent
-<code>whisper-server</code> endpoint (see
-<code>providers/whisper_server.py</code>) and falls back to one-shot
-<code>whisper-cli</code> (<code>providers/whisper_cli.py</code>). When
-<code>VOICELAYER_WHISPER_VAD_ENABLED=true</code> with a valid silero-vad
-ONNX model, a pre-pass in <code>providers/vad_segmenter.py</code> trims
-non-speech before whisper — failure downgrades to the raw WAV without
-losing the request.</li>
-<li><code>vl record-transcribe</code> asks the daemon's one-shot
-capture path (in-process <code>cpal</code> capture) to record a short
-WAV clip, then feeds it into the same transcription flow.</li>
-<li><code>voicelayerd</code> serves the daemon-side one-shot capture
-path at <code>/v1/dictation/capture</code>, which advances session state
-from <code>listening</code> to <code>transcribing</code> to
-<code>completed</code> or <code>failed</code>, setting
-<code>DictationFailureKind</code> on the unhappy paths.</li>
-<li><code>voicelayerd</code> also serves live dictation sessions at
-<code>/v1/sessions/dictation</code> (start) and
-<code>/v1/sessions/dictation/stop</code>.
-<code>StartDictationRequest.segmentation</code> selects between
-<code>{"mode": "one_shot"}</code>,
-<code>{"mode": "fixed", "segment_secs": N, "overlap_secs": 0}</code>,
-and
-<code>{"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}</code>.
-In <code>fixed</code> mode the capture buffer is sliced every
-<code>N</code> seconds, each chunk is transcribed in the background, and
-per-segment events (<code>dictation.segment_recorded</code>,
-<code>dictation.segment_transcribed</code>) stream on
-<code>/v1/events/stream</code> alongside the lifecycle events. In
-<code>vad_gated</code> mode probes are cut at
-<code>probe_secs</code> cadence, each probe is classified by silero-vad
-(via the worker's <code>segment_probe</code> RPC), pending speech probes
-flush on silence or at <code>max_segment_secs</code>, and per-probe /
-per-unit events (<code>dictation.probe_analyzed</code>,
-<code>dictation.speech_unit_flushed</code>,
-<code>dictation.speech_unit_transcribed</code>) stream alongside the
-lifecycle events. VAD-gated mode requires
-<code>VOICELAYER_WHISPER_VAD_ENABLED=true</code> and a silero-vad ONNX
-model path.</li>
-<li><code>vl dictation list</code> returns the JSON array from
-<code>GET /v1/sessions</code>. The daemon keeps every
-<code>CaptureSession</code> it has seen since startup (including
-completed and failed ones) sorted by <code>created_at_millis</code>, so
-an operator who lost a <code>session_id</code> printed by an earlier
-<code>dictation start</code> can recover it without restarting the
-daemon.</li>
-<li><code>vl dictation start/stop</code> uses the daemon UDS client, so
-the CLI exercises the same control plane hotkey and UI integrations use.
-<code>--mode {one-shot,fixed,vad-gated}</code> selects the segmentation
-strategy; <code>fixed</code> requires <code>--segment-secs</code>,
-<code>vad-gated</code> requires <code>--probe-secs</code> and
-<code>--max-segment-secs</code> (with an optional
-<code>--silence-gap-probes</code>, default 1). Omitting
-<code>--mode</code> keeps the pre-Phase-3 one-shot behavior. Pass
-<code>--duration-seconds N</code> to have the CLI auto-stop after
-<code>N</code> seconds and print the final
-<code>DictationCaptureResult</code> in one call — useful for smoke /
-benchmark loops where managing a session id by hand is overhead.</li>
-<li><code>vl dictation foreground-ptt</code> provides a terminal-local
-fallback for push-to-talk. It enables raw mode and keyboard enhancement
-flags; if the terminal reports release events it behaves like
-hold-to-record, otherwise it falls back to press-to-start /
-press-again-to-stop.</li>
-<li>The foreground-ptt alternate-screen panel preserves the full last
-transcript for scrolling review and supports <code>j/k</code>, arrow
-keys, and <code>PageUp/PageDown</code> for navigation. Press
-<code>c</code> to copy the last completed transcript to the clipboard on
-demand.</li>
-<li>Press <code>r</code> to restore the saved clipboard text backup
-after any clipboard overwrite performed by the panel.</li>
-<li>The panel also supports lightweight result actions: <code>i</code>
-re-applies the last injection, <code>s</code> saves the last transcript
-to a timestamped file under
-<code>$XDG_STATE_HOME/voicelayer/transcripts/</code> (default
-<code>~/.local/state/voicelayer/transcripts/</code>, override with
-<code>--save-dir</code>), and <code>d</code> discards the last
-transcript from the panel state.</li>
-<li><code>vl dictation foreground-ptt --copy-on-stop</code> adds an
-explicit clipboard fallback using the system clipboard after each
-completed dictation.</li>
-<li><code>vl dictation foreground-ptt --default-stop-action &lt;none|copy|inject|save&gt;</code>
-configures what the tool should try immediately after a stop.</li>
-<li><code>--restore-clipboard-on-exit</code> restores the saved text
-clipboard snapshot when the tool exits.</li>
-<li><code>--save-dir &lt;path&gt;</code> changes where the
-<code>save</code> action writes transcript files.</li>
-<li><code>cargo run -p vl -- config init-defaults</code> writes a
-default config file to
-<code>~/.config/voicelayer/config.toml</code>.</li>
-<li><code>cargo run -p vl -- config show</code> prints the effective
-on-disk config file content.</li>
-<li><code>cargo run -p vl -- config path</code> prints the config file
-location.</li>
-<li><code>cargo run -p vl -- config set foreground_ptt.default_stop_action inject</code>
-updates one supported config key in place.</li>
-<li><code>vl dictation foreground-ptt --tmux-target-pane &lt;pane&gt;</code>
-can paste the finished transcript into another tmux pane using bracketed
-paste mode. It intentionally refuses to paste back into the controller's
-own pane.</li>
-<li>When <code>--tmux-target-pane</code> is omitted inside tmux,
-<code>vl</code> auto-discovers candidate panes. One candidate is
-auto-selected; multiple candidates trigger an interactive selection
-prompt before raw mode starts.</li>
-<li><code>vl dictation foreground-ptt --wezterm-target-pane-id &lt;id&gt;</code>
-and <code>--kitty-match &lt;match&gt;</code> provide explicit
-terminal-specific injection routes for WezTerm and Kitty. These do not
-auto-discover targets yet.</li>
-<li><code>vl hotkeys portal-status</code> probes
-<code>org.freedesktop.portal.GlobalShortcuts</code> through D-Bus so you
-can tell early whether GNOME/portal-based push-to-talk is viable on the
-current session.</li>
-<li><code>cargo run -p vl -- doctor</code> reports whisper mode
-(<code>cli</code> / <code>server</code> / <code>unconfigured</code>), ASR
-and LLM provider reachability, and portal availability.</li>
-<li>When whisper-server or llama-server autostart is enabled, provider
-runtime files are written under
+<li>Contract and documentation guard tests live in
+<code>crates/voicelayer-core/tests/openapi_contract_guards.rs</code>,
+<code>crates/voicelayer-core/tests/repo_consistency_guards.rs</code>,
+<code>crates/voicelayer-core/tests/doc_consistency_guards.rs</code>,
+<code>crates/voicelayerd/tests/api_contract_guards.rs</code>,
+<code>crates/voicelayerd/tests/worker_protocol_guards.rs</code>, and
+<code>crates/voicelayer-cli/tests/cli_doc_guards.rs</code>.</li>
+<li><code>compose</code>, <code>rewrite</code>, and <code>translate</code> call
+an OpenAI-compatible endpoint via
+<code>python/voicelayer_worker/providers/openai_compatible.py</code>. Unconfigured
+endpoints return JSON-RPC <code>-32004</code>; runtime failures return
+<code>-32005</code>.</li>
+<li><code>transcribe</code> runs the optional Silero VAD pre-pass in
+<code>python/voicelayer_worker/pipeline.py</code> before dispatching to
+<code>whisper-server</code>, <code>whisper-cli</code>, MiMo-V2.5-ASR, or
+Qwen3-ASR-1.7B. VAD failures annotate notes and fall back to the raw WAV.</li>
+<li>Live dictation runs via <code>POST /v1/sessions/dictation</code> and
+<code>POST /v1/sessions/dictation/stop</code>.
+<code>StartDictationRequest.segmentation</code> selects
+<code>{"mode": "one_shot"}</code> (default),
+<code>{"mode": "fixed", "segment_secs": N}</code>, or
+<code>{"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}</code>.</li>
+<li>Passing <code>--duration-seconds N</code> to <code>vl dictation start</code>
+waits <code>N</code> seconds after listening begins, stops the session
+automatically, and prints the final <code>DictationCaptureResult</code>.</li>
+<li><code>vl dictation list</code> calls <code>GET /v1/sessions</code> and shows
+all sessions seen since daemon startup so lost session IDs can be recovered.</li>
+<li><code>vl dictation foreground-ptt</code> opens a terminal-local push-to-talk
+panel. When the terminal supports keyboard release events it records while held;
+otherwise it toggles on press. Inside the panel: scroll with <code>j/k</code>,
+arrows, or <code>PageUp/PageDown</code>; press <code>c</code> to copy,
+<code>r</code> to restore clipboard text, <code>i</code> to re-inject,
+<code>s</code> to save under
+<code>$XDG_STATE_HOME/voicelayer/transcripts/</code> (override with
+<code>--save-dir</code>), and <code>d</code> to discard.</li>
+<li><code>vl dictation foreground-ptt</code> supports
+<code>--copy-on-stop</code>,
+<code>--default-stop-action &lt;none|copy|inject|save&gt;</code>,
+<code>--restore-clipboard-on-exit</code>,
+<code>--tmux-target-pane &lt;pane&gt;</code> (auto-discovers candidate panes
+inside tmux and refuses to paste into its own pane),
+<code>--wezterm-target-pane-id &lt;id&gt;</code>, and
+<code>--kitty-match &lt;match&gt;</code>.</li>
+<li>Persist CLI defaults with
+<code>cargo run -p voicelayer-cli -- config init-defaults</code>,
+<code>config path</code>, <code>config show</code>, and
+<code>config set foreground_ptt.default_stop_action inject</code>.</li>
+<li><code>vl hotkeys portal-status</code> checks host global hotkey support
+(XDG GlobalShortcuts portal on Linux, Carbon hotkeys on macOS).</li>
+<li>Autostarted local provider servers store PID, lock, and log state under
 <code>$XDG_RUNTIME_DIR/voicelayer/providers</code>.</li>
-<li><code>vl-desktop</code> is an interactive GUI shell; see
-<code>docs/guides/desktop.html</code> for its two client-side env vars. It
-shares the same daemon socket, session store, and SSE stream as the
-CLI.</li>
-<li>To install VoiceLayer as a systemd user service, run
-<code>scripts/install.sh</code> (see
-<code>docs/guides/systemd.html</code>). The installer builds release
-binaries, copies units into <code>~/.config/systemd/user/</code>, and
-leaves the optional <code>voicelayer-whisper-server</code> unit disabled
-by default.</li>
-<li>Python commands must run through <code>uv</code>, not the system
+<li>For installed user services on Linux or macOS, run
+<code>scripts/install.sh</code> (see <a href="./services.html">User Services</a>).</li>
+<li>Always invoke Python through <code>uv</code> rather than the system
 interpreter.</li>
 </ul>
 
 </main>
 
 <footer class="vl-footer">
-  <span>VoiceLayer &mdash; local-first voice composition layer for Ubuntu and macOS.</span>
+  <span>VoiceLayer: local-first voice composition layer for Ubuntu and macOS.</span>
   <span>Documentation source: HTML files under <code>docs/</code>.</span>
 </footer>
 </body>

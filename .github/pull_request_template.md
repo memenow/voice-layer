@@ -1,20 +1,16 @@
-<!-- Keep the summary terse; details belong in commits or linked design notes. -->
+<!-- Keep the summary concise; put deep rationale in commits or docs. -->
 
 ## Summary
 
 <!-- One or two sentences describing the user-visible change. -->
 
-## Updates
-
-<!-- Bullet list of notable code, doc, or config changes. -->
+## Changes
 
 -
 
 ## Verification
 
-Confirm the authoritative verification chain ran locally on Ubuntu with Rust 1.89
-and Python 3.12 via uv. Check each box that applied or strike through with an
-explanation when intentionally skipped.
+Run the verification chain locally with Rust 1.100 and Python 3.12 via `uv`. Check each item or explain any skip.
 
 - [ ] `cargo fmt --all`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
@@ -22,17 +18,16 @@ explanation when intentionally skipped.
 - [ ] `uv run ruff check python tests/python`
 - [ ] `uv run ruff format --check python tests/python`
 - [ ] `uv run pytest -q tests/python`
-- [ ] Manual exercise of the affected path (daemon, CLI, desktop, worker, or docs)
+- [ ] Manual check of the affected runtime path
 
 ## Linked issue
 
-<!-- e.g. Closes #123, Refs #456. Leave blank if none. -->
+<!-- e.g. Closes #123 -->
 
 ## Breaking changes
 
-<!-- Public API, CLI flags, configuration schema, OpenAPI surface, on-disk
-     formats. Note migration steps if applicable. -->
+<!-- Public API, CLI flags, config schema, or OpenAPI changes and migration steps. -->
 
 ## Risks and follow-ups
 
-<!-- Performance, privacy, host integration risks, known gaps, deferred work. -->
+<!-- Platform-specific behavior, known gaps, or follow-up work. -->

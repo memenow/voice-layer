@@ -1,40 +1,29 @@
 #!/usr/bin/env bash
 # Measure warm `whisper-server` /inference latency.
 #
-# Cold-start latency is captured by scripts/benchmark-whisper-cold-start{,-docker}.sh;
-# this script measures the other half of the decision: how much per-call
-# wall-clock is saved once the server is warm and the ggml context stays
-# mmapped across requests. Operators can use the delta to decide whether
-# running whisper-server persistently is worthwhile for their hardware.
+# Pair with scripts/benchmark-whisper-cold-start{,-docker}.sh to see how much
+# per-call latency a persistent whisper-server saves once the ggml model stays
+# memory-mapped across requests.
 #
 # Requirements:
 #   - curl on PATH
-#   - A whisper-server instance already reachable at HOST:PORT. Start one
-#     with the Docker command documented in docs/guides/local-asr-provider.html,
-#     or rely on VOICELAYER_WHISPER_SERVER_AUTO_START inside the worker.
-#   - tests/fixtures/small.wav (create with `python3 scripts/generate_silent_fixture.py`)
+#   - A whisper-server instance reachable at HOST:PORT (see docs/guides/asr-providers.html,
+#     or enable VOICELAYER_WHISPER_SERVER_AUTO_START inside the worker)
+#   - tests/fixtures/small.wav (create with `uv run python scripts/generate-silent-fixture.py`)
 #
 # Usage:
 #   HOST=127.0.0.1 PORT=8188 RUNS=10 WARMUP_RUNS=2 \
 #     scripts/benchmark-whisper-warm-server.sh
 #
 # Optional environment overrides:
-#   HOST=127.0.0.1                 whisper-server bind host
-#   PORT=8188                      whisper-server bind port
+#   HOST=127.0.0.1                    whisper-server bind host
+#   PORT=8188                         whisper-server bind port
 #   FIXTURE=tests/fixtures/small.wav  input audio file
-#   RUNS=10                        timed requests after warmup
-#   WARMUP_RUNS=2                  untimed requests to settle caches
-#   LANGUAGE=auto                  forwarded as -F language=...
-#   TRANSLATE=false                forwarded as -F translate=true/false
-#   COLD_START_SECONDS=            optional cold-start baseline for the delta report;
-#                                  e.g. the mean reported by benchmark-whisper-cold-start-docker.sh
-#
-# The script prints every timed request's wall-clock seconds, mean/min/max,
-# and — when COLD_START_SECONDS is provided — the absolute and relative
-# saving per transcribe call. It does not make a proceed/stop decision;
-# the saving is configuration-specific (CPU vs CUDA, model size, audio
-# length) and the operator evaluates whether the delta is material for
-# the intended workload.
+#   RUNS=10                           timed requests after warmup
+#   WARMUP_RUNS=2                     untimed requests to settle caches
+#   LANGUAGE=auto                     forwarded as -F language=...
+#   TRANSLATE=false                   forwarded as -F translate=true/false
+#   COLD_START_SECONDS=               optional cold-start baseline for delta output
 
 set -euo pipefail
 
@@ -47,18 +36,12 @@ LANGUAGE="${LANGUAGE:-auto}"
 TRANSLATE="${TRANSLATE:-false}"
 COLD_START_SECONDS="${COLD_START_SECONDS:-}"
 
-# Validate RUNS before anything else: the timed loop divides by it when
-# computing the mean, and awk's divide-by-zero failure surfaces as an
-# opaque runtime error instead of a clear "bad input" message. A value
-# of zero or a non-integer makes no sense for a latency benchmark.
+# Validate RUNS early to avoid divide-by-zero in awk mean calculation.
 if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: RUNS must be a positive integer (got: $RUNS)" >&2
   exit 64
 fi
 
-# WARMUP_RUNS may legitimately be zero (skip warmup entirely), but it
-# must still be a non-negative integer so the printf on the summary
-# line and the seq below do not spray confusing errors.
 if ! [[ "$WARMUP_RUNS" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "error: WARMUP_RUNS must be a non-negative integer (got: $WARMUP_RUNS)" >&2
   exit 64
@@ -71,22 +54,21 @@ fi
 
 if [[ ! -f "$FIXTURE" ]]; then
   echo "error: fixture not found at $FIXTURE" >&2
-  echo "       generate one with: python3 scripts/generate_silent_fixture.py" >&2
+  echo "       generate one with: uv run python scripts/generate-silent-fixture.py" >&2
   exit 64
 fi
 
 base_url="http://$HOST:$PORT"
 inference_url="$base_url/inference"
 
-# Readiness check: the existing guide suggests the server answers GET /
-# with HTTP 200 or 400; treat anything under 500 as "up".
+# Treat any HTTP status below 500 on GET / as ready.
 if ! status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$base_url/"); then
   echo "error: curl failed to reach $base_url/" >&2
   exit 64
 fi
 if [[ "$status" -ge 500 || "$status" -eq 000 ]]; then
   echo "error: $base_url/ returned HTTP $status" >&2
-  echo "       start whisper-server first (see docs/guides/local-asr-provider.html)" >&2
+  echo "       start whisper-server first (see docs/guides/asr-providers.html)" >&2
   exit 64
 fi
 
@@ -101,9 +83,7 @@ printf -- '---\n'
 tmp_body="$(mktemp)"
 trap 'rm -f "$tmp_body"' EXIT
 
-# Send one /inference request and echo wall-clock seconds on stdout. The
-# HTTP status check uses curl's own -w to avoid parsing the body on the
-# hot path.
+# Send one /inference request and print wall-clock seconds to stdout.
 post_one() {
   local start_ns end_ns status
   start_ns=$(date +%s%N)

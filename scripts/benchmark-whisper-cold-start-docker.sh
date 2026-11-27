@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Docker variant of scripts/benchmark-whisper-cold-start.sh.
 #
-# Measures whisper-cli cold-start latency by running it inside an
-# ephemeral long-lived container and timing `docker exec` invocations.
-# This path never installs whisper.cpp on the host; only the ggml model
-# is downloaded to the host cache and bind-mounted read-only.
+# Measures whisper-cli cold-start latency inside a temporary container via
+# `docker exec`, without installing whisper.cpp on the host. Only the ggml
+# model is cached locally and bind-mounted read-only.
 #
 # Requirements:
 #   - Docker daemon reachable without sudo
@@ -15,18 +14,16 @@
 #
 # Optional environment overrides:
 #   IMAGE=ghcr.io/ggml-org/whisper.cpp:main          (CPU default)
-#   IMAGE=ghcr.io/ggml-org/whisper.cpp:main-cuda     (use --gpus all)
-#   GPUS='all'                                       (pass to `docker run`)
+#   IMAGE=ghcr.io/ggml-org/whisper.cpp:main-cuda     (use GPUS=all)
+#   GPUS='all'                                       (passed to `docker run`)
 #   MODEL_NAME=base.en                               (default; any ggml-*.bin name)
 #   MODELS_DIR=$HOME/.cache/voicelayer/models        (host model cache)
 #   FIXTURE=tests/fixtures/small.wav                 (input audio)
 #   RUNS=5                                           (timed exec invocations)
-#   THRESHOLD_SECONDS=0.25                           (decision threshold)
+#   THRESHOLD_SECONDS=0.25                           (recommendation threshold)
 #
-# The measurement includes `docker exec` overhead (~10-30ms on most hosts),
-# so a mean below ~0.20s safely clears the 0.25s threshold for Phase 3B
-# even after subtracting exec overhead. Host `whisper-cli` cannot be slower
-# than the measured docker-exec number; this is a conservative upper bound.
+# Includes `docker exec` overhead (~10-30 ms), providing a conservative upper
+# bound on host `whisper-cli` cold-start time.
 
 set -euo pipefail
 
@@ -51,7 +48,7 @@ fi
 
 if [[ ! -f "$FIXTURE" ]]; then
   echo "error: fixture not found at $FIXTURE" >&2
-  echo "       generate one with: python3 scripts/generate_silent_fixture.py" >&2
+  echo "       generate one with: uv run python scripts/generate-silent-fixture.py" >&2
   exit 64
 fi
 
@@ -93,7 +90,6 @@ docker pull "$IMAGE" >/dev/null
 echo "starting container..."
 docker run "${docker_run_args[@]}" "$IMAGE" infinity >/dev/null
 
-# Quick sanity: the image must expose whisper-cli.
 if ! docker exec "$CONTAINER_NAME" sh -c 'command -v whisper-cli >/dev/null'; then
   echo "error: whisper-cli not found inside $IMAGE" >&2
   exit 70
@@ -135,14 +131,11 @@ printf 'max  : %s s\n' "$max_s"
 decision=$(awk -v m="$mean_s" -v t="$THRESHOLD_SECONDS" 'BEGIN { print (m < t ? "below" : "above") }')
 echo ""
 if [[ "$decision" == "below" ]]; then
-  echo "decision: mean cold-start ($mean_s s) < threshold ($THRESHOLD_SECONDS s)"
-  echo "          Includes docker exec overhead (~10-30ms). Host whisper-cli"
-  echo "          will be at least as fast. Phase 3B (fixed segment recording)"
-  echo "          can proceed."
+  echo "recommendation: mean cold-start ($mean_s s) < threshold ($THRESHOLD_SECONDS s)"
+  echo "                Includes docker exec overhead (~10-30 ms); host whisper-cli"
+  echo "                is fast enough for segmented dictation."
 else
-  echo "decision: mean cold-start ($mean_s s) >= threshold ($THRESHOLD_SECONDS s)"
-  echo "          Even before subtracting docker exec overhead this exceeds"
-  echo "          the gate. Introduce providers/whisper_server.py first"
-  echo "          (persistent whisper-server); fixed-segment transcription"
-  echo "          would be slower than today's one-shot path otherwise."
+  echo "recommendation: mean cold-start ($mean_s s) >= threshold ($THRESHOLD_SECONDS s)"
+  echo "                Prefer persistent whisper-server (see docs/guides/asr-providers.html)"
+  echo "                to avoid paying model load latency on every segment."
 fi

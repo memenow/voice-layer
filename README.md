@@ -1,79 +1,67 @@
 # VoiceLayer
 
 VoiceLayer is a local-first voice composition layer for Ubuntu and macOS (Apple Silicon) desktop workflows.
-It combines fast dictation, structured text composition, rewrite, and translation into a single daemon, CLI/TUI, and host-injection stack.
+It combines low-latency dictation, structured text composition, rewrite, and translation behind a local daemon, a CLI/TUI, an optional desktop UI, and host injection adapters.
 
 ## Scope
 
-VoiceLayer is designed for:
+VoiceLayer targets:
 
 - Browser text areas and document editors
-- IDE input surfaces and comment fields
-- Terminal and TUI applications such as tmux, Neovim, Claude Code, and Codex CLI
-- Drafting workflows that need preview and confirmation before insertion
+- IDE input fields and code review forms
+- Terminal and TUI environments such as tmux, WezTerm, Kitty, and Neovim
+- Drafting workflows that benefit from preview and confirmation before insertion
 
-VoiceLayer is not designed as:
-
-- A traditional IME candidate window
-- A subtitle-only transcriber
-- A browser-only extension
-- A cloud-only voice assistant
+VoiceLayer is not an IME candidate window, a subtitle-only transcriber, a browser extension, or a cloud-only voice assistant.
 
 ## Architecture
 
-- `crates/voicelayer-core`: shared domain types and injection planning
-- `crates/voicelayer-doc-test-utils`: dev-only helpers shared by the workspace's repository-wide documentation guard tests
-- `crates/voicelayer-ui`: backend-agnostic Liquid Glass design tokens shared by the desktop GUI and the terminal UI
-- `crates/voicelayerd`: Unix-socket daemon and `/v1` control API
-- `crates/vl`: CLI/TUI entry point and operator tooling
-- `crates/vl-desktop`: interactive GUI shell that talks to the daemon over the same socket
-- `python/voicelayer_orchestrator`: JSON-RPC worker protocol and provider orchestration entry point
-- `systemd/`: user-service templates for the daemon and the optional persistent `whisper-server`
-- `launchd/`: macOS LaunchAgent template that `scripts/install.sh` installs on Darwin hosts
-- `scripts/install.sh`: one-shot installer that builds release binaries and seeds `~/.local/bin/`, `~/.config/systemd/user/`, and `~/.config/voicelayer/`
-- `docs/`: architecture, host strategy, and operations documentation. HTML pages are the authoritative docs format; open [`docs/index.html`](docs/index.html) for the navigation-friendly entry point. The site is organized into:
-    - Architecture references — [`docs/architecture/overview.html`](docs/architecture/overview.html) (runtime topology, audio capture, dictation segmentation), [`docs/architecture/python-worker-protocol.html`](docs/architecture/python-worker-protocol.html) (JSON-RPC methods, persistent worker semantics, provider routing), and [`docs/architecture/host-injection-strategy.html`](docs/architecture/host-injection-strategy.html) (AT-SPI / clipboard / keyboard simulation priority).
-    - Operator guides — [`docs/guides/development.html`](docs/guides/development.html) (repository layout and verification chain), [`docs/guides/systemd.html`](docs/guides/systemd.html) (`scripts/install.sh`, user units, env file), [`docs/guides/local-asr-provider.html`](docs/guides/local-asr-provider.html) (`whisper-cli` / `whisper-server`, silero-vad pre-pass, MiMo-V2.5-ASR, Qwen3-ASR-1.7B), [`docs/guides/local-llm-provider.html`](docs/guides/local-llm-provider.html) (OpenAI-compatible endpoint, optional `llama-server` autostart), and [`docs/guides/desktop.html`](docs/guides/desktop.html) (`vl-desktop` client-side env vars).
-- `openapi/`: local API contract
+- `crates/voicelayer-core`: shared domain types, unified TOML/env config, Unix-socket HTTP client, and injection planning
+- `crates/voicelayer-testkit`: dev-only test helpers (`EnvGuard`, doc link/code-span scanners)
+- `crates/voicelayer-ui`: shared color, typography, accessibility, and terminal rendering tokens
+- `crates/voicelayerd`: Unix-socket daemon, in-process `cpal` audio capture, `/v1` HTTP control API, SSE stream, and worker supervision
+- `crates/voicelayer-cli`: `vl` CLI/TUI operator tool and foreground push-to-talk panel
+- `crates/voicelayer-desktop`: `vl-desktop` interactive iced GUI shell, capture HUD, global hotkeys, and optional tray icon
+- `python/voicelayer_worker`: stdio JSON-RPC 2.0 inference worker and provider adapters
+- `openapi/voicelayerd.v1.yaml`: OpenAPI 3.1 contract for the `/v1` daemon API
+- `systemd/` and `launchd/`: Linux systemd user units and macOS LaunchAgent template
+- `scripts/install.sh`: release installer for binaries, service definitions, and environment defaults
+- `docs/`: standalone HTML documentation starting at [`docs/index.html`](docs/index.html)
+  - Architecture: [`docs/architecture/overview.html`](docs/architecture/overview.html), [`docs/architecture/worker-protocol.html`](docs/architecture/worker-protocol.html), [`docs/architecture/host-injection.html`](docs/architecture/host-injection.html)
+  - Guides: [`docs/guides/development.html`](docs/guides/development.html), [`docs/guides/services.html`](docs/guides/services.html), [`docs/guides/asr-providers.html`](docs/guides/asr-providers.html), [`docs/guides/llm-provider.html`](docs/guides/llm-provider.html), [`docs/guides/desktop.html`](docs/guides/desktop.html)
 
-## Current Status
+## Capabilities
 
-Shipped today:
+Implemented today:
 
-- Rust workspace with `voicelayer-core`, `voicelayerd`, `vl`, and `vl-desktop`
-- `/v1` control API over a Unix domain socket with Server-Sent Events at `/v1/events/stream`
-- One-shot, fixed-duration segmented, and silero-vad gated live dictation (`POST /v1/sessions/dictation` with `segmentation.mode = one_shot | fixed | vad_gated`), with per-segment `segment_recorded` / `segment_transcribed` events for fixed mode, per-probe `probe_analyzed` / `speech_unit_flushed` / `speech_unit_transcribed` events for VAD-gated mode, and a concatenated transcript on stop
-- `vl dictation foreground-ptt` alternate-screen panel with hold-to-record, transcript scrolling, clipboard restore, and tmux / WezTerm / Kitty targets
-- `vl-desktop` GUI overlay that shares the same socket, session state, and event stream as the CLI
-- Real ASR via `whisper.cpp`: one-shot `whisper-cli` plus an optional persistent `whisper-server` endpoint (with autostart) for warm-model reuse
-- Optional silero-vad pre-pass inside the Python worker that trims non-speech before every transcribe backend (whisper.cpp, MiMo-V2.5-ASR, Qwen3-ASR-1.7B)
-- Optional Xiaomi MiMo-V2.5-ASR backend (CUDA-only, opt-in via `provider_id`) for multilingual and quality-priority transcription, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id mimo_v2_5_asr`, `vl record-transcribe --provider-id ...`, `vl dictation foreground-ptt --provider-id ...`); see [docs/guides/local-asr-provider.html](docs/guides/local-asr-provider.html)
-- Optional Alibaba Qwen3-ASR-1.7B backend (Apache-2.0, GPU recommended, opt-in via `provider_id`) for 30-language transcription including Mandarin and Cantonese, selectable per-request on `/v1/transcriptions` and per-session on the dictation pipeline (`vl dictation start --provider-id qwen3_asr_1_7b`, ...); see [docs/guides/local-asr-provider.html](docs/guides/local-asr-provider.html)
-- Real LLM integration via OpenAI-compatible chat completions, with optional `llama-server` autostart for local endpoints
-- Live Rust↔Python stdio JSON-RPC bridge through the `uv`-managed project environment
-- systemd user units for `voicelayerd` and the optional `whisper-server`, plus `scripts/install.sh`
-- `vl doctor` surfaces whisper mode (`cli` / `server` / `unconfigured`), ASR and LLM provider reachability, and global-shortcuts portal support
+- `/v1` HTTP API over a Unix domain socket with Server-Sent Events at `/v1/events/stream`
+- One-shot, fixed-duration segmented, and Silero VAD-gated live dictation (`POST /v1/sessions/dictation` with `segmentation.mode = one_shot | fixed | vad_gated`)
+- `vl dictation foreground-ptt` alternate-screen panel with hold-to-record, transcript scrolling, clipboard backup/restore, and tmux / WezTerm / Kitty targeting
+- `vl-desktop` GUI shell sharing the daemon socket, session store, and SSE stream, with XDG GlobalShortcuts (Linux) and Carbon global hotkeys (macOS)
+- Local ASR via `whisper.cpp` (`whisper-cli` and persistent `whisper-server` with optional autostart), plus opt-in GPU providers (`mimo_v2_5_asr`, `qwen3_asr_1_7b`) selected via `provider_id`
+- Optional Silero VAD pre-pass applied uniformly across ASR backends inside the Python worker
+- Compose, rewrite, and translate workflows backed by any OpenAI-compatible chat completions endpoint, with optional `llama-server` autostart
+- `vl doctor` and `vl providers` diagnostics for ASR mode, LLM reachability, and global hotkey availability
 
-Not yet implemented (documented and scoped):
+Planned / out of current scope:
 
-- GNOME portal hotkey binding inside the `vl` CLI (`vl-desktop` already registers `voicelayer.dictation_toggle` through `org.freedesktop.portal.GlobalShortcuts` and maps activations to start/stop; the terminal CLI still relies on `dictation foreground-ptt` raw-mode key handling rather than the portal)
+- Global shortcut portal binding inside the `vl` CLI (handled today by `vl-desktop` and raw-mode terminal PTT)
 - AT-SPI writable target discovery
-- Always-on background microphone and mid-utterance partial transcripts
-- Adaptive capture cadence driven by VAD verdicts (the shipped `vad_gated` mode flushes buffered speech on silence but the capture itself still slices probes on a fixed `probe_secs` schedule)
+- Always-on background listening and mid-utterance partial transcripts
 - `.deb` packaging
 
 ## Development
 
 ### Requirements
 
-- Rust 1.89+
+- Rust 1.100+
 - Python 3.12+
 - `uv` 0.11+
 - Ubuntu with PipeWire, or macOS on Apple Silicon (CoreAudio)
 
 ### Verification Chain
 
-The authoritative commands every change must pass before merge (also mirrored in `CLAUDE.md`):
+Every change must pass the authoritative check sequence (also enforced in CI and documented in `CLAUDE.md`):
 
 ```bash
 cargo fmt --all
@@ -85,222 +73,94 @@ uv run ruff format --check python tests/python
 uv run pytest -q tests/python
 ```
 
-Python commands in this repository should always run through `uv`.
+Run all Python commands in this repository through `uv`.
 
 ### Worker Runtime
 
-The daemon and CLI launch the Python worker from the project-managed environment.
-Resolution order is:
+`voicelayerd` resolves the Python worker under `VOICELAYER_PROJECT_ROOT` (falling back to the current working directory):
 
-1. `VOICELAYER_PROJECT_ROOT/.venv/bin/python -m voicelayer_orchestrator.worker`
-2. `uv run --project <project_root> python -m voicelayer_orchestrator.worker`
+1. `<project_root>/.venv/bin/python -m voicelayer_worker.worker`
+2. `uv run --project <project_root> python -m voicelayer_worker.worker`
 
-If you run the daemon outside the repository root, set `VOICELAYER_PROJECT_ROOT` explicitly.
-When a local LLM endpoint is configured, `vl doctor` also probes endpoint reachability through `/v1/models`.
-If `VOICELAYER_LLM_AUTO_START=true`, the worker can also auto-launch `llama-server` for local endpoints.
+When starting the daemon outside the repository root, set `VOICELAYER_PROJECT_ROOT`.
+If a local LLM endpoint is configured, `vl doctor` probes `/v1/models`. With `VOICELAYER_LLM_AUTO_START=true`, the worker launches `llama-server` on demand for local endpoints.
 
-### Run the Daemon
+### Common Commands
+
+Start the daemon (default socket `$XDG_RUNTIME_DIR/voicelayer/daemon.sock` on Linux or `$TMPDIR/voicelayer/daemon.sock` on macOS):
 
 ```bash
 cargo run -p voicelayerd
 ```
 
-By default the daemon listens on:
-
-```text
-$XDG_RUNTIME_DIR/voicelayer/daemon.sock
-```
-
-### Inspect the Environment
+Inspect runtime health, provider catalog, and hotkey portal status:
 
 ```bash
-cargo run -p vl -- doctor
+cargo run -p voicelayer-cli -- doctor
+cargo run -p voicelayer-cli -- providers
+cargo run -p voicelayer-cli -- hotkeys portal-status
 ```
 
-### Inspect Providers
+Transcribe an audio file, record a fixed clip, or render a bracketed paste sequence:
 
 ```bash
-cargo run -p vl -- providers
+cargo run -p voicelayer-cli -- transcribe-file /path/to/sample.wav --language auto
+cargo run -p voicelayer-cli -- record-transcribe --duration-seconds 8 --language auto
+cargo run -p voicelayer-cli -- print-bracketed-paste "Review the authentication changes."
 ```
 
-### Configure a Local LLM Endpoint
-
-See [docs/guides/local-llm-provider.html](docs/guides/local-llm-provider.html) for the `llama.cpp server` path and environment variables.
-
-### Configure a Local ASR Provider
-
-See [docs/guides/local-asr-provider.html](docs/guides/local-asr-provider.html) for the `whisper.cpp` file transcription path, the optional persistent `whisper-server` deployment, and the optional silero-vad pre-pass.
-
-### Launch the Desktop Shell
-
-See [docs/guides/desktop.html](docs/guides/desktop.html) for `vl-desktop` usage and the two client-side environment variables (`VOICELAYER_DAEMON_BIN`, `VOICELAYER_LOG`).
-
-### Install as a systemd User Service
-
-See [docs/guides/systemd.html](docs/guides/systemd.html) for `scripts/install.sh`, the `voicelayerd` unit, and the optional dedicated `voicelayer-whisper-server` unit (with a Docker drop-in).
-
-### Render a Bracketed Paste Payload
+Drive live dictation sessions (`POST /v1/sessions/dictation`, `POST /v1/sessions/dictation/stop`, `GET /v1/sessions`):
 
 ```bash
-cargo run -p vl -- print-bracketed-paste "Analyze the current repository authentication flow."
+cargo run -p voicelayer-cli -- dictation start --language auto
+cargo run -p voicelayer-cli -- dictation start --mode fixed --segment-secs 8 --language auto
+cargo run -p voicelayer-cli -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
+cargo run -p voicelayer-cli -- dictation list
+cargo run -p voicelayer-cli -- dictation stop <session-id>
 ```
 
-### Transcribe a Local Audio File
+Live segmented sessions stream `dictation.segment_recorded` / `dictation.segment_transcribed` (fixed mode) or `dictation.probe_analyzed` / `dictation.speech_unit_flushed` / `dictation.speech_unit_transcribed` (VAD-gated mode) alongside `dictation.completed` / `dictation.failed` on `/v1/events/stream`.
+
+Run the foreground push-to-talk terminal panel:
 
 ```bash
-cargo run -p vl -- transcribe-file /path/to/sample.wav --language auto
-```
-
-### Record and Transcribe a Short Clip
-
-```bash
-cargo run -p vl -- record-transcribe --duration-seconds 8 --language auto
-```
-
-Capture runs in process in the daemon through `cpal` (CoreAudio on macOS, the PipeWire ALSA shim on Linux), so no external recorder binary is needed.
-Internally this reuses the same daemon-side dictation capture flow the UI and hotkey layer call.
-
-The daemon exposes a live dictation session flow:
-
-- `POST /v1/sessions/dictation` starts recording
-- `POST /v1/sessions/dictation/stop` stops recording and returns the transcript
-
-The request body's `segmentation` field selects between one-shot, fixed-duration segmented, and silero-vad gated capture:
-
-- `{"mode": "one_shot"}` (default) records a single WAV from start to stop and transcribes it once.
-- `{"mode": "fixed", "segment_secs": N}` slices the capture buffer every `N` seconds; each finalized chunk is transcribed in the background and the per-segment events surface on `/v1/events/stream` (`dictation.segment_recorded`, `dictation.segment_transcribed`) while stop returns the concatenated transcript.
-- `{"mode": "vad_gated", "probe_secs": P, "max_segment_secs": M, "silence_gap_probes": G}` cuts probes every `P` seconds, classifies each probe via the worker's `segment_probe` RPC (silero-vad), and flushes the buffered speech unit to `transcribe` when `G` consecutive silent probes arrive or the buffered duration reaches `M`. Per-probe / per-unit events (`dictation.probe_analyzed`, `dictation.speech_unit_flushed`, `dictation.speech_unit_transcribed`) stream alongside the lifecycle events.
-
-The `vl` CLI exercises that control plane directly:
-
-```bash
-cargo run -p vl -- dictation start --language auto
-cargo run -p vl -- dictation start --mode fixed --segment-secs 8 --language auto
-cargo run -p vl -- dictation start --mode vad-gated --probe-secs 2 --max-segment-secs 30 --language auto
-cargo run -p vl -- dictation list
-cargo run -p vl -- dictation stop <session-id>
-```
-
-`foreground-ptt` uses an alternate-screen status panel instead of streaming JSON on each transition.
-The panel shows:
-
-- current dictation status
-- active session ID
-- last completed session ID
-- last transcript preview
-- last injection result
-- last error
-- recent events
-
-Panel controls:
-
-- `j` / `k` or Up / Down to scroll the full transcript view
-- `PageUp` / `PageDown` for larger transcript jumps
-- `c` to copy the last completed transcript to the system clipboard on demand
-- `r` to restore the saved text clipboard backup after the tool has overwritten the clipboard
-- `i` to re-apply the last injection target
-- `s` to save the last transcript to a timestamped text file
-- `d` to discard the last transcript from the panel
-- `Esc` to exit
-
-If you also want a clipboard fallback after each completed dictation:
-
-```bash
-cargo run -p vl -- dictation foreground-ptt --language auto --copy-on-stop
-```
-
-This writes the finished transcript to the system clipboard before any optional terminal-target injection.
-
-You can change the default stop behavior without leaving the panel:
-
-```bash
-cargo run -p vl -- dictation foreground-ptt \
+cargo run -p voicelayer-cli -- dictation foreground-ptt --language auto
+cargo run -p voicelayer-cli -- dictation foreground-ptt \
   --default-stop-action inject \
+  --copy-on-stop \
   --restore-clipboard-on-exit \
   --save-dir ~/Documents/voice-layer
 ```
 
-Available default stop actions are:
+Panel keybindings: `j`/`k` or arrows and `PageUp`/`PageDown` to scroll, `c` to copy, `r` to restore the clipboard backup, `i` to re-inject, `s` to save, `d` to discard, and `Esc` to exit.
+When the terminal supports key release events, the PTT key operates as hold-to-record; otherwise pressing once starts and pressing again stops.
 
-- `none`
-- `copy`
-- `inject`
-- `save`
-
-VoiceLayer can also persist these defaults in a local config file:
+Explicit terminal injection targets:
 
 ```bash
-cargo run -p vl -- config path
-cargo run -p vl -- config init-defaults
-cargo run -p vl -- config show
-cargo run -p vl -- config set foreground_ptt.default_stop_action inject
+cargo run -p voicelayer-cli -- dictation foreground-ptt --tmux-target-pane %2
+cargo run -p voicelayer-cli -- dictation foreground-ptt --wezterm-target-pane-id 12
+cargo run -p voicelayer-cli -- dictation foreground-ptt --kitty-match 'title:Output'
 ```
 
-The config file lives at:
+Inside tmux, omitting `--tmux-target-pane` auto-selects a single candidate pane or prompts when multiple panes exist, and never pastes into the controller's own pane.
 
-```text
-~/.config/voicelayer/config.toml
-```
-
-For terminal-focused fallback usage, `vl` also provides a foreground raw-terminal mode:
+Manage persistent defaults in `~/.config/voicelayer/config.toml`:
 
 ```bash
-cargo run -p vl -- dictation foreground-ptt --language auto
+cargo run -p voicelayer-cli -- config path
+cargo run -p voicelayer-cli -- config init-defaults
+cargo run -p voicelayer-cli -- config show
+cargo run -p voicelayer-cli -- config set foreground_ptt.default_stop_action inject
 ```
 
-When the terminal reports key release events, this behaves like hold-to-record.
-When release events are not available, it degrades to:
+### Guides
 
-- first key press starts dictation
-- second key press stops dictation
-- `Esc` exits the mode
-
-If you run the controller inside tmux and want the transcript pasted into another pane:
-
-```bash
-cargo run -p vl -- dictation foreground-ptt --language auto --tmux-target-pane %2
-```
-
-This uses `tmux set-buffer` plus `tmux paste-buffer -dpr -t <pane>`.
-The controller refuses to paste into the same pane that is currently running `foreground-ptt`.
-
-If you omit `--tmux-target-pane` while running inside tmux:
-
-- zero candidate panes: no tmux injection is attempted
-- one candidate pane: it is selected automatically
-- multiple candidate panes: `vl` prompts you to choose a target pane before entering raw mode
-
-For terminal-specific explicit targets outside tmux:
-
-```bash
-cargo run -p vl -- dictation foreground-ptt --wezterm-target-pane-id 12
-cargo run -p vl -- dictation foreground-ptt --kitty-match 'title:Output'
-```
-
-These routes are explicit-only:
-
-- WezTerm uses `wezterm cli send-text --pane-id`
-- Kitty uses `kitten @ send-text --match ... --stdin --bracketed-paste auto`
-
-VoiceLayer does not auto-discover WezTerm or Kitty targets yet.
-
-### Inspect Global Shortcuts Portal Support
-
-```bash
-cargo run -p vl -- hotkeys portal-status
-```
-
-This checks whether the current desktop session exposes `org.freedesktop.portal.GlobalShortcuts`.
-
-## Product Defaults
-
-- Desktop target: Ubuntu GNOME Wayland (primary), macOS on Apple Silicon (supported)
-- Local ASR baseline: `whisper.cpp`
-- Local LLM baseline: `Gemma 4` via `llama.cpp`-compatible deployment
-- GUI insertion priority: AT-SPI, then clipboard, then keyboard simulation fallback
-- Terminal insertion priority: bracketed paste, then terminal-specific adapters
-- Preview surface: CLI/TUI first, GUI preview later
+- Local ASR (`whisper-cli`, `whisper-server`, Silero VAD, MiMo-V2.5-ASR, Qwen3-ASR-1.7B): [`docs/guides/asr-providers.html`](docs/guides/asr-providers.html)
+- Local LLM (OpenAI-compatible endpoint, `llama-server` autostart): [`docs/guides/llm-provider.html`](docs/guides/llm-provider.html)
+- Desktop shell (`vl-desktop`, capture HUD, hotkeys, client env vars): [`docs/guides/desktop.html`](docs/guides/desktop.html)
+- User services (`scripts/install.sh`, systemd units, launchd agent): [`docs/guides/services.html`](docs/guides/services.html)
 
 ## License
 
-The repository is intended to ship under the Apache License 2.0.
+Apache License 2.0. See [LICENSE](LICENSE).
